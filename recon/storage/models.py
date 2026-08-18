@@ -1,0 +1,1260 @@
+"""SQLAlchemy persistence models for Night Scout.
+
+The SQLite database is the durable source of truth for a single target
+workspace. Core/policy modules remain storage-agnostic; conversion between
+Pydantic domain objects and these ORM records belongs in storage/database.py.
+
+A deliberate distinction is made between:
+
+    AssetRecord
+        One canonical deduplicated asset in the target knowledge graph.
+
+    EventObservationRecord
+        One observation of an asset, preserving source/provenance.
+
+For example, if the same hostname is discovered independently by passive DNS,
+a certificate SAN, JavaScript, and an archive, Night Scout keeps one AssetRecord
+but four EventObservationRecord rows.
+
+This prevents deduplication from destroying evidence diversity.
+
+The schema also persists:
+    - graph relationships and evidence,
+    - recon runs and branches,
+    - task queue state,
+    - scheduler/policy decisions for explainability,
+    - human-review cases,
+    - budget reservations,
+    - shared rate-limit state.
+
+Later storage modules may add snapshot/vocabulary-specific tables through
+Alembic migrations without changing the core contracts.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+from uuid import uuid4
+
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    MetaData,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.engine import Dialect
+from sqlalchemy.ext.mutable import MutableDict, MutableList
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
+
+
+def utc_now() -> datetime:
+    """Return the current UTC time as a timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def _new_id(prefix: str) -> str:
+    """Create a compact prefixed identifier for persistence-only entities."""
+    return f"{prefix}_{uuid4().hex}"
+
+
+NAMING_CONVENTION = {
+    "ix": "ix_%(table_name)s_%(column_0_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+
+
+class UTCDateTime(TypeDecorator[datetime]):
+    """Store timezone-aware datetimes as canonical UTC ISO-8601 strings.
+
+    SQLite's native DateTime handling does not reliably preserve timezone
+    information. Night Scout's domain models require aware timestamps, so this
+    type performs an explicit round-trip instead of relying on SQLite affinity.
+    """
+
+    impl = String(40)
+    cache_ok = True
+
+    def process_bind_param(
+        self,
+        value: datetime | None,
+        dialect: Dialect,
+    ) -> str | None:
+        del dialect
+
+        if value is None:
+            return None
+
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Night Scout timestamps must be timezone-aware")
+
+        return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+    def process_result_value(
+        self,
+        value: str | None,
+        dialect: Dialect,
+    ) -> datetime | None:
+        del dialect
+
+        if value is None:
+            return None
+
+        parsed = datetime.fromisoformat(value)
+
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(
+                "database contained a timezone-naive Night Scout timestamp"
+            )
+
+        return parsed.astimezone(timezone.utc)
+
+
+class Base(DeclarativeBase):
+    """Declarative base shared by all Night Scout ORM models."""
+
+    metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+
+class ReconRunRecord(Base):
+    """One reconnaissance execution/session inside a target workspace."""
+
+    __tablename__ = "recon_runs"
+
+    run_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("run"),
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="RUNNING",
+        index=True,
+    )
+
+    started_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
+
+    config_hash: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+    )
+
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "finished_at IS NULL OR status != 'RUNNING'",
+            name="finished_run_not_running",
+        ),
+    )
+
+
+class AssetRecord(Base):
+    """Canonical deduplicated asset in the target knowledge graph."""
+
+    __tablename__ = "assets"
+
+    asset_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("ast"),
+    )
+
+    event_type: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    value: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    # Produced from the normalized domain identity, normally:
+    #     f"{event_type}:{canonical_value}"
+    identity_key: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    first_seen: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+
+    scope_state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="UNKNOWN",
+        index=True,
+    )
+
+    confidence: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+    )
+    novelty: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+    )
+
+    min_depth: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    tags_json: Mapped[list[str]] = mapped_column(
+        MutableList.as_mutable(JSON),
+        nullable=False,
+        default=list,
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "identity_key",
+            name="asset_identity",
+        ),
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="asset_confidence_range",
+        ),
+        CheckConstraint(
+            "novelty >= 0.0 AND novelty <= 1.0",
+            name="asset_novelty_range",
+        ),
+        CheckConstraint(
+            "min_depth >= 0",
+            name="asset_min_depth_nonnegative",
+        ),
+        Index(
+            "ix_assets_type_value",
+            "event_type",
+            "value",
+        ),
+        Index(
+            "ix_assets_last_seen",
+            "last_seen",
+        ),
+    )
+
+
+class EventObservationRecord(Base):
+    """One provenance-preserving observation of a canonical asset."""
+
+    __tablename__ = "event_observations"
+
+    event_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+    )
+
+    asset_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    run_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey("recon_runs.run_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    event_type: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    value: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    source: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        index=True,
+    )
+
+    parent_event_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey(
+            "event_observations.event_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+    )
+
+    first_seen: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+
+    scope_state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="UNKNOWN",
+    )
+    confidence: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+    )
+    novelty: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+    )
+    depth: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    tags_json: Mapped[list[str]] = mapped_column(
+        MutableList.as_mutable(JSON),
+        nullable=False,
+        default=list,
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="event_confidence_range",
+        ),
+        CheckConstraint(
+            "novelty >= 0.0 AND novelty <= 1.0",
+            name="event_novelty_range",
+        ),
+        CheckConstraint(
+            "depth >= 0",
+            name="event_depth_nonnegative",
+        ),
+        Index(
+            "ix_event_observations_asset_source",
+            "asset_id",
+            "source",
+        ),
+        Index(
+            "ix_event_observations_run_type",
+            "run_id",
+            "event_type",
+        ),
+    )
+
+
+class RelationshipRecord(Base):
+    """Canonical directed edge between two assets."""
+
+    __tablename__ = "asset_relationships"
+
+    relationship_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("rel"),
+    )
+
+    source_asset_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    target_asset_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    relation_type: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+
+    first_source_event_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey(
+            "event_observations.event_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+
+    confidence: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+    )
+
+    first_seen: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_asset_id",
+            "target_asset_id",
+            "relation_type",
+            name="asset_relationship_identity",
+        ),
+        CheckConstraint(
+            "source_asset_id != target_asset_id",
+            name="relationship_no_self_edge",
+        ),
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="relationship_confidence_range",
+        ),
+    )
+
+
+class EvidenceRecord(Base):
+    """One safe provenance/evidence pointer.
+
+    Raw credential/private-data values should not be stored in `summary`.
+    Sensitive bytes belong in a future evidence store with stricter handling;
+    this table keeps fingerprints, locators, and redacted explanations.
+    """
+
+    __tablename__ = "evidence"
+
+    evidence_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("evd"),
+    )
+
+    asset_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    event_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey(
+            "event_observations.event_id",
+            ondelete="CASCADE",
+        ),
+        nullable=True,
+        index=True,
+    )
+    relationship_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey(
+            "asset_relationships.relationship_id",
+            ondelete="CASCADE",
+        ),
+        nullable=True,
+        index=True,
+    )
+
+    kind: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    source: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        index=True,
+    )
+
+    locator: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    content_hash: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        index=True,
+    )
+    summary: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            """
+            asset_id IS NOT NULL
+            OR event_id IS NOT NULL
+            OR relationship_id IS NOT NULL
+            """,
+            name="evidence_has_subject",
+        ),
+    )
+
+
+class BranchRecord(Base):
+    """Persistent recursive-recon branch used by budgets/convergence."""
+
+    __tablename__ = "branches"
+
+    branch_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("brn"),
+    )
+
+    run_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey("recon_runs.run_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    parent_branch_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey("branches.branch_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    root_event_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey(
+            "event_observations.event_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+
+    state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="OPEN",
+        index=True,
+    )
+    depth: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    soft_budget_multiplier: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=1.0,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
+
+    stats_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "depth >= 0",
+            name="branch_depth_nonnegative",
+        ),
+        CheckConstraint(
+            "soft_budget_multiplier >= 1.0",
+            name="branch_budget_multiplier_minimum",
+        ),
+    )
+
+
+class TaskRecord(Base):
+    """Durable task queue row compatible with core.queue.Task."""
+
+    __tablename__ = "tasks"
+
+    task_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+    )
+
+    run_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey("recon_runs.run_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    worker: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        index=True,
+    )
+    action: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+
+    input_event_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey(
+            "event_observations.event_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+        index=True,
+    )
+
+    branch_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey("branches.branch_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    route_rule_id: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+    )
+    routing_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="PENDING",
+        index=True,
+    )
+    priority: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+    )
+
+    attempts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=3,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+
+    started_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
+
+    last_error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    dedupe_key: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "attempts >= 0",
+            name="task_attempts_nonnegative",
+        ),
+        CheckConstraint(
+            "max_attempts >= 1",
+            name="task_max_attempts_positive",
+        ),
+        CheckConstraint(
+            "attempts <= max_attempts",
+            name="task_attempts_within_budget",
+        ),
+        Index(
+            "ix_tasks_ready",
+            "status",
+            "available_at",
+            "priority",
+        ),
+        # Database-level protection against two active copies of the same
+        # logical task. Terminal history does not block later re-scheduling.
+        Index(
+            "uq_tasks_active_dedupe",
+            "dedupe_key",
+            unique=True,
+            sqlite_where=text(
+                "status IN ('PENDING', 'RUNNING', 'DEFERRED', 'REVIEW')"
+            ),
+        ),
+    )
+
+
+class SchedulerDecisionRecord(Base):
+    """Persisted scheduler scoring decision for explainability."""
+
+    __tablename__ = "scheduler_decisions"
+
+    decision_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("sch"),
+    )
+
+    task_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("tasks.task_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    evaluated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+        index=True,
+    )
+
+    score: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+    )
+    selected: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+
+    breakdown_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+    signals_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+
+
+class PolicyDecisionRecord(Base):
+    """Generic append-only policy/scope/review decision log."""
+
+    __tablename__ = "policy_decisions"
+
+    decision_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("pol"),
+    )
+
+    task_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("tasks.task_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    gate: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    outcome: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        index=True,
+    )
+
+    reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+        index=True,
+    )
+
+    details_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_policy_decisions_task_gate",
+            "task_id",
+            "gate",
+            "created_at",
+        ),
+    )
+
+
+class ReviewCaseRecord(Base):
+    """Durable human-review queue case."""
+
+    __tablename__ = "review_cases"
+
+    case_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+    )
+
+    task_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("tasks.task_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    worker: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+    action: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+    input_event_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey(
+            "event_observations.event_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+        index=True,
+    )
+
+    state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="OPEN",
+        index=True,
+    )
+
+    # Hash of task + sorted signal fingerprints.
+    dedupe_key: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+
+    opened_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
+
+    resolution_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    __table_args__ = (
+        Index(
+            "uq_review_cases_open_dedupe",
+            "dedupe_key",
+            unique=True,
+            sqlite_where=text("state = 'OPEN'"),
+        ),
+    )
+
+
+class ReviewSignalRecord(Base):
+    """Redacted signal attached to one review case."""
+
+    __tablename__ = "review_signals"
+
+    signal_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("rsg"),
+    )
+
+    case_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("review_cases.case_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    category: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    severity: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+    confidence: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+    )
+
+    summary: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    source_event_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey(
+            "event_observations.event_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+
+    evidence_fingerprint: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+
+    tags_json: Mapped[list[str]] = mapped_column(
+        MutableList.as_mutable(JSON),
+        nullable=False,
+        default=list,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "case_id",
+            "evidence_fingerprint",
+            name="review_case_signal_fingerprint",
+        ),
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="review_signal_confidence_range",
+        ),
+    )
+
+
+class BudgetReservationRecord(Base):
+    """Durable budget reservation lease."""
+
+    __tablename__ = "budget_reservations"
+
+    reservation_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+    )
+
+    task_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("tasks.task_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        index=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        index=True,
+    )
+
+
+class BudgetReservationItemRecord(Base):
+    """One bucket/metric amount held by a budget reservation."""
+
+    __tablename__ = "budget_reservation_items"
+
+    item_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("bgi"),
+    )
+
+    reservation_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey(
+            "budget_reservations.reservation_id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+        index=True,
+    )
+
+    bucket_key: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    metric: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    # Nullable for compatibility with early schema/domain versions; new code
+    # should persist SOFT/HARD explicitly.
+    budget_class: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+    )
+
+    amount: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "amount > 0.0",
+            name="budget_item_amount_positive",
+        ),
+        UniqueConstraint(
+            "reservation_id",
+            "bucket_key",
+            "metric",
+            "budget_class",
+            name="budget_reservation_bucket_metric",
+        ),
+    )
+
+
+class RateBucketRecord(Base):
+    """Shared token-bucket/concurrency state."""
+
+    __tablename__ = "rate_buckets"
+
+    rule_id: Mapped[str] = mapped_column(
+        String(128),
+        primary_key=True,
+    )
+    bucket_key: Mapped[str] = mapped_column(
+        Text,
+        primary_key=True,
+    )
+
+    tokens: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+    )
+    last_refill_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+    )
+    active_concurrency: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "tokens >= 0.0",
+            name="rate_bucket_tokens_nonnegative",
+        ),
+        CheckConstraint(
+            "active_concurrency >= 0",
+            name="rate_bucket_concurrency_nonnegative",
+        ),
+    )
+
+
+class RateLeaseRecord(Base):
+    """Durable active-rate/concurrency lease."""
+
+    __tablename__ = "rate_leases"
+
+    lease_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+    )
+
+    task_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("tasks.task_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        index=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        index=True,
+    )
+
+
+class RateLeaseItemRecord(Base):
+    """Concurrency amount held by a rate-limit lease in one bucket."""
+
+    __tablename__ = "rate_lease_items"
+
+    item_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("rli"),
+    )
+
+    lease_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("rate_leases.lease_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    rule_id: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+    bucket_key: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    concurrency: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "concurrency >= 0",
+            name="rate_lease_concurrency_nonnegative",
+        ),
+        UniqueConstraint(
+            "lease_id",
+            "rule_id",
+            "bucket_key",
+            name="rate_lease_bucket",
+        ),
+    )
