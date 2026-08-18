@@ -912,7 +912,18 @@ class DNSWorker:
                     **result.metadata,
                 },
             )
-            await self._publisher.publish(record_event)
+            record_accepted = await self._publisher.publish(
+                record_event
+            )
+
+            # EventPublisher may reject an equivalent observation that already
+            # exists. Never point a child at a freshly generated event_id that
+            # was not accepted/persisted; fall back to the known input event.
+            child_parent_event_id = (
+                record_event.event_id
+                if record_accepted
+                else input_event.event_id
+            )
 
             if result.record_type in {
                 DNSRecordType.A,
@@ -922,7 +933,7 @@ class DNSWorker:
                     type=EventType.IP_ADDRESS,
                     value=canonical_value,
                     source=record_event.source,
-                    parent_event_id=record_event.event_id,
+                    parent_event_id=child_parent_event_id,
                     scope_state=ScopeState.UNKNOWN,
                     confidence=self._config.record_confidence,
                     novelty=0.4,
@@ -944,7 +955,7 @@ class DNSWorker:
                     type=EventType.DNS_NAME,
                     value=canonical_value,
                     source=record_event.source,
-                    parent_event_id=record_event.event_id,
+                    parent_event_id=child_parent_event_id,
                     # CNAME targets can cross administrative/scope boundaries.
                     scope_state=ScopeState.UNKNOWN,
                     confidence=self._config.cname_target_confidence,
