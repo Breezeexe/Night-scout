@@ -397,6 +397,82 @@ class EventObservationRecord(Base):
     )
 
 
+class ProvenanceEdgeRecord(Base):
+    """Directed observation-to-observation provenance edge."""
+
+    __tablename__ = "provenance_edges"
+
+    edge_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("prv"),
+    )
+    parent_event_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("event_observations.event_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    child_event_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("event_observations.event_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    relation_type: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    source: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+    confidence: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=1.0,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "parent_event_id",
+            "child_event_id",
+            "relation_type",
+            "source",
+            name="provenance_edge_identity",
+        ),
+        CheckConstraint(
+            "parent_event_id != child_event_id",
+            name="provenance_no_self_edge",
+        ),
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="provenance_confidence_range",
+        ),
+        Index(
+            "ix_provenance_parent_created",
+            "parent_event_id",
+            "created_at",
+        ),
+        Index(
+            "ix_provenance_child_created",
+            "child_event_id",
+            "created_at",
+        ),
+    )
+
+
 class RelationshipRecord(Base):
     """Canonical directed edge between two assets."""
 
@@ -1046,6 +1122,148 @@ class ReviewSignalRecord(Base):
     )
 
 
+class SurfaceSnapshotRecord(Base):
+    """One normalized surface-state observation for an asset in a recon run."""
+
+    __tablename__ = "surface_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("snp"),
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("recon_runs.run_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    asset_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    snapshot_kind: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    observed_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+        index=True,
+    )
+    present: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+    )
+    state_hash: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        index=True,
+    )
+    state_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "asset_id",
+            "snapshot_kind",
+            name="surface_snapshot_run_asset_kind",
+        ),
+        Index(
+            "ix_surface_snapshots_asset_kind_time",
+            "asset_id",
+            "snapshot_kind",
+            "observed_at",
+        ),
+    )
+
+
+class SnapshotChangeRecord(Base):
+    """One persisted differential-recon change."""
+
+    __tablename__ = "snapshot_changes"
+
+    change_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("chg"),
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("recon_runs.run_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    asset_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("assets.asset_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    previous_snapshot_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey("surface_snapshots.snapshot_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    current_snapshot_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey("surface_snapshots.snapshot_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    change_type: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    change_key: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+    detected_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+        index=True,
+    )
+    before_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+    after_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+    details_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        nullable=False,
+        default=dict,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "change_key",
+            name="snapshot_change_run_key",
+        ),
+        Index(
+            "ix_snapshot_changes_asset_time",
+            "asset_id",
+            "detected_at",
+        ),
+    )
+
+
 class BudgetReservationRecord(Base):
     """Durable budget reservation lease."""
 
@@ -1134,6 +1352,51 @@ class BudgetReservationItemRecord(Base):
             "metric",
             "budget_class",
             name="budget_reservation_bucket_metric",
+        ),
+    )
+
+
+class BudgetUsageRecord(Base):
+    """Persistent committed/reserved usage for one budget bucket."""
+
+    __tablename__ = "budget_usage"
+
+    bucket_key: Mapped[str] = mapped_column(
+        Text,
+        primary_key=True,
+    )
+    budget_class: Mapped[str] = mapped_column(
+        String(16),
+        primary_key=True,
+    )
+    metric: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+    )
+    committed: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+    )
+    reserved: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "committed >= 0.0",
+            name="budget_usage_committed_nonnegative",
+        ),
+        CheckConstraint(
+            "reserved >= 0.0",
+            name="budget_usage_reserved_nonnegative",
         ),
     )
 
