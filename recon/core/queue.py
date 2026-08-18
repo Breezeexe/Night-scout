@@ -75,6 +75,10 @@ class Task(BaseModel):
 
     branch_id: str | None = None
 
+    # Persist routing provenance so explainability survives process restarts.
+    route_rule_id: str | None = None
+    routing_reason: str | None = None
+
     status: TaskStatus = TaskStatus.PENDING
     priority: float = 0.0
 
@@ -99,6 +103,16 @@ class Task(BaseModel):
         if not normalized:
             raise ValueError("must not be blank")
         return normalized
+
+    @field_validator("route_rule_id", "routing_reason")
+    @classmethod
+    def normalize_optional_routing_text(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
 
     @field_validator(
         "created_at",
