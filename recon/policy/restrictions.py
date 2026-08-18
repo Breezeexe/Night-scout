@@ -644,6 +644,25 @@ def default_recon_descriptor_rules() -> tuple[ActionDescriptorRule, ...]:
             ),
         ),
         ActionDescriptorRule(
+            rule_id="permutations.generate",
+            worker_pattern="permutations",
+            action_pattern="*",
+            descriptor=ActionDescriptor(
+                action_class=ActionClass.PASSIVE_DISCOVERY,
+                capabilities=frozenset(
+                    {
+                        passive,
+                        read_only,
+                        ActionCapability.LOCAL_STATIC_ANALYSIS,
+                    }
+                ),
+                description=(
+                    "Local bounded DNS candidate generation from "
+                    "global/target vocabulary"
+                ),
+            ),
+        ),
+        ActionDescriptorRule(
             rule_id="dns.query",
             worker_pattern="dns",
             action_pattern="*",
