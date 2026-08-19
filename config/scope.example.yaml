@@ -1,0 +1,191 @@
+# Night Scout scope configuration example.
+#
+# This file describes WHERE Night Scout may operate.
+# It does NOT describe:
+#   - rate limits (recon/policy/rate_limit.py),
+#   - action restrictions (recon/policy/restrictions.py),
+#   - worker routing/scheduling,
+#   - vulnerability severity.
+#
+# Fail-closed semantics:
+#   - no matching rule -> UNKNOWN -> human review for active work;
+#   - AMBIGUOUS -> human review;
+#   - PASSIVE_ONLY -> passive workers only;
+#   - OUT_OF_SCOPE -> blocked;
+#   - IN_SCOPE -> scope gate may allow the task, subject to all other policy gates.
+#
+# IMPORTANT:
+# A shared IP, ASN, certificate SAN, favicon, CNAME relationship, historical
+# reference, or fingerprint match NEVER makes an asset IN_SCOPE automatically.
+# Every actively contacted execution target must match an explicit rule.
+
+schema_version: 1
+
+target_id: example-program
+display_name: Example Bug Bounty Program
+
+# ScopeGate behavior.
+gate:
+  # When false (recommended/default), an asset with no matching rule is sent
+  # to human review even for passive workers.
+  #
+  # Set true only when the program explicitly permits passive relationship
+  # collection outside the active scope. This NEVER permits active traffic.
+  allow_unknown_passive: false
+
+# Rules map directly to recon.policy.scope.ScopeRule:
+#
+#   rule_id:  stable unique identifier
+#   kind:     DOMAIN | URL | IP_ADDRESS | CIDR | MOBILE_APP
+#   pattern:  normalized by ScopeRule
+#   state:    IN_SCOPE | OUT_OF_SCOPE | PASSIVE_ONLY | AMBIGUOUS
+#   priority: higher number wins before specificity
+#   tier:     optional program/reward tier label
+#   reason:   human-readable provenance/explanation
+#
+# UNKNOWN is intentionally NOT a valid explicit rule state.
+rules:
+
+  # --------------------------------------------------------------------------
+  # Domains
+  # --------------------------------------------------------------------------
+
+  # Exact apex. "*.example.com" does NOT include "example.com", so the apex is
+  # represented separately when it is authorized.
+  - rule_id: domain-apex
+    kind: DOMAIN
+    pattern: example.com
+    state: IN_SCOPE
+    priority: 100
+    tier: L1
+    reason: Explicitly listed apex domain
+
+  # Recursive wildcard:
+  #   api.example.com            -> match
+  #   dev.api.example.com        -> match
+  #   example.com                -> NO match
+  - rule_id: domain-wildcard
+    kind: DOMAIN
+    pattern: "*.example.com"
+    state: IN_SCOPE
+    priority: 100
+    tier: L1
+    reason: Program explicitly authorizes all subdomains
+
+  # Example of a known related domain where passive collection is allowed but
+  # Night Scout must not actively probe it.
+  - rule_id: related-passive-domain
+    kind: DOMAIN
+    pattern: example-cdn.net
+    state: PASSIVE_ONLY
+    priority: 100
+    tier: related
+    reason: Known related infrastructure; passive intelligence only
+
+  # Example of an explicitly excluded hostname overriding the broad wildcard.
+  # Higher priority wins before specificity.
+  - rule_id: excluded-payments-host
+    kind: DOMAIN
+    pattern: payments.example.com
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Explicit program exclusion
+
+  # Example of a hostname whose program wording is unclear.
+  - rule_id: ambiguous-partner-host
+    kind: DOMAIN
+    pattern: partner.example.com
+    state: AMBIGUOUS
+    priority: 250
+    tier: review
+    reason: Program wording requires manual scope confirmation
+
+  # --------------------------------------------------------------------------
+  # URL/path exceptions
+  # --------------------------------------------------------------------------
+
+  # URL rules are useful when only part of a host is authorized or when a path
+  # must be excluded from an otherwise broad domain scope.
+  #
+  # Empty query in a rule means "any query string on the matched path".
+  - rule_id: api-v1-path
+    kind: URL
+    pattern: "https://api.example.com/v1/*"
+    state: IN_SCOPE
+    priority: 200
+    tier: L1
+    reason: Explicitly authorized API path
+
+  # A more specific, higher-priority exclusion.
+  - rule_id: api-v1-billing-exclusion
+    kind: URL
+    pattern: "https://api.example.com/v1/billing/*"
+    state: OUT_OF_SCOPE
+    priority: 400
+    tier: excluded
+    reason: Billing path explicitly excluded by program rules
+
+  # Wildcard URL host. Like DOMAIN wildcard, it excludes the apex.
+  - rule_id: stage-health-passive
+    kind: URL
+    pattern: "https://*.example.com/health/*"
+    state: PASSIVE_ONLY
+    priority: 220
+    tier: related
+    reason: Example of a path restricted to passive handling
+
+  # --------------------------------------------------------------------------
+  # IP/CIDR
+  # --------------------------------------------------------------------------
+
+  # Use exact IP/CIDR authorization only when the program explicitly lists
+  # those network assets. DNS resolution into this range is NOT enough to infer
+  # authorization for unrelated names.
+  - rule_id: listed-ip
+    kind: IP_ADDRESS
+    pattern: 203.0.113.10
+    state: IN_SCOPE
+    priority: 100
+    tier: L2
+    reason: Explicitly listed IP address
+
+  - rule_id: listed-network
+    kind: CIDR
+    pattern: 203.0.113.0/28
+    state: IN_SCOPE
+    priority: 90
+    tier: L2
+    reason: Explicitly listed network range
+
+  # Network exception with higher priority.
+  - rule_id: network-excluded-ip
+    kind: IP_ADDRESS
+    pattern: 203.0.113.14
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Explicit exception inside listed network
+
+  # --------------------------------------------------------------------------
+  # Mobile applications
+  # --------------------------------------------------------------------------
+
+  # Mobile identifiers are local/static-analysis scope subjects. This does not
+  # automatically authorize every backend URL found inside the application;
+  # each discovered network target is reclassified independently.
+  - rule_id: android-app
+    kind: MOBILE_APP
+    pattern: com.example.mobile
+    state: IN_SCOPE
+    priority: 100
+    tier: L1
+    reason: Explicitly listed Android application identifier
+
+  - rule_id: ios-app
+    kind: MOBILE_APP
+    pattern: com.example.ios
+    state: IN_SCOPE
+    priority: 100
+    tier: L1
+    reason: Explicitly listed iOS bundle identifier
