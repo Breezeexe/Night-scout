@@ -146,6 +146,7 @@ class RouteRule:
             worker=self.worker,
             action=self.action,
             input_event_id=event.event_id,
+            input_identity_key=event.identity_key,
             branch_id=context.branch_id,
             route_rule_id=self.rule_id,
             routing_reason=reason,

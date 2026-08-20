@@ -33,7 +33,6 @@ from scripts.wordlists_sync import build_local_manifest, main as wordlists_sync_
 
 from recon.tooling import (
     ToolInstallProgress,
-    ToolRequirement,
     assert_supported_platform,
     install_tools,
     load_tools_manifest,
@@ -65,6 +64,14 @@ wordlists_app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(wordlists_app, name="wordlists")
+
+review_app = typer.Typer(
+    name="review",
+    help="Inspect and resolve tasks paused for human review.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(review_app, name="review")
 
 
 def _resolve_pipeline(value: Path | None) -> Path:
@@ -469,6 +476,140 @@ def explain_command(
         raise typer.Exit(code=1)
 
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@review_app.command("list")
+def review_list_command(
+    pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
+    scope: Path | None = typer.Option(None, "--scope", "-s"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """List open review cases without exposing raw sensitive evidence."""
+    pipeline = _resolve_pipeline(pipeline)
+
+    async def _list() -> list[dict[str, Any]]:
+        runtime = await build_runtime(pipeline_path=pipeline, scope_path=scope)
+        try:
+            cases = await runtime.list_review_cases()
+            return [case.model_dump(mode="json") for case in cases]
+        finally:
+            await runtime.close()
+
+    try:
+        cases = asyncio.run(_list())
+    except Exception as exc:
+        typer.echo(f"review list failed: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    if json_output:
+        typer.echo(json.dumps(cases, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if not cases:
+        typer.echo("no open review cases")
+        return
+    for item in cases:
+        categories = ",".join(item["categories"])
+        typer.echo(
+            f"{item['case_id']}  task={item['task_id']}  "
+            f"worker={item['worker']}:{item['action']}  categories={categories}"
+        )
+        for summary in item["summaries"]:
+            typer.echo(f"  {summary}")
+
+
+@review_app.command("show")
+def review_show_command(
+    case_id: str = typer.Argument(...),
+    pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
+    scope: Path | None = typer.Option(None, "--scope", "-s"),
+) -> None:
+    """Show one review case and its paused task."""
+    pipeline = _resolve_pipeline(pipeline)
+
+    async def _show() -> dict[str, Any] | None:
+        runtime = await build_runtime(pipeline_path=pipeline, scope_path=scope)
+        try:
+            return await runtime.review_case_details(case_id)
+        finally:
+            await runtime.close()
+
+    try:
+        result = asyncio.run(_show())
+    except Exception as exc:
+        typer.echo(f"review show failed: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if result is None:
+        typer.echo(f"unknown review case: {case_id}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _resolve_review_from_cli(
+    *,
+    case_id: str,
+    approve: bool,
+    reason: str | None,
+    pipeline: Path | None,
+    scope: Path | None,
+) -> None:
+    resolved_pipeline = _resolve_pipeline(pipeline)
+
+    async def _resolve() -> dict[str, Any]:
+        runtime = await build_runtime(
+            pipeline_path=resolved_pipeline,
+            scope_path=scope,
+        )
+        try:
+            case = (
+                await runtime.approve_review_case(case_id, reason=reason)
+                if approve
+                else await runtime.reject_review_case(case_id, reason=reason)
+            )
+            return case.model_dump(mode="json")
+        finally:
+            await runtime.close()
+
+    action = "approve" if approve else "reject"
+    try:
+        result = asyncio.run(_resolve())
+    except Exception as exc:
+        typer.echo(f"review {action} failed: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(f"{result['case_id']}: {result['state']}")
+
+
+@review_app.command("approve")
+def review_approve_command(
+    case_id: str = typer.Argument(...),
+    reason: str | None = typer.Option(None, "--reason"),
+    pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
+    scope: Path | None = typer.Option(None, "--scope", "-s"),
+) -> None:
+    """Approve and release exactly one paused task."""
+    _resolve_review_from_cli(
+        case_id=case_id,
+        approve=True,
+        reason=reason,
+        pipeline=pipeline,
+        scope=scope,
+    )
+
+
+@review_app.command("reject")
+def review_reject_command(
+    case_id: str = typer.Argument(...),
+    reason: str | None = typer.Option(None, "--reason"),
+    pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
+    scope: Path | None = typer.Option(None, "--scope", "-s"),
+) -> None:
+    """Reject and permanently block exactly one paused task."""
+    _resolve_review_from_cli(
+        case_id=case_id,
+        approve=False,
+        reason=reason,
+        pipeline=pipeline,
+        scope=scope,
+    )
 
 
 @app.command("export")

@@ -143,6 +143,11 @@ domain and separately asks whether wildcard subdomains are authorized. Existing
 `OUT_OF_SCOPE`, `PASSIVE_ONLY`, or otherwise explicit classifications are never
 silently overridden.
 
+Bundled `pipeline.example.yaml` and `scope.example.yaml` files are templates,
+not operational authorization. Runtime commands reject paths whose filename is
+marked `.example.`; run `nightscout setup`, or copy, rename, and review the
+templates before use.
+
 For automation/non-interactive use with the managed local scope:
 
 ```bash
@@ -210,6 +215,12 @@ nightscout status
 
 # Explain a persisted Event by event ID or exact Event value.
 nightscout explain <event-id-or-value>
+
+# Inspect and resolve tasks paused by policy/review gates.
+nightscout review list
+nightscout review show <case-id>
+nightscout review approve <case-id> --reason "authorized by program policy"
+nightscout review reject <case-id> --reason "not authorized"
 
 # Export SAFE JSONL, TXT and CSV views.
 nightscout export
@@ -491,6 +502,7 @@ nightscout setup
 nightscout run <root-domain>
 nightscout status
 nightscout explain <event-id-or-value>
+nightscout review list|show|approve|reject
 nightscout export
 nightscout doctor
 nightscout tools ...
@@ -1901,6 +1913,11 @@ source: historical mobile artifact
 event: evt_...
 automation: paused
 ```
+
+Program-specific `restrictions.rules` in the pipeline may return either
+`BLOCK` or `REVIEW`. A REVIEW decision creates a durable case and leaves the
+task in `REVIEW`; approval releases that exact task and is recorded in the
+policy audit trail, while rejection moves it to `BLOCKED`.
 
 Possible review classes:
 

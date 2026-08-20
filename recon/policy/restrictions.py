@@ -459,6 +459,26 @@ class RestrictionDecisionRecorder(Protocol):
         ...
 
 
+class RestrictionReviewBridge(Protocol):
+    """Connect program REVIEW decisions to the shared human-review queue."""
+
+    async def approved_for_task(
+        self,
+        *,
+        task: Task,
+        decision: RestrictionDecision,
+    ) -> bool:
+        ...
+
+    async def open_case(
+        self,
+        *,
+        task: Task,
+        decision: RestrictionDecision,
+    ) -> str:
+        ...
+
+
 BASELINE_BLOCKED_ACTION_CLASSES = frozenset(
     {
         ActionClass.AUTHENTICATED_ACCESS,
@@ -577,10 +597,12 @@ class RestrictionsGate:
         engine: RestrictionEngine,
         descriptors: ActionDescriptorProvider,
         recorder: RestrictionDecisionRecorder | None = None,
+        review_bridge: RestrictionReviewBridge | None = None,
     ) -> None:
         self._engine = engine
         self._descriptors = descriptors
         self._recorder = recorder
+        self._review_bridge = review_bridge
 
     async def evaluate(
         self,
@@ -611,6 +633,27 @@ class RestrictionsGate:
                 descriptor=descriptor,
             )
 
+        case_id: str | None = None
+        if (
+            decision.outcome is GateOutcome.REVIEW
+            and self._review_bridge is not None
+        ):
+            if await self._review_bridge.approved_for_task(
+                task=task,
+                decision=decision,
+            ):
+                decision = decision.model_copy(
+                    update={
+                        "outcome": GateOutcome.ALLOW,
+                        "reason": "program restriction was explicitly approved by human review",
+                    }
+                )
+            else:
+                case_id = await self._review_bridge.open_case(
+                    task=task,
+                    decision=decision,
+                )
+
         if self._recorder is not None:
             await self._recorder.record(
                 task=task,
@@ -619,7 +662,12 @@ class RestrictionsGate:
 
         return GateDecision(
             outcome=decision.outcome,
-            reason=decision.reason,
+            reason=(
+                f"{decision.reason}; case={case_id}"
+                if case_id is not None
+                else decision.reason
+            ),
+            review_case_id=case_id,
         )
 
 

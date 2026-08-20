@@ -13,8 +13,13 @@ def test_cli_version_and_help():
 
     help_result = runner.invoke(app, ["--help"])
     assert help_result.exit_code == 0
-    for command in ("setup", "doctor", "run", "status", "explain", "export", "tools", "wordlists"):
+    for command in ("setup", "doctor", "run", "status", "explain", "export", "review", "tools", "wordlists"):
         assert command in help_result.stdout
+
+    review_help = runner.invoke(app, ["review", "--help"])
+    assert review_help.exit_code == 0
+    for command in ("list", "show", "approve", "reject"):
+        assert command in review_help.stdout
 
 
 def test_cli_tools_list() -> None:
@@ -23,6 +28,68 @@ def test_cli_tools_list() -> None:
     assert result.exit_code == 0
     assert '"subfinder"' in result.stdout
     assert '"debian"' in result.stdout or '"kali"' in result.stdout
+
+
+def test_cli_review_lists_and_approves_case(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    calls: list[tuple[str, str]] = []
+    open_payload = {
+        "case_id": "rev_fixture",
+        "task_id": "tsk_fixture",
+        "worker": "permutations",
+        "action": "generate_targeted",
+        "categories": ["POLICY_AMBIGUITY"],
+        "summaries": ["program restriction fixture: approval required"],
+        "state": "OPEN",
+    }
+
+    class FakeRuntime:
+        async def list_review_cases(self):
+            return (SimpleNamespace(model_dump=lambda mode="json": open_payload),)
+
+        async def approve_review_case(self, case_id, *, reason=None):
+            calls.append((case_id, reason))
+            return SimpleNamespace(
+                model_dump=lambda mode="json": {
+                    **open_payload,
+                    "state": "APPROVED",
+                }
+            )
+
+        async def close(self):
+            pass
+
+    async def fake_build_runtime(**kwargs):
+        return FakeRuntime()
+
+    monkeypatch.setattr("recon.cli.build_runtime", fake_build_runtime)
+    pipeline = tmp_path / "pipeline.yaml"
+    runner = CliRunner()
+
+    listed = runner.invoke(
+        app,
+        ["review", "list", "--pipeline", str(pipeline)],
+    )
+    assert listed.exit_code == 0
+    assert "rev_fixture" in listed.stdout
+    assert "approval required" in listed.stdout
+
+    approved = runner.invoke(
+        app,
+        [
+            "review",
+            "approve",
+            "rev_fixture",
+            "--reason",
+            "authorized",
+            "--pipeline",
+            str(pipeline),
+        ],
+    )
+    assert approved.exit_code == 0
+    assert "APPROVED" in approved.stdout
+    assert calls == [("rev_fixture", "authorized")]
 
 
 def test_cli_setup_without_tool_install(monkeypatch, tmp_path) -> None:

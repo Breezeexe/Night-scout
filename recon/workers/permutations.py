@@ -477,7 +477,10 @@ class PermutationsConfig(BaseModel):
 
     @property
     def exploration_candidate_limit(self) -> int:
-        total = self.effective_max_candidates
+        return self.exploration_limit_for(self.effective_max_candidates)
+
+    def exploration_limit_for(self, total: int) -> int:
+        """Return the protected exploration share for an effective tier cap."""
 
         reserved = max(
             self.minimum_exploration_candidates,
@@ -490,11 +493,10 @@ class PermutationsConfig(BaseModel):
 
     @property
     def targeted_candidate_limit(self) -> int:
-        return max(
-            self.effective_max_candidates
-            - self.exploration_candidate_limit,
-            0,
-        )
+        return self.targeted_limit_for(self.effective_max_candidates)
+
+    def targeted_limit_for(self, total: int) -> int:
+        return max(total - self.exploration_limit_for(total), 0)
 
 
 class PermutationBudgetPlanner:
@@ -574,6 +576,10 @@ class PermutationsWorker:
         self._learned = learned or NoLearnedHypotheses()
         self._config = config or PermutationsConfig()
 
+    @staticmethod
+    def candidate_limit_for_tier(tier: str) -> int:
+        return DEFAULT_TIER_LIMITS[CandidateTier(tier)]
+
     async def execute(
         self,
         task: Task,
@@ -647,12 +653,19 @@ class PermutationsWorker:
         else:
             learned = ()
 
+        effective_total = min(
+            self._config.effective_max_candidates,
+            task.candidate_limit_hint or self._config.effective_max_candidates,
+        )
+        effective_tier = CandidateTier(task.search_tier or self._config.tier.value)
         candidates = await self.generate_candidates(
             seed_event=seed_event,
             seed=seed,
             corpus=corpus,
             learned=learned,
             lane=lane,
+            candidate_limit=effective_total,
+            tier=effective_tier,
         )
 
         for candidate in candidates:
@@ -673,14 +686,14 @@ class PermutationsWorker:
                     "hypothesis",
                     "dns-candidate",
                     f"lane:{candidate.lane.value.lower()}",
-                    f"tier:{self._config.tier.value.lower()}",
+                    f"tier:{effective_tier.value.lower()}",
                     f"method:{candidate.method.value.lower()}",
                 },
                 metadata={
                     "hypothesis": True,
                     "requires_dns_confirmation": True,
                     "candidate_lane": candidate.lane.value,
-                    "candidate_tier": self._config.tier.value,
+                    "candidate_tier": effective_tier.value,
                     "generation_method": candidate.method.value,
                     "generation_score": candidate.score,
                     "word_tokens": list(candidate.word_tokens),
@@ -707,6 +720,8 @@ class PermutationsWorker:
         corpus: Sequence[PermutationWord],
         learned: Sequence[LearnedHostnameHypothesis],
         lane: CandidateLane,
+        candidate_limit: int | None = None,
+        tier: CandidateTier | None = None,
     ) -> tuple[PermutationCandidate, ...]:
         """Generate one independently-budgeted lane."""
         words = _dedupe_words(corpus)
@@ -721,7 +736,8 @@ class PermutationsWorker:
                 key=_targeted_word_sort_key,
             )
 
-            limit = self._config.targeted_candidate_limit
+            total = candidate_limit or self._config.effective_max_candidates
+            limit = self._config.targeted_limit_for(total)
 
             word_candidates = self._generate_word_candidates(
                 seed_event=seed_event,
@@ -750,7 +766,8 @@ class PermutationsWorker:
             key=_exploration_word_sort_key,
         )
 
-        limit = self._config.exploration_candidate_limit
+        total = candidate_limit or self._config.effective_max_candidates
+        limit = self._config.exploration_limit_for(total)
 
         if not exploration_words or limit <= 0:
             return ()
@@ -761,7 +778,7 @@ class PermutationsWorker:
         indexes = await self._exploration_cursors.claim_window(
             namespace=_exploration_namespace(
                 seed=seed,
-                tier=self._config.tier,
+                tier=tier or self._config.tier,
             ),
             pool_size=len(exploration_words),
             window_size=min(

@@ -27,7 +27,7 @@ import math
 from datetime import datetime, timezone
 from typing import Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from recon.core.queue import Task, TaskQueue
 
@@ -89,8 +89,16 @@ class SchedulerConfig(BaseModel):
     age_boost_per_minute: float = Field(default=0.01, ge=0.0)
     max_age_boost: float = Field(default=3.0, ge=0.0)
 
-    candidate_limit: int | None = Field(default=None, ge=1)
+    candidate_limit: int = Field(default=256, ge=1, le=10_000)
     signal_concurrency: int = Field(default=32, ge=1)
+
+    @field_validator("candidate_limit", mode="before")
+    @classmethod
+    def bounded_default_candidate_limit(cls, value: object) -> object:
+        # Older generated pipeline files used YAML null to mean unbounded.
+        # Treat it as the safe bounded default instead of retaining O(n)
+        # scoring on every scheduler iteration.
+        return 256 if value is None else value
 
 
 class ScoreBreakdown(BaseModel):
@@ -157,7 +165,10 @@ class Scheduler:
 
         No task lifecycle state is modified by this method.
         """
-        tasks = await self._queue.ready(limit=self._config.candidate_limit)
+        tasks = await self._queue.ready(
+            limit=self._config.candidate_limit,
+            fair=True,
+        )
 
         if not tasks:
             return []

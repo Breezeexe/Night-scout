@@ -72,6 +72,7 @@ class Task(BaseModel):
     worker: str
     action: str
     input_event_id: str
+    input_identity_key: str | None = None
 
     branch_id: str | None = None
 
@@ -95,6 +96,12 @@ class Task(BaseModel):
 
     last_error: str | None = None
 
+    # Ephemeral execution hints are resolved from current convergence state
+    # immediately before worker dispatch. Durable queue provenance remains
+    # independent from the intelligence layer.
+    search_tier: str | None = None
+    candidate_limit_hint: int | None = Field(default=None, ge=1)
+
     @field_validator("worker", "action", "input_event_id")
     @classmethod
     def must_not_be_blank(cls, value: str) -> str:
@@ -113,6 +120,20 @@ class Task(BaseModel):
         if value is None:
             return None
         return value.strip() or None
+
+    @field_validator("input_identity_key")
+    @classmethod
+    def normalize_optional_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+    @field_validator("search_tier")
+    @classmethod
+    def normalize_search_tier(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip().upper() or None
 
     @field_validator(
         "created_at",
@@ -156,7 +177,8 @@ class Task(BaseModel):
         A worker may expose more than one action for the same event, so action
         is deliberately part of the key.
         """
-        return f"{self.worker}:{self.action}:{self.input_event_id}"
+        logical_input = self.input_identity_key or self.input_event_id
+        return f"{self.worker}:{self.action}:{logical_input}"
 
     @property
     def is_terminal(self) -> bool:
@@ -191,7 +213,23 @@ class TaskStore(Protocol):
         """Persist an existing task."""
         ...
 
-    async def ready(self, *, now: datetime, limit: int | None = None) -> list[Task]:
+    async def claim(
+        self,
+        task_id: str,
+        *,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> Task:
+        """Atomically claim one ready task or raise ValueError."""
+        ...
+
+    async def ready(
+        self,
+        *,
+        now: datetime,
+        limit: int | None = None,
+        fair: bool = False,
+    ) -> list[Task]:
         """Return runnable tasks ordered for scheduler consumption."""
         ...
 
@@ -214,10 +252,13 @@ class InMemoryTaskStore:
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
         self._active_keys: dict[str, str] = {}
+        self._known_keys: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
     async def put(self, task: Task) -> bool:
         async with self._lock:
+            if task.dedupe_key in self._known_keys:
+                return False
             existing_id = self._active_keys.get(task.dedupe_key)
             if existing_id is not None:
                 existing = self._tasks.get(existing_id)
@@ -227,6 +268,7 @@ class InMemoryTaskStore:
 
             stored = task.model_copy(deep=True)
             self._tasks[stored.task_id] = stored
+            self._known_keys[stored.dedupe_key] = stored.task_id
 
             if not stored.is_terminal:
                 self._active_keys[stored.dedupe_key] = stored.task_id
@@ -259,7 +301,50 @@ class InMemoryTaskStore:
                     )
                 self._active_keys[stored.dedupe_key] = stored.task_id
 
-    async def ready(self, *, now: datetime, limit: int | None = None) -> list[Task]:
+    async def claim(
+        self,
+        task_id: str,
+        *,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> Task:
+        """Atomically transition a ready in-memory task to RUNNING."""
+        async with self._lock:
+            try:
+                current = self._tasks[task_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown task_id: {task_id}") from exc
+
+            if current.status not in {TaskStatus.PENDING, TaskStatus.DEFERRED}:
+                raise ValueError(
+                    f"task {task_id} is not claimable from {current.status}"
+                )
+            if current.available_at > now:
+                raise ValueError(f"task {task_id} is not available yet")
+            if current.attempts >= current.max_attempts:
+                raise ValueError(f"task {task_id} has exhausted its retry budget")
+
+            claimed = current.model_copy(
+                update={
+                    "attempts": current.attempts + 1,
+                    "started_at": now,
+                    "finished_at": None,
+                    "status": TaskStatus.RUNNING,
+                    "lease_expires_at": lease_expires_at,
+                    "updated_at": now,
+                    "last_error": None,
+                }
+            )
+            self._tasks[task_id] = claimed
+            return claimed.model_copy(deep=True)
+
+    async def ready(
+        self,
+        *,
+        now: datetime,
+        limit: int | None = None,
+        fair: bool = False,
+    ) -> list[Task]:
         async with self._lock:
             candidates = [
                 task
@@ -268,16 +353,63 @@ class InMemoryTaskStore:
                 and task.available_at <= now
             ]
 
-            candidates.sort(
-                key=lambda task: (
+            def priority_key(task: Task) -> tuple[float, datetime, datetime, str]:
+                return (
                     -task.priority,
                     task.available_at,
                     task.created_at,
                     task.task_id,
                 )
-            )
+            candidates.sort(key=priority_key)
 
-            if limit is not None:
+            if limit is not None and fair:
+                top_count, oldest_count, exploration_count, tail_count = (
+                    fair_lane_limits(limit)
+                )
+                lanes = (
+                    candidates[:top_count],
+                    sorted(candidates, key=lambda task: (task.created_at, task.task_id))[
+                        :oldest_count
+                    ],
+                    [
+                        task
+                        for task in candidates
+                        if "exploration"
+                        in " ".join(
+                            filter(
+                                None,
+                                (
+                                    task.action,
+                                    task.route_rule_id or "",
+                                    task.routing_reason or "",
+                                ),
+                            )
+                        ).lower()
+                    ][:exploration_count],
+                    sorted(
+                        candidates,
+                        key=lambda task: (
+                            task.priority,
+                            task.created_at,
+                            task.task_id,
+                        ),
+                    )[:tail_count],
+                    candidates,
+                )
+                selected: list[Task] = []
+                seen: set[str] = set()
+                for lane in lanes:
+                    for task in lane:
+                        if task.task_id in seen:
+                            continue
+                        seen.add(task.task_id)
+                        selected.append(task)
+                        if len(selected) >= limit:
+                            break
+                    if len(selected) >= limit:
+                        break
+                candidates = selected
+            elif limit is not None:
                 candidates = candidates[:limit]
 
             return [task.model_copy(deep=True) for task in candidates]
@@ -298,6 +430,17 @@ class InMemoryTaskStore:
     async def all(self) -> list[Task]:
         async with self._lock:
             return [task.model_copy(deep=True) for task in self._tasks.values()]
+
+
+def fair_lane_limits(limit: int) -> tuple[int, int, int, int]:
+    """Split a bounded shortlist across priority, age and diversity lanes."""
+    if limit <= 0:
+        return (0, 0, 0, 0)
+    top = max(1, limit // 2)
+    oldest = (limit - top) // 2
+    exploration = (limit - top - oldest) // 2
+    tail = limit - top - oldest - exploration
+    return top, oldest, exploration, tail
 
 
 class TaskQueue:
@@ -338,11 +481,16 @@ class TaskQueue:
         """Return a task by identifier."""
         return await self._store.get(task_id)
 
-    async def ready(self, *, limit: int | None = None) -> list[Task]:
+    async def ready(
+        self,
+        *,
+        limit: int | None = None,
+        fair: bool = False,
+    ) -> list[Task]:
         """Return tasks that are eligible for scheduler consideration."""
         if limit is not None and limit < 1:
             raise ValueError("limit must be >= 1")
-        return await self._store.ready(now=utc_now(), limit=limit)
+        return await self._store.ready(now=utc_now(), limit=limit, fair=fair)
 
     async def claim(
         self,
@@ -357,29 +505,12 @@ class TaskQueue:
         if lease_for <= timedelta(0):
             raise ValueError("lease_for must be positive")
 
-        async with self._transition_lock:
-            task = await self._require(task_id)
-            now = utc_now()
-
-            if task.status not in {TaskStatus.PENDING, TaskStatus.DEFERRED}:
-                raise ValueError(f"task {task_id} is not claimable from {task.status}")
-
-            if task.available_at > now:
-                raise ValueError(f"task {task_id} is not available yet")
-
-            if task.attempts >= task.max_attempts:
-                raise ValueError(f"task {task_id} has exhausted its retry budget")
-
-            task.attempts += 1
-            task.started_at = now
-            task.finished_at = None
-            task.status = TaskStatus.RUNNING
-            task.lease_expires_at = now + lease_for
-            task.updated_at = now
-            task.last_error = None
-
-            await self._store.save(task)
-            return task
+        now = utc_now()
+        return await self._store.claim(
+            task_id,
+            now=now,
+            lease_expires_at=now + lease_for,
+        )
 
     async def heartbeat(
         self,
@@ -430,9 +561,7 @@ class TaskQueue:
             task.lease_expires_at = None
             task.updated_at = now
 
-            can_retry = task.attempts < task.max_attempts and retry_delay is not None
-
-            if can_retry:
+            if retry_delay is not None and task.attempts < task.max_attempts:
                 if retry_delay < timedelta(0):
                     raise ValueError("retry_delay cannot be negative")
 

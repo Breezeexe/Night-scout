@@ -71,10 +71,14 @@ def user_paths() -> UserPaths:
 
 
 def preferred_pipeline_path() -> Path:
-    paths = user_paths()
-    if paths.pipeline_path.is_file():
-        return paths.pipeline_path
-    return default_pipeline_path()
+    """Return the managed user pipeline path, whether or not setup ran.
+
+    Bundled example configuration is a template, not an execution default.
+    Returning the expected user path makes every operational command fail
+    closed with a useful ``FileNotFoundError`` until ``nightscout setup`` has
+    created an explicit local policy.
+    """
+    return user_paths().pipeline_path
 
 
 def is_default_user_pipeline(path: str | Path) -> bool:

@@ -16,11 +16,11 @@ from collections.abc import Iterable, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from recon.core.events import Event, EventType
+from recon.core.events import Event
+from recon.core.redaction import sanitize_url
 
 
 class ExportMode(StrEnum):
@@ -182,12 +182,6 @@ def _metadata_key_is_sensitive(key: str) -> bool:
         )
     )
 
-_SENSITIVE_QUERY_RE = re.compile(
-    r"(?:^|[_-])(?:pass(?:word|wd)?|secret|token|key|auth|session|cookie|code|credential)(?:$|[_-])",
-    re.IGNORECASE,
-)
-
-
 def normalize_fingerprint(value: str) -> str | None:
     normalized = value.strip().lower().replace(":", "")
     if not normalized or not re.fullmatch(r"[0-9a-f]{16,128}", normalized):
@@ -218,39 +212,7 @@ def sensitive_fingerprint_for_event(event: Event) -> str | None:
 
 def sanitize_url_for_safe_export(value: str) -> str:
     """Keep useful query data while redacting likely credential parameters."""
-
-    try:
-        parts = urlsplit(value)
-    except ValueError:
-        return value
-
-    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
-        return value
-
-    if not parts.query:
-        return value
-
-    try:
-        pairs = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=False)
-    except ValueError:
-        return value
-
-    safe_pairs: list[tuple[str, str]] = []
-    for key, val in pairs:
-        if _SENSITIVE_QUERY_RE.search(key):
-            safe_pairs.append((key, "[REDACTED]"))
-        else:
-            safe_pairs.append((key, val))
-
-    return urlunsplit(
-        (
-            parts.scheme,
-            parts.netloc,
-            parts.path,
-            urlencode(safe_pairs, doseq=True),
-            parts.fragment,
-        )
-    )
+    return sanitize_url(value)
 
 
 def sanitize_export_value(value: Any, *, key: str | None = None) -> Any:

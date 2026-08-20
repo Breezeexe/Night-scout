@@ -42,7 +42,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from recon.core.budgets import (
     BudgetContext,
-    BudgetDecision,
     BudgetDemand,
     BudgetManager,
     BudgetOutcome,
@@ -92,6 +91,7 @@ class GateDecision(BaseModel):
 
     outcome: GateOutcome
     reason: str | None = None
+    review_case_id: str | None = None
 
     retry_after_seconds: float | None = Field(default=None, ge=0.0)
 
@@ -105,6 +105,8 @@ class GateDecision(BaseModel):
             raise ValueError(
                 "retry_after_seconds is only valid for DEFER decisions"
             )
+        if self.review_case_id is not None and self.outcome is not GateOutcome.REVIEW:
+            raise ValueError("review_case_id is only valid for REVIEW decisions")
         return self
 
 
@@ -219,6 +221,28 @@ class ExecutionGate(Protocol):
         ...
 
 
+class LifecycleReviewCoordinator(Protocol):
+    """Open and authorize review decisions not owned by a specialized gate."""
+
+    async def approved_for(
+        self,
+        *,
+        task: Task,
+        gate_name: str,
+        reason: str,
+    ) -> bool:
+        ...
+
+    async def open_case(
+        self,
+        *,
+        task: Task,
+        gate_name: str,
+        reason: str,
+    ) -> str:
+        ...
+
+
 class BudgetPlanner(Protocol):
     """Derive budget demand/context from task and scheduling intelligence."""
 
@@ -279,6 +303,7 @@ class Lifecycle:
         budget_planner: BudgetPlanner | None = None,
         task_lease_for: timedelta = timedelta(minutes=5),
         heartbeat_interval: timedelta | None = None,
+        review_coordinator: LifecycleReviewCoordinator | None = None,
     ) -> None:
         gate_list = tuple(gates)
 
@@ -312,6 +337,7 @@ class Lifecycle:
 
         self._task_lease_for = task_lease_for
         self._heartbeat_interval = heartbeat_interval
+        self._review_coordinator = review_coordinator
 
     async def recover_expired(
         self,
@@ -574,16 +600,39 @@ class Lifecycle:
                 )
 
             if decision.outcome is GateOutcome.REVIEW:
+                reason = decision.reason or "manual review required"
+                case_id = decision.review_case_id
+                if case_id is None and self._review_coordinator is not None:
+                    gate_name = type(gate).__name__
+                    if await self._review_coordinator.approved_for(
+                        task=task,
+                        gate_name=gate_name,
+                        reason=reason,
+                    ):
+                        continue
+                    case_id = await self._review_coordinator.open_case(
+                        task=task,
+                        gate_name=gate_name,
+                        reason=reason,
+                    )
                 review = await self._queue.send_to_review(
                     task.task_id,
-                    reason=decision.reason or "manual review required",
+                    reason=(
+                        f"{reason}; case={case_id}"
+                        if case_id is not None and f"case={case_id}" not in reason
+                        else reason
+                    ),
                 )
                 return LifecycleResult(
                     outcome=LifecycleOutcome.REVIEW,
                     task_id=task.task_id,
                     worker=task.worker,
                     action=task.action,
-                    reason=decision.reason,
+                    reason=(
+                        f"{reason}; case={case_id}"
+                        if case_id is not None and f"case={case_id}" not in reason
+                        else reason
+                    ),
                     schedule_score=schedule.score,
                     queue_status=review.status,
                 )

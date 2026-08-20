@@ -7,12 +7,15 @@ import pytest
 from pydantic import SecretStr
 
 from recon.core.events import Event, EventType
+from recon.core.redaction import sanitize_url
 from recon.exporters.jsonl import (
     ExportMode,
     JsonlExportOptions,
     WorkspaceSensitiveEvidenceProvider,
     build_jsonl_records,
 )
+from recon.storage.database import Database, EventRepository
+from recon.storage.schema import upgrade_database
 from recon.workers.mobile import SensitiveEvidenceRecord, WorkspaceSensitiveEvidenceStore
 
 
@@ -69,3 +72,74 @@ async def test_safe_export_redacts_raw_secret_sensitive_mode_is_explicit(tmp_pat
     evidence_file = next((tmp_path / "protected").glob("*.json"))
     assert stat.S_IMODE((tmp_path / "protected").stat().st_mode) == 0o700
     assert stat.S_IMODE(evidence_file.stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_sensitive_url_is_redacted_before_ordinary_event_storage(tmp_path):
+    database_path = tmp_path / "events.sqlite3"
+    upgrade_database(database_path)
+    database = Database.from_path(database_path)
+    secret = "raw-super-secret-token"
+    event = Event(
+        type=EventType.URL,
+        value=(
+            "https://user:password@example.com/reset/abcdefghijk"
+            f"?page=2&access_token={secret}&apiKey={secret}"
+            f"&X-Amz-Signature={secret}"
+        ),
+        source="test",
+        metadata={
+            "request_url": f"https://example.com/callback?code={secret}&page=2",
+            "raw_secret": secret,
+        },
+    )
+    try:
+        await EventRepository(database).ingest(event)
+        stored = await EventRepository(database).get_event(event.event_id)
+        assert stored is not None
+        serialized = json.dumps(stored.model_dump(mode="json"))
+        assert secret not in serialized
+        assert "password" not in stored.value
+        assert "page=2" in stored.value
+        assert stored.metadata["raw_secret"] == "[REDACTED]"
+        assert "sensitive-data-redacted" in stored.tags
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "/oauth/callback?code=raw-super-secret-token",
+        "/api/reset/raw-super-secret-token",
+        "//example.com/callback?access_token=raw-super-secret-token",
+        "../callback?apiKey=raw-super-secret-token&safe=visible",
+    ),
+)
+def test_relative_web_references_are_redacted(value):
+    sanitized = sanitize_url(value)
+    assert "raw-super-secret-token" not in sanitized
+    assert "[REDACTED]" in sanitized or "%5BREDACTED%5D" in sanitized
+
+
+@pytest.mark.asyncio
+async def test_relative_api_endpoint_is_redacted_before_storage(tmp_path):
+    database_path = tmp_path / "relative-events.sqlite3"
+    upgrade_database(database_path)
+    database = Database.from_path(database_path)
+    secret = "raw-super-secret-token"
+    event = Event(
+        type=EventType.API_ENDPOINT,
+        value=f"/oauth/callback?access_token={secret}&page=2",
+        source="test",
+        metadata={"relative_url": f"//example.com/reset/{secret}"},
+    )
+    try:
+        await EventRepository(database).ingest(event)
+        stored = await EventRepository(database).get_event(event.event_id)
+        assert stored is not None
+        serialized = json.dumps(stored.model_dump(mode="json"))
+        assert secret not in serialized
+        assert "page=2" in stored.value
+    finally:
+        await database.dispose()

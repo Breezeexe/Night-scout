@@ -95,7 +95,6 @@ from recon.workers.permutations import (
     CandidateLane,
     ExplorationCursorStore,
     InMemoryExplorationCursorStore,
-    PermutationWord,
     WordCorpusProvider,
 )
 
@@ -865,6 +864,16 @@ class VHostWorker:
         self._backend = backend or HttpxVHostBackend()
         self._config = config or VHostWorkerConfig()
 
+    @staticmethod
+    def candidate_limit_for_tier(tier: str) -> int:
+        return {
+            "MICRO": 10,
+            "SMALL": 50,
+            "MEDIUM": 250,
+            "LARGE": 1_000,
+            "EXHAUSTIVE": 10_000,
+        }[tier]
+
     async def execute(
         self,
         task: Task,
@@ -926,6 +935,8 @@ class VHostWorker:
             if lane is CandidateLane.TARGETED
             else self._config.exploration_limit
         )
+        if task.candidate_limit_hint is not None:
+            candidate_limit = min(candidate_limit, task.candidate_limit_hint)
 
         raw_candidates = tuple(
             await self._candidates.candidates_for(

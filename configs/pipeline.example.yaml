@@ -35,6 +35,10 @@ runtime:
   heartbeat_interval_seconds: 60
   recover_retry_delay_seconds: 0
 
+  # Resume pending frontier items created by earlier interrupted/bounded runs.
+  # Origin and execution run attribution remain separate in storage.
+  resume_frontier: true
+
   project_vocabulary: true
   vulnerability_enrichment: true
   snapshot_capture: true
@@ -94,8 +98,8 @@ scheduler:
   age_boost_per_minute: 0.01
   max_age_boost: 3.0
 
-  # null = consider all currently ready tasks.
-  candidate_limit: null
+  # Bound scoring work per lifecycle step; legacy null is treated as 256.
+  candidate_limit: 256
   signal_concurrency: 32
 
 # -----------------------------------------------------------------------------
@@ -342,6 +346,12 @@ exploration:
   # A low-yield EXPLORATION branch normally cools down instead of being
   # permanently closed solely because its recent yield is low.
   exploration_low_yield_close: false
+
+# Program policy can only subtract permission. REVIEW rules create durable
+# cases that must be approved explicitly with `nightscout review approve`.
+restrictions:
+  enabled: true
+  rules: []
 
 # -----------------------------------------------------------------------------
 # Workers

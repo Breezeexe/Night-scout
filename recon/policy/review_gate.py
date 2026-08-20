@@ -311,6 +311,15 @@ class ReviewCaseStore(Protocol):
         """Return current human-review backlog."""
         ...
 
+    async def approved_for_task(
+        self,
+        task_id: str,
+        *,
+        signal_fingerprints: tuple[str, ...] | None = None,
+    ) -> ReviewCase | None:
+        """Return an approval that authorizes this exact queued task."""
+        ...
+
     async def resolve(
         self,
         case_id: str,
@@ -423,6 +432,31 @@ class InMemoryReviewCaseStore:
         )
         return cases
 
+    async def approved_for_task(
+        self,
+        task_id: str,
+        *,
+        signal_fingerprints: tuple[str, ...] | None = None,
+    ) -> ReviewCase | None:
+        async with self._lock:
+            cases = [
+                case
+                for case in self._cases.values()
+                if case.task_id == task_id
+                and case.state is ReviewCaseState.APPROVED
+                and (
+                    signal_fingerprints is None
+                    or case.signal_fingerprints == signal_fingerprints
+                )
+            ]
+            if not cases:
+                return None
+            cases.sort(
+                key=lambda case: case.resolved_at or case.opened_at,
+                reverse=True,
+            )
+            return cases[0].model_copy(deep=True)
+
     async def resolve(
         self,
         case_id: str,
@@ -521,27 +555,42 @@ class ReviewGate:
                 ),
             )
         else:
-            review_case = await self._cases.open_or_get(
-                task=task,
-                signals=triggering,
+            fingerprints = tuple(
+                sorted({signal.stable_fingerprint for signal in triggering})
             )
-
-            categories = ", ".join(
-                category.value
-                for category in review_case.categories
+            approved = await self._cases.approved_for_task(
+                task.task_id,
+                signal_fingerprints=fingerprints,
             )
-
-            evaluation = ReviewEvaluation(
-                outcome=GateOutcome.REVIEW,
-                task_id=task.task_id,
-                triggering_signals=triggering,
-                ignored_signals=ignored,
-                case_id=review_case.case_id,
-                reason=(
-                    f"human review required; case={review_case.case_id}; "
-                    f"categories={categories}"
-                ),
-            )
+            if approved is not None:
+                evaluation = ReviewEvaluation(
+                    outcome=GateOutcome.ALLOW,
+                    task_id=task.task_id,
+                    triggering_signals=triggering,
+                    ignored_signals=ignored,
+                    case_id=approved.case_id,
+                    reason=f"signals approved by human review case={approved.case_id}",
+                )
+            else:
+                review_case = await self._cases.open_or_get(
+                    task=task,
+                    signals=triggering,
+                )
+                categories = ", ".join(
+                    category.value
+                    for category in review_case.categories
+                )
+                evaluation = ReviewEvaluation(
+                    outcome=GateOutcome.REVIEW,
+                    task_id=task.task_id,
+                    triggering_signals=triggering,
+                    ignored_signals=ignored,
+                    case_id=review_case.case_id,
+                    reason=(
+                        f"human review required; case={review_case.case_id}; "
+                        f"categories={categories}"
+                    ),
+                )
 
         if self._recorder is not None:
             await self._recorder.record(
@@ -552,6 +601,11 @@ class ReviewGate:
         return GateDecision(
             outcome=evaluation.outcome,
             reason=evaluation.reason,
+            review_case_id=(
+                evaluation.case_id
+                if evaluation.outcome is GateOutcome.REVIEW
+                else None
+            ),
         )
 
 

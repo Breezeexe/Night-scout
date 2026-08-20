@@ -33,11 +33,9 @@ import contextvars
 import hashlib
 import json
 import os
-import shutil
-import subprocess
 import time
 from collections import Counter
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -46,7 +44,7 @@ from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from recon.core.budgets import (
     BudgetContext,
@@ -58,13 +56,16 @@ from recon.core.budgets import (
 from recon.core.events import Event, EventType, ScopeState
 from recon.core.lifecycle import (
     BudgetPlan,
+    GateDecision,
+    GateOutcome,
     Lifecycle,
     LifecycleOutcome,
-    LifecycleResult,
+    LifecycleReviewCoordinator,
     WorkerExecutionResult,
     WorkerOutcome,
 )
-from recon.core.queue import Task, TaskQueue, TaskStatus
+from recon.core.queue import Task, TaskQueue, TaskStatus, utc_now
+from recon.core.redaction import sanitize_event_for_storage
 from recon.core.router import RouteRule, Router, RoutingContext
 from recon.core.scheduler import (
     ScheduleDecision,
@@ -117,11 +118,14 @@ from recon.policy.rate_limit import RateLimitProfile, RateLimiter
 from recon.policy.restrictions import (
     RestrictionDecision,
     RestrictionEngine,
+    RestrictionRule,
     RestrictionsGate,
     StaticActionDescriptorProvider,
     default_recon_descriptor_rules,
 )
 from recon.policy.review_gate import (
+    ReviewCase,
+    ReviewCaseState,
     ReviewCategory,
     ReviewDecisionRecorder,
     ReviewEvaluation,
@@ -141,7 +145,6 @@ from recon.policy.seeds import (
 from recon.policy.scope import (
     ScopeAssetKind,
     ScopeDecision,
-    ScopeDecisionRecorder,
     ScopeEngine,
     ScopeGate,
     ScopeRule,
@@ -166,6 +169,7 @@ from recon.storage.models import (
     AssetRecord,
     EventObservationRecord,
     ReconRunRecord,
+    ReviewCaseRecord,
     SchedulerDecisionRecord,
     TaskRecord,
 )
@@ -356,6 +360,7 @@ class RuntimeLoopConfig(BaseModel):
     task_lease_seconds: int = Field(default=300, ge=30)
     heartbeat_interval_seconds: int = Field(default=60, ge=5)
     recover_retry_delay_seconds: int = Field(default=0, ge=0)
+    resume_frontier: bool = True
 
     project_vocabulary: bool = True
     vulnerability_enrichment: bool = True
@@ -364,6 +369,13 @@ class RuntimeLoopConfig(BaseModel):
     build_genome_on_finish: bool = True
 
     novel_asset_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
+
+
+class RestrictionsDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = True
+    rules: tuple[RestrictionRule, ...] = ()
 
 
 class PipelineDocument(BaseModel):
@@ -384,6 +396,7 @@ class PipelineDocument(BaseModel):
     rate_limit: dict[str, Any]
     routing: dict[str, Any]
     exploration: dict[str, Any] = Field(default_factory=dict)
+    restrictions: RestrictionsDocument = Field(default_factory=RestrictionsDocument)
     workers: dict[str, dict[str, Any]]
     intelligence: dict[str, Any]
     snapshots: dict[str, Any] = Field(default_factory=dict)
@@ -666,6 +679,107 @@ class ReviewDecisionAuditRecorder(ReviewDecisionRecorder):
         )
 
 
+class RuntimeRestrictionReviewBridge:
+    def __init__(self, cases: SQLiteReviewCaseStore) -> None:
+        self._cases = cases
+
+    async def approved_for_task(
+        self,
+        *,
+        task: Task,
+        decision: RestrictionDecision,
+    ) -> bool:
+        signal = _restriction_review_signal(task, decision)
+        approved = await self._cases.approved_for_task(
+            task.task_id,
+            signal_fingerprints=(signal.stable_fingerprint,),
+        )
+        return approved is not None
+
+    async def open_case(
+        self,
+        *,
+        task: Task,
+        decision: RestrictionDecision,
+    ) -> str:
+        signal = _restriction_review_signal(task, decision)
+        review_case = await self._cases.open_or_get(
+            task=task,
+            signals=(signal,),
+        )
+        return review_case.case_id
+
+
+def _restriction_review_signal(
+    task: Task,
+    decision: RestrictionDecision,
+) -> ReviewSignal:
+    rule = decision.matched_rule_id or decision.source.value
+    return ReviewSignal(
+        category=ReviewCategory.POLICY_AMBIGUITY,
+        severity=ReviewSeverity.HIGH,
+        confidence=1.0,
+        summary=f"program restriction {rule}: {decision.reason}",
+        source_event_id=task.input_event_id,
+        evidence_fingerprint=hashlib.sha256(
+            f"restriction|{task.task_id}|{rule}".encode()
+        ).hexdigest(),
+        tags=frozenset({"program-restriction", rule.lower()}),
+    )
+
+
+class RuntimeLifecycleReviewCoordinator(LifecycleReviewCoordinator):
+    """Persist review decisions from gates without their own case bridge."""
+
+    def __init__(self, cases: SQLiteReviewCaseStore) -> None:
+        self._cases = cases
+
+    @staticmethod
+    def _signal(*, task: Task, gate_name: str, reason: str) -> ReviewSignal:
+        normalized_gate = gate_name.strip() or "ExecutionGate"
+        category = (
+            ReviewCategory.SCOPE_AMBIGUITY
+            if "scope" in normalized_gate.lower()
+            else ReviewCategory.POLICY_AMBIGUITY
+        )
+        return ReviewSignal(
+            category=category,
+            severity=ReviewSeverity.HIGH,
+            confidence=1.0,
+            summary=f"execution gate {normalized_gate} requires manual review",
+            source_event_id=task.input_event_id,
+            evidence_fingerprint=hashlib.sha256(
+                f"lifecycle|{task.task_id}|{normalized_gate}|{reason}".encode()
+            ).hexdigest(),
+            tags=frozenset({"lifecycle-review", normalized_gate.lower()}),
+        )
+
+    async def approved_for(
+        self,
+        *,
+        task: Task,
+        gate_name: str,
+        reason: str,
+    ) -> bool:
+        signal = self._signal(task=task, gate_name=gate_name, reason=reason)
+        approved = await self._cases.approved_for_task(
+            task.task_id,
+            signal_fingerprints=(signal.stable_fingerprint,),
+        )
+        return approved is not None
+
+    async def open_case(
+        self,
+        *,
+        task: Task,
+        gate_name: str,
+        reason: str,
+    ) -> str:
+        signal = self._signal(task=task, gate_name=gate_name, reason=reason)
+        review_case = await self._cases.open_or_get(task=task, signals=(signal,))
+        return review_case.case_id
+
+
 class RuntimeReviewSignalProvider:
     """Small fail-safe classifier for explicitly tagged sensitive follow-ups."""
 
@@ -783,7 +897,7 @@ class CompositeSchedulingSignalProvider:
 
 
 class RecordingScheduler(Scheduler):
-    """Scheduler that persists the complete ranking at every selection point."""
+    """Scheduler that persists each bounded ranking in one transaction."""
 
     def __init__(self, *args: Any, decisions: DecisionRepository, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -791,12 +905,75 @@ class RecordingScheduler(Scheduler):
 
     async def select_next(self) -> ScheduleDecision | None:
         ranked = await self.rank_ready()
-        for index, decision in enumerate(ranked):
-            await self._decisions.record_schedule(
-                decision,
-                selected=(index == 0),
+        if ranked:
+            await self._decisions.record_schedules(
+                ranked,
+                selected_task_id=ranked[0].task_id,
             )
         return ranked[0] if ranked else None
+
+
+class RuntimeConvergenceGate:
+    """Enforce persisted branch convergence before budget reservation/claim."""
+
+    def __init__(self, *, events: EventRepository, state_store: Any) -> None:
+        self._events = events
+        self._state_store = state_store
+
+    async def evaluate(
+        self,
+        task: Task,
+        schedule: ScheduleDecision,
+    ) -> GateDecision:
+        del schedule
+        if task.branch_id is None:
+            return GateDecision(outcome=GateOutcome.ALLOW)
+
+        seed = await self._events.get_event(task.branch_id)
+        if seed is None:
+            return GateDecision(outcome=GateOutcome.ALLOW)
+
+        state = await self._state_store.get(
+            target_key=target_key_for_event(seed),
+            branch_id=task.branch_id,
+            lane=task_budget_lane(task),
+        )
+        if state is None:
+            return GateDecision(outcome=GateOutcome.ALLOW)
+        if state.closed:
+            return GateDecision(
+                outcome=GateOutcome.BLOCK,
+                reason="convergence closed this branch",
+            )
+        if state.cooldown_until is not None:
+            remaining = (state.cooldown_until - utc_now()).total_seconds()
+            if remaining > 0:
+                return GateDecision(
+                    outcome=GateOutcome.DEFER,
+                    reason="convergence cooldown is active for this branch",
+                    retry_after_seconds=remaining,
+                )
+        return GateDecision(outcome=GateOutcome.ALLOW)
+
+
+class RuntimeExplorationGate:
+    """Block exploration tasks when the pipeline disables that subsystem."""
+
+    def __init__(self, *, enabled: bool) -> None:
+        self._enabled = enabled
+
+    async def evaluate(
+        self,
+        task: Task,
+        schedule: ScheduleDecision,
+    ) -> GateDecision:
+        del schedule
+        if not self._enabled and task_budget_lane(task) is BudgetLane.EXPLORATION:
+            return GateDecision(
+                outcome=GateOutcome.BLOCK,
+                reason="exploration is disabled by pipeline configuration",
+            )
+        return GateDecision(outcome=GateOutcome.ALLOW)
 
 
 class RuntimeBudgetPlanner:
@@ -1041,6 +1218,7 @@ class RuntimeEventBus:
         return True
 
     async def _prepare_event(self, event: Event) -> Event:
+        event = sanitize_event_for_storage(event)
         direct_subject = scope_subject_from_event(event)
         prepared = event
 
@@ -1197,6 +1375,7 @@ class RuntimeWorkerExecutor:
         events: EventRepository,
         yield_model: YieldModel,
         convergence: ConvergenceController,
+        convergence_store: Any,
         initial_tier: SearchTier,
         run_id_getter: Any,
         warnings: list[str],
@@ -1206,6 +1385,7 @@ class RuntimeWorkerExecutor:
         self._events = events
         self._yield = yield_model
         self._convergence = convergence
+        self._convergence_store = convergence_store
         self._initial_tier = initial_tier
         self._run_id_getter = run_id_getter
         self._warnings = warnings
@@ -1219,12 +1399,13 @@ class RuntimeWorkerExecutor:
             )
 
         input_event = await self._events.get_event(task.input_event_id)
+        execution_task = await self._with_search_tier(task, worker=worker)
         metrics = PublicationMetrics()
         started = time.monotonic()
 
         try:
             with self._bus.bind_task(task, metrics):
-                result = await worker.execute(task)
+                result = await worker.execute(execution_task)
         except Exception:
             await self._record_yield(
                 task,
@@ -1251,6 +1432,32 @@ class RuntimeWorkerExecutor:
 
         await self._update_convergence(task, input_event=input_event)
         return result
+
+    async def _with_search_tier(self, task: Task, *, worker: Any) -> Task:
+        tier = self._initial_tier
+        if task.branch_id is not None:
+            seed = await self._events.get_event(task.branch_id)
+            if seed is not None:
+                state = await self._convergence_store.get(
+                    target_key=target_key_for_event(seed),
+                    branch_id=task.branch_id,
+                    lane=task_budget_lane(task),
+                )
+                if state is not None:
+                    tier = state.tier
+
+        limit_resolver = getattr(worker, "candidate_limit_for_tier", None)
+        candidate_limit = (
+            int(limit_resolver(tier.value))
+            if callable(limit_resolver)
+            else None
+        )
+        return task.model_copy(
+            update={
+                "search_tier": tier.value,
+                "candidate_limit_hint": candidate_limit,
+            }
+        )
 
     async def _record_yield(
         self,
@@ -1300,11 +1507,17 @@ class RuntimeWorkerExecutor:
             return
 
         try:
+            lane = task_budget_lane(task)
+            state = await self._convergence_store.get(
+                target_key=target_key_for_event(seed),
+                branch_id=task.branch_id,
+                lane=lane,
+            )
             await self._convergence.evaluate(
                 seed_event=seed,
                 branch_id=task.branch_id,
-                lane=task_budget_lane(task),
-                current_tier=self._initial_tier,
+                lane=lane,
+                current_tier=(state.tier if state is not None else self._initial_tier),
             )
         except Exception as exc:
             self._warnings.append(
@@ -1358,7 +1571,6 @@ class NightScoutRuntime:
         )
 
         cfg = self.configuration
-        project_root = cfg.project_root
         pipeline = cfg.pipeline
 
         storage = pipeline.storage
@@ -1385,7 +1597,10 @@ class NightScoutRuntime:
         self.branches = BranchRepository(self.database)
         self.provenance = ProvenanceRepository(self.database)
         self.snapshots = SnapshotRepository(self.database)
-        self.task_store = SQLiteTaskStore(self.database)
+        self.task_store = SQLiteTaskStore(
+            self.database,
+            resume_frontier=pipeline.runtime.resume_frontier,
+        )
         self.queue = TaskQueue(self.task_store)
         self.review_store = SQLiteReviewCaseStore(self.database)
         self.runs = RunRepository(self.database)
@@ -1503,6 +1718,7 @@ class NightScoutRuntime:
         scope_subjects = RuntimeScopeSubjectProvider(self.events)
 
         route_rules = all_runtime_route_rules()
+        exploration_enabled = bool(pipeline.exploration.get("enabled", True))
         enabled_rule_ids = {
             str(rule_id).strip()
             for rule_id in pipeline.routing.get("enabled_rule_ids", [])
@@ -1526,6 +1742,14 @@ class NightScoutRuntime:
             for rule in route_rules
             if rule.worker in enabled_workers
             and (not enabled_rule_ids or rule.rule_id in enabled_rule_ids)
+            and (
+                exploration_enabled
+                or not is_exploration_work(
+                    rule.action,
+                    rule.rule_id,
+                    rule.reason,
+                )
+            )
         )
 
         event_log_raw = dict(storage.get("event_log", {}))
@@ -1633,9 +1857,14 @@ class NightScoutRuntime:
             list(default_recon_descriptor_rules())
         )
         restrictions = RestrictionsGate(
-            engine=RestrictionEngine(),
+            engine=RestrictionEngine(
+                list(pipeline.restrictions.rules)
+                if pipeline.restrictions.enabled
+                else []
+            ),
             descriptors=descriptor_provider,
             recorder=RestrictionDecisionAuditRecorder(self.decisions),
+            review_bridge=RuntimeRestrictionReviewBridge(self.review_store),
         )
 
         activities = StaticWorkerActivityProvider(
@@ -1675,6 +1904,15 @@ class NightScoutRuntime:
             budget_store,
             profile=budget_profile,
         )
+        initial_tier = SearchTier(
+            str(pipeline.exploration.get("initial_tier", "SMALL")).upper()
+        )
+        maximum_tier = SearchTier(
+            str(pipeline.exploration.get("maximum_tier", "EXHAUSTIVE")).upper()
+        )
+        if initial_tier.rank > maximum_tier.rank:
+            raise ValueError("exploration.initial_tier cannot exceed maximum_tier")
+
         convergence = ConvergenceController(
             yield_model=self.yield_model,
             budget_inspector=budget_inspector,
@@ -1682,17 +1920,16 @@ class NightScoutRuntime:
             config=ConvergenceConfig.model_validate(
                 pipeline.intelligence.get("convergence", {})
             ),
+            maximum_tier=maximum_tier,
         )
 
-        initial_tier = SearchTier(
-            str(pipeline.exploration.get("initial_tier", "SMALL")).upper()
-        )
         executor = RuntimeWorkerExecutor(
             workers=self.workers,
             event_bus=self.event_bus,
             events=self.events,
             yield_model=self.yield_model,
             convergence=convergence,
+            convergence_store=self.intelligence.convergence_store,
             initial_tier=initial_tier,
             run_id_getter=lambda: self._run_id,
             warnings=self.warnings,
@@ -1703,18 +1940,31 @@ class NightScoutRuntime:
             convergence_store=self.intelligence.convergence_store,
             configuration=cfg,
         )
+        convergence_gate = RuntimeConvergenceGate(
+            events=self.events,
+            state_store=self.intelligence.convergence_store,
+        )
 
         runtime_cfg = pipeline.runtime
         self.lifecycle = Lifecycle(
             queue=self.queue,
             scheduler=self.scheduler,
             budgets=budget_manager,
-            gates=(scope_gate, restrictions, review_gate),
+            gates=(
+                RuntimeExplorationGate(enabled=exploration_enabled),
+                scope_gate,
+                restrictions,
+                convergence_gate,
+                review_gate,
+            ),
             executor=executor,
             budget_planner=budget_planner,
             task_lease_for=timedelta(seconds=runtime_cfg.task_lease_seconds),
             heartbeat_interval=timedelta(
                 seconds=runtime_cfg.heartbeat_interval_seconds
+            ),
+            review_coordinator=RuntimeLifecycleReviewCoordinator(
+                self.review_store
             ),
         )
 
@@ -2093,7 +2343,7 @@ class NightScoutRuntime:
                 )
 
             await self.runs.finish(run_id, status="SUCCEEDED")
-            status = await self.status()
+            status = await self.status(run_id=run_id)
 
             return RuntimeProgramRunSummary(
                 run_id=run_id,
@@ -2144,22 +2394,63 @@ class NightScoutRuntime:
             warnings=program.warnings,
         )
 
-    async def status(self) -> RuntimeStatus:
-        tasks = await self.task_store.all()
-        task_counts = Counter(task.status.value for task in tasks)
-        open_reviews = await self.review_store.open_cases()
-
+    async def status(self, *, run_id: str | None = None) -> RuntimeStatus:
+        """Return global workspace status or a run-attributed summary."""
         async with self.database.session() as session:
+            if run_id is None:
+                tasks = await self.task_store.all()
+                task_counts = Counter(task.status.value for task in tasks)
+                open_review_count = len(await self.review_store.open_cases())
+                event_filter: tuple[Any, ...] = ()
+            else:
+                task_run_filter = or_(
+                    TaskRecord.run_id == run_id,
+                    TaskRecord.execution_run_id == run_id,
+                )
+                task_rows = list(
+                    (
+                        await session.execute(
+                            select(TaskRecord.status, func.count(TaskRecord.task_id))
+                            .where(task_run_filter)
+                            .group_by(TaskRecord.status)
+                        )
+                    ).all()
+                )
+                task_counts = Counter(
+                    {str(status): int(count) for status, count in task_rows}
+                )
+                open_review_count = int(
+                    await session.scalar(
+                        select(func.count(ReviewCaseRecord.case_id))
+                        .join(
+                            TaskRecord,
+                            TaskRecord.task_id == ReviewCaseRecord.task_id,
+                        )
+                        .where(
+                            ReviewCaseRecord.state == "OPEN",
+                            task_run_filter,
+                        )
+                    )
+                    or 0
+                )
+                event_filter = (EventObservationRecord.run_id == run_id,)
+
             event_count = int(
                 await session.scalar(
-                    select(func.count(EventObservationRecord.event_id))
+                    select(func.count(EventObservationRecord.event_id)).where(
+                        *event_filter
+                    )
                 )
                 or 0
             )
-            asset_count = int(
-                await session.scalar(select(func.count(AssetRecord.asset_id)))
-                or 0
+            asset_statement = (
+                select(func.count(AssetRecord.asset_id))
+                if run_id is None
+                else select(
+                    func.count(func.distinct(EventObservationRecord.asset_id))
+                ).where(*event_filter)
             )
+            asset_count = int(await session.scalar(asset_statement) or 0)
             run_rows = list(
                 (
                     await session.execute(
@@ -2174,9 +2465,116 @@ class NightScoutRuntime:
             event_count=event_count,
             asset_count=asset_count,
             task_counts=dict(sorted(task_counts.items())),
-            open_review_cases=len(open_reviews),
+            open_review_cases=open_review_count,
             run_counts={str(status): int(count) for status, count in run_rows},
             warnings=tuple(dict.fromkeys(self.warnings)),
+        )
+
+    async def list_review_cases(self) -> tuple[ReviewCase, ...]:
+        return tuple(await self.review_store.open_cases())
+
+    async def review_case_details(self, case_id: str) -> dict[str, Any] | None:
+        review_case = await self.review_store.get(case_id.strip())
+        if review_case is None:
+            return None
+        task = await self.queue.get(review_case.task_id)
+        return {
+            "case": review_case.model_dump(mode="json"),
+            "task": task.model_dump(mode="json") if task is not None else None,
+        }
+
+    async def approve_review_case(
+        self,
+        case_id: str,
+        *,
+        reason: str | None = None,
+    ) -> ReviewCase:
+        existing = await self.review_store.get(case_id.strip())
+        if existing is None:
+            raise KeyError(f"unknown review case: {case_id.strip()}")
+        task = await self.queue.get(existing.task_id)
+        if task is None:
+            raise KeyError(f"review task no longer exists: {existing.task_id}")
+        if task.status not in {
+            TaskStatus.REVIEW,
+            TaskStatus.PENDING,
+            TaskStatus.DEFERRED,
+        }:
+            raise ValueError(
+                f"review task cannot be approved from state {task.status.value}"
+            )
+
+        review_case = await self._resolve_review_case(
+            case_id,
+            state=ReviewCaseState.APPROVED,
+            reason=reason,
+        )
+        if task.status is TaskStatus.REVIEW:
+            await self.queue.release_review(task.task_id)
+        await self.decisions.record_policy(
+            task_id=task.task_id,
+            gate="human_review_resolution",
+            outcome=ReviewCaseState.APPROVED.value,
+            reason=reason,
+            details={"case_id": review_case.case_id},
+        )
+        return review_case
+
+    async def reject_review_case(
+        self,
+        case_id: str,
+        *,
+        reason: str | None = None,
+    ) -> ReviewCase:
+        existing = await self.review_store.get(case_id.strip())
+        if existing is None:
+            raise KeyError(f"unknown review case: {case_id.strip()}")
+        task = await self.queue.get(existing.task_id)
+        if task is None:
+            raise KeyError(f"review task no longer exists: {existing.task_id}")
+
+        review_case = await self._resolve_review_case(
+            case_id,
+            state=ReviewCaseState.BLOCKED,
+            reason=reason,
+        )
+        if not task.is_terminal:
+            await self.queue.block(
+                task.task_id,
+                reason=reason or f"rejected by review case {review_case.case_id}",
+            )
+        await self.decisions.record_policy(
+            task_id=task.task_id,
+            gate="human_review_resolution",
+            outcome=ReviewCaseState.BLOCKED.value,
+            reason=reason,
+            details={"case_id": review_case.case_id},
+        )
+        return review_case
+
+    async def _resolve_review_case(
+        self,
+        case_id: str,
+        *,
+        state: ReviewCaseState,
+        reason: str | None,
+    ) -> ReviewCase:
+        normalized = case_id.strip()
+        if not normalized:
+            raise ValueError("review case id must not be blank")
+        existing = await self.review_store.get(normalized)
+        if existing is None:
+            raise KeyError(f"unknown review case: {normalized}")
+        if existing.state is state:
+            return existing
+        if existing.state is not ReviewCaseState.OPEN:
+            raise ValueError(
+                f"review case {normalized} is already {existing.state.value}"
+            )
+        return await self.review_store.resolve(
+            normalized,
+            state=state,
+            reason=reason,
         )
 
     async def all_events(self) -> tuple[Event, ...]:
@@ -2364,6 +2762,11 @@ def load_runtime_configuration(
     pipeline_file = Path(pipeline_path).expanduser().resolve()
     if not pipeline_file.is_file():
         raise FileNotFoundError(f"pipeline config not found: {pipeline_file}")
+    if ".example." in pipeline_file.name.lower():
+        raise ValueError(
+            "example pipeline is a template, not an operational config; "
+            "run nightscout setup or copy and explicitly configure it"
+        )
 
     project_root = discover_project_root(pipeline_file)
     raw_pipeline = load_yaml_mapping(pipeline_file)
@@ -2384,17 +2787,18 @@ def load_runtime_configuration(
                 if local_scope.is_file()
                 else resolve_project_path(project_root, configured_scope)
             )
-        if not scope_file.is_file():
-            example = scope_file.with_name(
-                scope_file.name.replace(".yaml", ".example.yaml")
-            )
-            if example.is_file():
-                scope_file = example
     else:
-        scope_file = resolve_project_path(project_root, "configs/scope.example.yaml")
+        raise ValueError(
+            "scope config is required: set pipeline.scope_file or pass --scope"
+        )
 
     if not scope_file.is_file():
         raise FileNotFoundError(f"scope config not found: {scope_file}")
+    if ".example." in scope_file.name.lower():
+        raise ValueError(
+            "example scope is a template, not an authorization policy; "
+            "copy it to a non-example path and review every rule"
+        )
 
     raw_scope = load_yaml_mapping(scope_file)
     scope = ScopeDocument.model_validate(raw_scope)
@@ -2523,17 +2927,20 @@ def scope_subject_from_event(event: Event) -> ScopeSubject | None:
 
 
 def task_budget_lane(task: Task) -> BudgetLane:
-    material = " ".join(
-        filter(
-            None,
-            (task.action, task.route_rule_id or "", task.routing_reason or ""),
-        )
-    ).lower()
     return (
         BudgetLane.EXPLORATION
-        if "exploration" in material
+        if is_exploration_work(
+            task.action,
+            task.route_rule_id,
+            task.routing_reason,
+        )
         else BudgetLane.NORMAL
     )
+
+
+def is_exploration_work(*descriptors: str | None) -> bool:
+    material = " ".join(value for value in descriptors if value).lower()
+    return "exploration" in material
 
 
 def event_from_storage_record(record: EventObservationRecord) -> Event:

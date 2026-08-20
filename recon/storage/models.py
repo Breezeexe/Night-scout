@@ -658,6 +658,7 @@ class BranchRecord(Base):
         default=lambda: _new_id("brn"),
     )
 
+    # Origin run only. A persistent branch may be resumed by later runs.
     run_id: Mapped[str | None] = mapped_column(
         String(40),
         ForeignKey("recon_runs.run_id", ondelete="SET NULL"),
@@ -742,7 +743,17 @@ class TaskRecord(Base):
         primary_key=True,
     )
 
+    # Run that originally created this frontier item.
     run_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey("recon_runs.run_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Most recent run that actually dispatched/claimed the item. Keeping this
+    # separate prevents persistent-frontier resume from rewriting provenance.
+    execution_run_id: Mapped[str | None] = mapped_column(
         String(40),
         ForeignKey("recon_runs.run_id", ondelete="SET NULL"),
         nullable=True,

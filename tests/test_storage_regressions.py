@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 import pytest
@@ -10,12 +11,22 @@ from recon.core.budgets import (
     BudgetMetric,
     BudgetReservation,
     BudgetReservationItem,
+)
+from recon.core.budgets import (
     utc_now as budget_now,
 )
-from recon.policy.rate_limit import RateBucketCheck, RateLimitOutcome, utc_now as rate_now
 from recon.core.events import Event, EventType
-from recon.core.queue import Task
-from recon.storage.database import Database, EventRepository, SQLiteBudgetStore, SQLiteRateLimitStore, SQLiteTaskStore
+from recon.core.queue import Task, TaskQueue, TaskStatus
+from recon.core.router import Router, RouteRule, RoutingContext
+from recon.policy.rate_limit import RateBucketCheck, RateLimitOutcome
+from recon.policy.rate_limit import utc_now as rate_now
+from recon.storage.database import (
+    Database,
+    EventRepository,
+    SQLiteBudgetStore,
+    SQLiteRateLimitStore,
+    SQLiteTaskStore,
+)
 from recon.storage.schema import upgrade_database
 
 
@@ -94,5 +105,83 @@ async def test_rate_lease_parent_is_flushed_before_fk_items(tmp_path):
         assert decision.lease is not None
         loaded = await store.get_lease(decision.lease.lease_id)
         assert loaded is not None and len(loaded.items) == 1
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_semantic_task_dedupe_survives_repeated_observation_and_completion(tmp_path):
+    path = tmp_path / "dedupe.sqlite3"
+    upgrade_database(path)
+    database = Database.from_path(path)
+    try:
+        events = EventRepository(database)
+        store = SQLiteTaskStore(database)
+        queue = TaskQueue(store)
+        router = Router(
+            [
+                RouteRule(
+                    rule_id="dns.resolve",
+                    accepts=frozenset({EventType.DNS_NAME}),
+                    worker="dns",
+                    action="resolve",
+                )
+            ]
+        )
+        first = Event(type=EventType.DNS_NAME, value="api.example.com", source="one")
+        repeated = Event(type=EventType.DNS_NAME, value="api.example.com", source="two")
+        await events.ingest(first)
+        await events.ingest(repeated)
+
+        first_task = router.expand(first, context=RoutingContext())[0]
+        repeated_task = router.expand(repeated, context=RoutingContext())[0]
+        assert first_task.dedupe_key == repeated_task.dedupe_key
+        assert await queue.enqueue(first_task) is True
+        assert await queue.enqueue(repeated_task) is False
+
+        await queue.claim(first_task.task_id)
+        await queue.succeed(first_task.task_id)
+        third = Event(type=EventType.DNS_NAME, value="api.example.com", source="three")
+        await events.ingest(third)
+        assert await queue.enqueue(router.expand(third, context=RoutingContext())[0]) is False
+        assert len(await store.all()) == 1
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_task_claim_is_atomic_across_queue_instances(tmp_path):
+    path = tmp_path / "atomic-claim.sqlite3"
+    upgrade_database(path)
+    database = Database.from_path(path)
+    try:
+        event = Event(type=EventType.ROOT_DOMAIN, value="example.com", source="test")
+        await EventRepository(database).ingest(event)
+        task = Task(
+            worker="fixture",
+            action="atomic-claim",
+            input_event_id=event.event_id,
+        )
+        assert await SQLiteTaskStore(database).put(task) is True
+
+        queues = (
+            TaskQueue(SQLiteTaskStore(database)),
+            TaskQueue(SQLiteTaskStore(database)),
+        )
+
+        async def attempt(queue: TaskQueue):
+            try:
+                return await queue.claim(task.task_id)
+            except ValueError:
+                return None
+
+        claims = await asyncio.gather(*(attempt(queue) for queue in queues))
+
+        successful = [claim for claim in claims if claim is not None]
+        assert len(successful) == 1
+        assert successful[0].status is TaskStatus.RUNNING
+        persisted = await SQLiteTaskStore(database).get(task.task_id)
+        assert persisted is not None
+        assert persisted.attempts == 1
     finally:
         await database.dispose()

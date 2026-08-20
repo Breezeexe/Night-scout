@@ -144,6 +144,16 @@ class SearchTier(StrEnum):
     def is_exhaustive(self) -> bool:
         return self is SearchTier.EXHAUSTIVE
 
+    @property
+    def rank(self) -> int:
+        return (
+            SearchTier.MICRO,
+            SearchTier.SMALL,
+            SearchTier.MEDIUM,
+            SearchTier.LARGE,
+            SearchTier.EXHAUSTIVE,
+        ).index(self)
+
 
 class BudgetMetricPressure(BaseModel):
     """One observed branch budget bucket/metric pressure."""
@@ -799,6 +809,7 @@ class ConvergenceController:
         budget_inspector: BranchBudgetInspector,
         state_store: ConvergenceStateStore,
         config: ConvergenceConfig | None = None,
+        maximum_tier: SearchTier | str = SearchTier.EXHAUSTIVE,
     ) -> None:
         self._yield_model = (
             yield_model
@@ -816,6 +827,7 @@ class ConvergenceController:
             config
             or ConvergenceConfig()
         )
+        self._maximum_tier = normalize_search_tier(maximum_tier)
 
     async def evaluate(
         self,
@@ -845,6 +857,11 @@ class ConvergenceController:
         tier = normalize_search_tier(
             current_tier
         )
+        if tier.rank > self._maximum_tier.rank:
+            raise ValueError(
+                f"current tier {tier.value} exceeds configured maximum tier "
+                f"{self._maximum_tier.value}"
+            )
 
         target_key = (
             target_key_for_event(
@@ -1261,7 +1278,7 @@ class ConvergenceController:
             >= (
                 self._config.advance_productive_streak
             )
-            and not tier.is_exhaustive
+            and tier.rank < self._maximum_tier.rank
             and budget.soft_pressure
             < (
                 self._config.advance_max_soft_pressure

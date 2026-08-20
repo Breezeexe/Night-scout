@@ -613,6 +613,16 @@ class ParametersWorker:
         self._backend = backend or ArjunBackend()
         self._config = config or ParameterDiscoveryConfig()
 
+    @staticmethod
+    def candidate_limit_for_tier(tier: str) -> int:
+        return {
+            "MICRO": 25,
+            "SMALL": 100,
+            "MEDIUM": 300,
+            "LARGE": 1_000,
+            "EXHAUSTIVE": 10_000,
+        }[tier]
+
     async def execute(self, task: Task) -> WorkerExecutionResult:
         if task.status is not TaskStatus.RUNNING:
             return WorkerExecutionResult(
@@ -654,6 +664,7 @@ class ParametersWorker:
             input_event=input_event,
             target_url=target_url,
             lane=lane,
+            limit_hint=task.candidate_limit_hint,
         )
 
         if not selected:
@@ -832,6 +843,7 @@ class ParametersWorker:
         input_event: Event,
         target_url: str,
         lane: ParameterLane,
+        limit_hint: int | None = None,
     ) -> tuple[ParameterCandidate, ...]:
         candidates = _dedupe_candidates(
             await self._candidates.candidates_for(input_event)
@@ -850,7 +862,11 @@ class ParametersWorker:
                 key=_targeted_sort_key,
             )
 
-            return tuple(pool[: self._config.targeted_candidates])
+            limit = min(
+                self._config.targeted_candidates,
+                limit_hint or self._config.targeted_candidates,
+            )
+            return tuple(pool[:limit])
 
         pool = sorted(
             (
@@ -865,12 +881,16 @@ class ParametersWorker:
         if not pool:
             return ()
 
+        limit = min(
+            self._config.exploration_candidates,
+            limit_hint or self._config.exploration_candidates,
+        )
         indexes = await self._exploration_cursors.claim_window(
             namespace=_exploration_namespace(target_url),
             pool_size=len(pool),
             window_size=min(
                 len(pool),
-                self._config.exploration_candidates,
+                limit,
             ),
         )
 

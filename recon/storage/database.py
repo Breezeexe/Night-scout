@@ -35,7 +35,7 @@ concurrent lifecycle coroutines cannot collectively overspend shared limits.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -43,7 +43,8 @@ from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import Select, event as sa_event, select, text
+from sqlalchemy import Select, or_, select, text, update
+from sqlalchemy import event as sa_event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -63,7 +64,13 @@ from recon.core.budgets import (
     ReservationState,
 )
 from recon.core.events import Event, EventType, ScopeState
-from recon.core.queue import TERMINAL_TASK_STATUSES, Task, TaskStatus
+from recon.core.queue import (
+    TERMINAL_TASK_STATUSES,
+    Task,
+    TaskStatus,
+    fair_lane_limits,
+)
+from recon.core.redaction import sanitize_event_for_storage
 from recon.core.scheduler import ScheduleDecision
 from recon.policy.rate_limit import (
     RateBucketCheck,
@@ -274,7 +281,8 @@ class EventRepository:
         *,
         run_id: str | None = None,
     ) -> EventWriteResult:
-        """Persist an Event without destroying repeated-source evidence."""
+        """Persist a sanitized Event without destroying repeated-source evidence."""
+        event = sanitize_event_for_storage(event)
         async with self._database.transaction(immediate=True) as session:
             existing_observation = await session.get(
                 EventObservationRecord,
@@ -466,9 +474,11 @@ class SQLiteTaskStore:
         database: Database,
         *,
         run_id: str | None = None,
+        resume_frontier: bool = True,
     ) -> None:
         self._database = database
         self._run_id = run_id
+        self._resume_frontier = resume_frontier
 
     @property
     def run_id(self) -> str | None:
@@ -477,19 +487,40 @@ class SQLiteTaskStore:
         return self._run_id
 
     def set_run_id(self, run_id: str | None) -> None:
-        """Bind subsequent task inserts to a persistent reconnaissance run.
+        """Bind task creation and execution attribution to the active run.
 
-        Existing tasks keep their original run association. The runtime calls
-        this at run start/end so recursive tasks created by the EventBus retain
-        run provenance without adding run_id to the core Task contract.
+        Existing tasks keep their origin ``run_id``. A successful claim records
+        the current run separately in ``execution_run_id``.
         """
 
         self._run_id = run_id
 
     async def put(self, task: Task) -> bool:
-        """Insert unless an active task with the same dedupe key exists."""
+        """Insert unless this logical work has already been scheduled."""
         try:
-            async with self._database.transaction() as session:
+            async with self._database.transaction(immediate=True) as session:
+                existing = await session.scalar(
+                    select(TaskRecord.task_id)
+                    .where(
+                        TaskRecord.dedupe_key == task.dedupe_key,
+                        or_(
+                            TaskRecord.status.not_in(
+                                tuple(
+                                    status.value
+                                    for status in TERMINAL_TASK_STATUSES
+                                )
+                            ),
+                            (
+                                TaskRecord.run_id.is_(None)
+                                if self._run_id is None
+                                else TaskRecord.run_id == self._run_id
+                            ),
+                        ),
+                    )
+                    .limit(1)
+                )
+                if existing is not None:
+                    return False
                 session.add(
                     TaskRecord(
                         run_id=self._run_id,
@@ -528,39 +559,138 @@ class SQLiteTaskStore:
                 ) from exc
             raise
 
+    async def claim(
+        self,
+        task_id: str,
+        *,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> Task:
+        """Atomically claim a ready row across processes and connections."""
+        _require_aware(now, name="now")
+        _require_aware(lease_expires_at, name="lease_expires_at")
+
+        async with self._database.transaction(immediate=True) as session:
+            statement = (
+                update(TaskRecord)
+                .where(
+                    TaskRecord.task_id == task_id,
+                    TaskRecord.status.in_(
+                        (TaskStatus.PENDING.value, TaskStatus.DEFERRED.value)
+                    ),
+                    TaskRecord.available_at <= now,
+                    TaskRecord.attempts < TaskRecord.max_attempts,
+                )
+                .values(
+                    execution_run_id=self._run_id,
+                    attempts=TaskRecord.attempts + 1,
+                    started_at=now,
+                    finished_at=None,
+                    status=TaskStatus.RUNNING.value,
+                    lease_expires_at=lease_expires_at,
+                    updated_at=now,
+                    last_error=None,
+                )
+                .returning(TaskRecord)
+            )
+            record = (await session.execute(statement)).scalar_one_or_none()
+            if record is not None:
+                return _task_from_record(record)
+
+            current = await session.get(TaskRecord, task_id)
+            if current is None:
+                raise KeyError(f"unknown task_id: {task_id}")
+            if current.status not in {
+                TaskStatus.PENDING.value,
+                TaskStatus.DEFERRED.value,
+            }:
+                raise ValueError(
+                    f"task {task_id} is not claimable from "
+                    f"{TaskStatus(current.status)}"
+                )
+            if current.available_at > now:
+                raise ValueError(f"task {task_id} is not available yet")
+            raise ValueError(f"task {task_id} has exhausted its retry budget")
+
     async def ready(
         self,
         *,
         now: datetime,
         limit: int | None = None,
+        fair: bool = False,
     ) -> list[Task]:
         _require_aware(now, name="now")
 
-        statement: Select[tuple[TaskRecord]] = (
-            select(TaskRecord)
-            .where(
-                TaskRecord.status.in_(
-                    (
-                        TaskStatus.PENDING.value,
-                        TaskStatus.DEFERRED.value,
-                    )
-                ),
-                TaskRecord.available_at <= now,
-            )
-            .order_by(
-                TaskRecord.priority.desc(),
-                TaskRecord.available_at,
-                TaskRecord.created_at,
-                TaskRecord.task_id,
-            )
+        ready_conditions: list[Any] = [
+            TaskRecord.status.in_(
+                (TaskStatus.PENDING.value, TaskStatus.DEFERRED.value)
+            ),
+            TaskRecord.available_at <= now,
+        ]
+        if not self._resume_frontier and self._run_id is not None:
+            ready_conditions.append(TaskRecord.run_id == self._run_id)
+        priority_order = (
+            TaskRecord.priority.desc(),
+            TaskRecord.available_at,
+            TaskRecord.created_at,
+            TaskRecord.task_id,
         )
+        statement: Select[tuple[TaskRecord]] = select(TaskRecord).where(
+            *ready_conditions
+        ).order_by(*priority_order)
 
         if limit is not None:
             statement = statement.limit(limit)
 
         async with self._database.session() as session:
-            rows = list((await session.scalars(statement)).all())
-            return [_task_from_record(row) for row in rows]
+            if not fair or limit is None:
+                rows = list((await session.scalars(statement)).all())
+                return [_task_from_record(row) for row in rows]
+
+            top_count, oldest_count, exploration_count, tail_count = (
+                fair_lane_limits(limit)
+            )
+            lane_statements = (
+                statement.limit(top_count),
+                select(TaskRecord)
+                .where(*ready_conditions)
+                .order_by(TaskRecord.created_at, TaskRecord.task_id)
+                .limit(oldest_count),
+                select(TaskRecord)
+                .where(
+                    *ready_conditions,
+                    or_(
+                        TaskRecord.action.contains("exploration"),
+                        TaskRecord.route_rule_id.contains("exploration"),
+                        TaskRecord.routing_reason.contains("exploration"),
+                    ),
+                )
+                .order_by(TaskRecord.created_at, TaskRecord.task_id)
+                .limit(exploration_count),
+                select(TaskRecord)
+                .where(*ready_conditions)
+                .order_by(
+                    TaskRecord.priority,
+                    TaskRecord.created_at,
+                    TaskRecord.task_id,
+                )
+                .limit(tail_count),
+                statement.limit(limit),
+            )
+            selected: list[TaskRecord] = []
+            seen: set[str] = set()
+            for lane_statement in lane_statements:
+                rows = list((await session.scalars(lane_statement)).all())
+                for row in rows:
+                    if row.task_id in seen:
+                        continue
+                    seen.add(row.task_id)
+                    selected.append(row)
+                    if len(selected) >= limit:
+                        break
+                if len(selected) >= limit:
+                    break
+            return [_task_from_record(row) for row in selected]
 
     async def active_by_dedupe_key(
         self,
@@ -1081,6 +1211,33 @@ class SQLiteReviewCaseStore:
                 for record in records
             ]
 
+    async def approved_for_task(
+        self,
+        task_id: str,
+        *,
+        signal_fingerprints: tuple[str, ...] | None = None,
+    ) -> ReviewCase | None:
+        async with self._database.session() as session:
+            records = list((await session.scalars(
+                select(ReviewCaseRecord)
+                .where(
+                    ReviewCaseRecord.task_id == task_id,
+                    ReviewCaseRecord.state == ReviewCaseState.APPROVED.value,
+                )
+                .order_by(
+                    ReviewCaseRecord.resolved_at.desc(),
+                    ReviewCaseRecord.case_id.desc(),
+                )
+            )).all())
+            for record in records:
+                review_case = await self._review_case_from_record(session, record)
+                if (
+                    signal_fingerprints is None
+                    or review_case.signal_fingerprints == signal_fingerprints
+                ):
+                    return review_case
+            return None
+
     async def resolve(
         self,
         case_id: str,
@@ -1581,6 +1738,34 @@ class DecisionRepository:
             await session.flush()
             return record.decision_id
 
+    async def record_schedules(
+        self,
+        decisions: Sequence[ScheduleDecision],
+        *,
+        selected_task_id: str,
+    ) -> tuple[str, ...]:
+        """Persist one bounded scheduler ranking atomically."""
+        if not decisions:
+            return ()
+        if selected_task_id not in {item.task_id for item in decisions}:
+            raise ValueError("selected_task_id is not present in decisions")
+
+        records = [
+            SchedulerDecisionRecord(
+                task_id=decision.task_id,
+                evaluated_at=decision.evaluated_at,
+                score=decision.score,
+                selected=(decision.task_id == selected_task_id),
+                breakdown_json=decision.breakdown.model_dump(mode="json"),
+                signals_json=decision.signals.model_dump(mode="json"),
+            )
+            for decision in decisions
+        ]
+        async with self._database.transaction() as session:
+            session.add_all(records)
+            await session.flush()
+            return tuple(record.decision_id for record in records)
+
     async def record_policy(
         self,
         *,
@@ -1645,14 +1830,10 @@ class BranchRepository:
                 )
                 return
 
-            # Fill missing provenance conservatively, but never silently move a
-            # branch between runs or roots once those fields are established.
+            # ``run_id`` is origin provenance. Later runs may resume the same
+            # persistent branch without moving or rejecting it.
             if record.run_id is None and run_id is not None:
                 record.run_id = run_id
-            elif run_id is not None and record.run_id not in {None, run_id}:
-                raise ValueError(
-                    f"branch {normalized} already belongs to run {record.run_id}"
-                )
 
             if record.root_event_id is None and root_event_id is not None:
                 record.root_event_id = root_event_id
@@ -1755,11 +1936,20 @@ def _task_values(task: Task) -> dict[str, Any]:
 
 
 def _task_from_record(record: TaskRecord) -> Task:
+    prefix = f"{record.worker}:{record.action}:"
+    logical_input = (
+        record.dedupe_key[len(prefix):]
+        if record.dedupe_key.startswith(prefix)
+        else record.input_event_id
+    )
     return Task(
         task_id=record.task_id,
         worker=record.worker,
         action=record.action,
         input_event_id=record.input_event_id,
+        input_identity_key=(
+            logical_input if logical_input != record.input_event_id else None
+        ),
         branch_id=record.branch_id,
         route_rule_id=record.route_rule_id,
         routing_reason=record.routing_reason,
