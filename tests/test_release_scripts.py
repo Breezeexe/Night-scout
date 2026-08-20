@@ -18,6 +18,7 @@ def test_pyinstaller_command_is_onedir_and_bundles_runtime_data(tmp_path: Path) 
     assert "migrations:migrations" in joined
     assert "wordlists:wordlists" in joined
     assert "tools_manifest.yaml:scripts" in joined
+    assert "--hidden-import logging.config" in joined
 
 
 def test_release_workflow_builds_installs_and_publishes_deb() -> None:
