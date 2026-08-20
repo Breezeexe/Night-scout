@@ -70,24 +70,43 @@ def test_required_projectdiscovery_tools_use_verified_github_releases() -> None:
         assert spec.checksum_asset_regex
 
 
-def test_dnsx_version_banner_passes_identity_probe(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("tool_id", "version_output"),
+    (
+        ("dnsx", "projectdiscovery.io\n[INF] Current Version: 1.3.0\n"),
+        ("asnmap", "[INF] Current Version: v1.1.1\n"),
+    ),
+)
+def test_projectdiscovery_version_and_help_identity_probes(
+    monkeypatch,
+    tmp_path,
+    tool_id,
+    version_output,
+) -> None:
     import recon.tooling as tooling
 
     manifest = load_tools_manifest()
-    spec = manifest.by_id()["dnsx"]
-    binary = tmp_path / "dnsx"
+    spec = manifest.by_id()[tool_id]
+    binary = tmp_path / tool_id
     binary.write_text("placeholder", encoding="utf-8")
     binary.chmod(0o755)
 
     monkeypatch.setattr(tooling, "resolve_binary", lambda _binary, _manifest=None: str(binary))
+
+    def fake_run(command, **_kwargs):
+        if command[-1] == "-version":
+            return SimpleNamespace(returncode=0, stdout=version_output, stderr="")
+        assert command[-1] == "-h"
+        return SimpleNamespace(
+            returncode=0,
+            stdout=f"{tool_id} is a ProjectDiscovery command\nUsage: {tool_id} [flags]\n",
+            stderr="",
+        )
+
     monkeypatch.setattr(
         tooling.subprocess,
         "run",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=0,
-            stdout="projectdiscovery.io\n[INF] Current Version: 1.3.0\n",
-            stderr="",
-        ),
+        fake_run,
     )
 
     status = tooling.probe_tool(spec, manifest)
