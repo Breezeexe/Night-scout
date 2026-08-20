@@ -24,10 +24,12 @@ tools:
     requirement: required
     workers: [passive_domains]
     description: Passive subdomain enumeration
-    strategy: pdtm
-    project: subfinder
+    strategy: github_binary
+    repository: projectdiscovery/subfinder
+    asset_regex: '^subfinder_.*_linux_{goarch}\.zip$'
+    checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: subfinder
+    identity_regex: 'subfinder|projectdiscovery'
     apt:
       kali: {package: subfinder, binary: subfinder}
 
@@ -36,10 +38,12 @@ tools:
     requirement: required
     workers: [dns]
     description: DNS resolution and negative knowledge
-    strategy: pdtm
-    project: dnsx
+    strategy: github_binary
+    repository: projectdiscovery/dnsx
+    asset_regex: '^dnsx_.*_linux_{goarch}\.zip$'
+    checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: dnsx
+    identity_regex: 'dnsx|projectdiscovery'
     apt:
       kali: {package: dnsx, binary: dnsx}
 
@@ -48,8 +52,10 @@ tools:
     requirement: required
     workers: [http, content, vhost]
     description: ProjectDiscovery HTTP probing CLI (not the Python httpx CLI)
-    strategy: pdtm
-    project: httpx
+    strategy: github_binary
+    repository: projectdiscovery/httpx
+    asset_regex: '^httpx_.*_linux_{goarch}\.zip$'
+    checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
     identity_regex: 'httpx|projectdiscovery'
     apt:
@@ -61,50 +67,60 @@ tools:
     requirement: required
     workers: [tls]
     description: TLS certificate inspection
-    strategy: pdtm
-    project: tlsx
+    strategy: github_binary
+    repository: projectdiscovery/tlsx
+    asset_regex: '^tlsx_.*_linux_{goarch}\.zip$'
+    checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: tlsx
+    identity_regex: 'tlsx|projectdiscovery'
 
   - tool_id: asnmap
     binary: asnmap
     requirement: required
     workers: [asn]
     description: Passive ASN/CIDR enrichment
-    strategy: pdtm
-    project: asnmap
+    strategy: github_binary
+    repository: projectdiscovery/asnmap
+    asset_regex: '^asnmap_.*_linux_{goarch}\.zip$'
+    checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: asnmap
+    identity_regex: 'asnmap|projectdiscovery'
 
   - tool_id: katana
     binary: katana
     requirement: required
     workers: [crawler]
     description: Bounded web crawler
-    strategy: pdtm
-    project: katana
+    strategy: github_binary
+    repository: projectdiscovery/katana
+    asset_regex: '^katana_.*_linux_{goarch}\.zip$'
+    checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: katana
+    identity_regex: 'katana|projectdiscovery'
 
   - tool_id: urlfinder
     binary: urlfinder
     requirement: required
     workers: [archives]
     description: Passive historical URL collection
-    strategy: pdtm
-    project: urlfinder
+    strategy: github_binary
+    repository: projectdiscovery/urlfinder
+    asset_regex: '^urlfinder_.*_linux_{goarch}\.zip$'
+    checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: urlfinder
+    identity_regex: 'urlfinder|projectdiscovery'
 
   - tool_id: nuclei
     binary: nuclei
     requirement: required
     workers: [nuclei]
     description: Audited read-only CVE validation templates
-    strategy: pdtm
-    project: nuclei
+    strategy: github_binary
+    repository: projectdiscovery/nuclei
+    asset_regex: '^nuclei_.*_linux_{goarch}\.zip$'
+    checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: nuclei
+    identity_regex: 'nuclei|projectdiscovery'
     apt:
       kali: {package: nuclei, binary: nuclei}
 
@@ -182,3 +198,4 @@ tools:
     checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [--version]
     identity_regex: 'trufflehog|^[0-9]+\.'
+                                             
