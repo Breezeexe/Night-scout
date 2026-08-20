@@ -18,6 +18,7 @@ import typer
 from recon import __version__
 from recon.core.events import ScopeState
 from recon.exporters.jsonl import ExportMode
+from recon.policy.request_identity import RequestIdentityPolicy
 from recon.policy.scope import ScopeAssetKind, ScopeEngine, ScopeSubject
 from recon.policy.seeds import effective_scope_rules
 from recon.runtime import (
@@ -97,6 +98,18 @@ app.add_typer(review_app, name="review")
 
 def _resolve_pipeline(value: Path | None) -> Path:
     return value.expanduser().resolve() if value is not None else preferred_pipeline_path()
+
+
+def _request_identity_from_cli(
+    values: list[str] | None,
+    *,
+    command: str,
+) -> RequestIdentityPolicy:
+    try:
+        return RequestIdentityPolicy.from_cli_header_lines(values or ())
+    except ValueError as exc:
+        typer.echo(f"{command} failed: invalid --identity-header: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
 
 
 def _version_callback(value: bool) -> None:
@@ -288,6 +301,11 @@ def doctor_command(
         "-s",
         help="Scope YAML override. Otherwise pipeline scope_file is used.",
     ),
+    identity_headers: list[str] = typer.Option(
+        None,
+        "--identity-header",
+        help="Required target HTTP header as 'Name: value'; repeat for multiple headers.",
+    ),
     json_output: bool = typer.Option(
         False,
         "--json",
@@ -297,9 +315,11 @@ def doctor_command(
     """Validate configuration and external tool availability without scanning."""
 
     pipeline = _resolve_pipeline(pipeline)
+    request_identity = _request_identity_from_cli(identity_headers, command="doctor")
     report = doctor_from_files(
         pipeline_path=pipeline,
         scope_path=scope,
+        request_identity=request_identity,
     )
 
     if json_output:
@@ -374,6 +394,11 @@ def run_command(
         case_sensitive=False,
         help="Artifact kind when it cannot be inferred from .apk or .ipa.",
     ),
+    identity_headers: list[str] = typer.Option(
+        None,
+        "--identity-header",
+        help="Required target HTTP header as 'Name: value'; repeat for multiple headers.",
+    ),
     authorize_exact: bool = typer.Option(
         False,
         "--authorize-exact",
@@ -399,6 +424,7 @@ def run_command(
 
     pipeline = _resolve_pipeline(pipeline)
     normalized_targets = tuple(targets or ())
+    request_identity = _request_identity_from_cli(identity_headers, command="run")
     if (mobile_artifact is None) != (mobile_app_id is None):
         typer.echo(
             "run failed: --mobile-artifact and --mobile-app-id must be provided together",
@@ -437,6 +463,7 @@ def run_command(
         runtime = await build_runtime(
             pipeline_path=pipeline,
             scope_path=scope,
+            request_identity=request_identity,
         )
         try:
             if mobile_input is None:

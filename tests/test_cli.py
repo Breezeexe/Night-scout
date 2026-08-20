@@ -48,7 +48,12 @@ def test_cli_version_and_help():
     assert "--mobile-artifact" in run_help.stdout
     assert "--mobile-app-id" in run_help.stdout
     assert "--mobile-source" in run_help.stdout
+    assert "--identity-header" in run_help.stdout
     assert "provenance only" in run_help.stdout
+
+    doctor_help = runner.invoke(app, ["doctor", "--help"])
+    assert doctor_help.exit_code == 0
+    assert "--identity-header" in doctor_help.stdout
 
     removed_mobile_command = runner.invoke(app, ["mobile", "--help"])
     assert removed_mobile_command.exit_code != 0
@@ -118,6 +123,8 @@ def test_cli_run_combines_domain_and_mobile_ingress(monkeypatch, tmp_path) -> No
             "com.company.mobile",
             "--mobile-source-url",
             "https://play.google.com/store/apps/details?id=com.company.mobile",
+            "--identity-header",
+            "X_Bug_Bounty: test-researcher",
             "--scope",
             str(scope),
             "--max-steps",
@@ -134,6 +141,10 @@ def test_cli_run_combines_domain_and_mobile_ingress(monkeypatch, tmp_path) -> No
     assert isinstance(mobile_input.source_url, str)
     assert mobile_input.source_url.startswith("https://play.google.com/")
     assert calls["max_steps"] == 3
+    request_identity = calls["build"]["request_identity"]
+    assert request_identity.http_headers == {
+        "X_Bug_Bounty": "test-researcher"
+    }
     assert calls["closed"] is True
     assert "com.company.mobile" in result.stdout
     assert "artifact=abc.apk" in result.stdout
@@ -150,6 +161,16 @@ def test_cli_run_requires_mobile_artifact_and_app_id_together(tmp_path) -> None:
 
     assert result.exit_code == 2
     assert "must be provided together" in result.output
+
+
+def test_cli_rejects_invalid_identity_header_before_building_runtime() -> None:
+    result = CliRunner().invoke(
+        app,
+        ["run", "--identity-header", "missing-colon", "--no-progress"],
+    )
+
+    assert result.exit_code == 2
+    assert "invalid --identity-header" in result.output
 
 
 def test_cli_tools_list() -> None:
@@ -406,6 +427,7 @@ def test_cli_run_accepts_many_explicit_seeds(monkeypatch, tmp_path) -> None:
     assert result.exit_code == 0, result.stdout
     assert calls["domains"] == ("a.example.com", "b.example.com")
     assert calls["max_steps"] == 7
+    assert calls["build"]["request_identity"].configured is False
     assert calls["closed"] is True
     assert "seeds:       2" in result.stdout
     assert "a.example.com" in result.stdout

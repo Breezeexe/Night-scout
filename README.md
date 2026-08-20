@@ -382,6 +382,7 @@ scope-derived domain seeds with:
 nightscout run \
   --pipeline ./company-pipeline.yaml \
   --scope ./company-scope.yaml \
+  --identity-header "X_Bug_Bounty: your_username" \
   --mobile-artifact ./company.apk \
   --mobile-app-id com.company.mobile \
   --mobile-source-url "https://play.google.com/store/apps/details?id=com.company.mobile"
@@ -421,6 +422,33 @@ profile_id: company-30-rps-per-node
 display_name: Company authorized recon — 30 req/s per node
 scope_file: company-scope.yaml
 ```
+
+Supply Company’s required non-secret researcher identity through the CLI. Use
+your platform username when the program accepts it, or replace the value with
+the program-specific UUID:
+
+```bash
+nightscout doctor \
+  --pipeline ./company-pipeline.yaml \
+  --scope ./company-scope.yaml \
+  --identity-header "X_Bug_Bounty: your_username"
+```
+
+`--identity-header` is optional for programs that do not require traffic
+tagging and repeatable when a program requires several headers. Night Scout
+applies supplied headers to every target-facing request made by the `http`, `content`, `crawler`,
+`parameters`, `vhost`, and `nuclei` workers. It deliberately does not send them
+to DNS/TLS operations or third-party passive services such as Subfinder,
+URLFinder, NVD, or application stores.
+
+Header names and values are validated centrally. Routing/framing/session/auth
+headers such as `Host`, `Content-Length`, `Authorization`, and `Cookie` are not
+accepted here, CR/LF injection is rejected, and audited Nuclei templates cannot
+override an identification header. `doctor` reports only configured header
+names and compatible enabled workers; values are redacted. Run metadata stores
+only names and a one-way fingerprint. If unfinished frontier tasks originated
+under identity headers, every resume must repeat the same CLI options; omitting
+or changing them fails closed before a new run starts.
 
 Then replace the template's complete `rate_limit` section with this one, while
 leaving the other required sections (`runtime`, `storage`, `scheduler`,
@@ -466,10 +494,14 @@ frontier containing the scope-derived domains and the independently obtained
 APK only after checking the authorization again:
 
 ```bash
-nightscout doctor --pipeline ./company-pipeline.yaml --scope ./company-scope.yaml
+nightscout doctor \
+  --pipeline ./company-pipeline.yaml \
+  --scope ./company-scope.yaml \
+  --identity-header "X_Bug_Bounty: your_username"
 nightscout run \
   --pipeline ./company-pipeline.yaml \
   --scope ./company-scope.yaml \
+  --identity-header "X_Bug_Bounty: your_username" \
   --mobile-artifact ./company.apk \
   --mobile-app-id com.company.mobile \
   --mobile-source-url "https://play.google.com/store/apps/details?id=com.company.mobile" \
@@ -485,6 +517,9 @@ binary is missing. The subsequent `run` does generate target traffic.
 ```bash
 # Run every domain seed derived from a real program scope.
 nightscout run --scope ./program.yaml
+
+# Add a mandatory bug-bounty traffic identifier when the program requires it.
+nightscout run --scope ./program.yaml --identity-header "X_Bug_Bounty: your_username"
 
 # Or provide several explicit seeds under the same authorization boundary.
 nightscout run api.example.com portal.example.net --scope ./program.yaml
@@ -802,7 +837,7 @@ Thin Typer command-line entry point. The initial runtime exposes:
 
 ```text
 nightscout setup
-nightscout run [<root-domain> ...] [--mobile-artifact <artifact> --mobile-app-id <id>]
+nightscout run [<root-domain> ...] [--identity-header "Name: value"] [--mobile-artifact <artifact> --mobile-app-id <id>]
 nightscout status
 nightscout explain <event-id-or-value>
 nightscout review list|show|approve|reject

@@ -384,6 +384,7 @@ Mobile worker никогда не скачивает APK. Получи прил�
 nightscout run \
   --pipeline ./company-pipeline.yaml \
   --scope ./company-scope.yaml \
+  --identity-header "X_Bug_Bounty: your_username" \
   --mobile-artifact ./company.apk \
   --mobile-app-id com.company.mobile \
   --mobile-source-url "https://play.google.com/store/apps/details?id=com.company.mobile"
@@ -423,6 +424,34 @@ profile_id: company-30-rps-per-node
 display_name: Company authorized recon — 30 req/s per node
 scope_file: company-scope.yaml
 ```
+
+Передай обязательный non-secret идентификатор исследователя Company через CLI.
+Используй username платформы, если программа его принимает, либо замени значение
+на выданный программой UUID:
+
+```bash
+nightscout doctor \
+  --pipeline ./company-pipeline.yaml \
+  --scope ./company-scope.yaml \
+  --identity-header "X_Bug_Bounty: your_username"
+```
+
+`--identity-header` необязателен для программ без требования traffic tagging;
+его можно повторить, если программа требует несколько headers. Night Scout
+добавляет переданные headers ко всем target-facing запросам workers `http`, `content`, `crawler`,
+`parameters`, `vhost` и `nuclei`. Они намеренно не отправляются в DNS/TLS
+операциях и сторонним passive-сервисам вроде Subfinder, URLFinder, NVD или
+магазинов приложений.
+
+Имена и значения headers валидируются централизованно. Здесь нельзя задавать
+routing/framing/session/auth headers вроде `Host`, `Content-Length`,
+`Authorization` и `Cookie`; CR/LF injection отклоняется, а audited Nuclei
+templates не могут переопределить identification header. `doctor` показывает
+только настроенные имена headers и совместимые включённые workers, скрывая
+значения. Run metadata хранит только имена и односторонний fingerprint. Если
+незавершённые frontier tasks были созданы с identity headers, при каждом resume
+нужно повторить те же CLI options; отсутствие или изменение headers приводит к
+fail-closed до создания нового run.
 
 Затем полностью замени секцию `rate_limit` из шаблона на следующую, сохранив
 остальные обязательные секции (`runtime`, `storage`, `scheduler`, `budgets`,
@@ -467,10 +496,14 @@ authorization и только после этого запускай едины�
 scope доменами и самостоятельно загруженным APK:
 
 ```bash
-nightscout doctor --pipeline ./company-pipeline.yaml --scope ./company-scope.yaml
+nightscout doctor \
+  --pipeline ./company-pipeline.yaml \
+  --scope ./company-scope.yaml \
+  --identity-header "X_Bug_Bounty: your_username"
 nightscout run \
   --pipeline ./company-pipeline.yaml \
   --scope ./company-scope.yaml \
+  --identity-header "X_Bug_Bounty: your_username" \
   --mobile-artifact ./company.apk \
   --mobile-app-id com.company.mobile \
   --mobile-source-url "https://play.google.com/store/apps/details?id=com.company.mobile" \
@@ -486,6 +519,9 @@ nightscout run \
 ```bash
 # Запустить все domain seeds, полученные из scope реальной программы.
 nightscout run --scope ./program.yaml
+
+# Добавить обязательный traffic identifier, если этого требует программа.
+nightscout run --scope ./program.yaml --identity-header "X_Bug_Bounty: your_username"
 
 # Или явно дать несколько seeds под тем же authorization boundary.
 nightscout run api.example.com portal.example.net --scope ./program.yaml
@@ -803,7 +839,7 @@ night-scout/
 
 ```text
 nightscout setup
-nightscout run [<root-domain> ...] [--mobile-artifact <artifact> --mobile-app-id <id>]
+nightscout run [<root-domain> ...] [--identity-header "Name: value"] [--mobile-artifact <artifact> --mobile-app-id <id>]
 nightscout status
 nightscout explain <event-id-or-value>
 nightscout review list|show|approve|reject

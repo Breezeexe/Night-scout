@@ -83,6 +83,7 @@ from recon.policy.rate_limit import (
     RateLimitOutcome,
     tool_integer_rps_hint,
 )
+from recon.policy.request_identity import RequestIdentityPolicy
 from recon.policy.scope import (
     ScopeAssetKind,
     ScopeDecision,
@@ -673,8 +674,11 @@ class HttpxVHostBackend:
     def __init__(
         self,
         config: HttpxVHostConfig | None = None,
+        *,
+        request_identity: RequestIdentityPolicy | None = None,
     ) -> None:
         self.config = config or HttpxVHostConfig()
+        self.request_identity = request_identity or RequestIdentityPolicy()
 
     def ensure_available(self) -> None:
         if _resolve_executable(self.config.binary) is None:
@@ -729,6 +733,7 @@ class HttpxVHostBackend:
         if rate_limit_rps is not None:
             args.extend(("-rl", str(rate_limit_rps)))
 
+        args.extend(self.request_identity.repeated_cli_args("-H"))
         args.extend(self.config.extra_args)
         return tuple(args)
 

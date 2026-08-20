@@ -91,6 +91,7 @@ from recon.policy.rate_limit import (
     RateLimitOutcome,
     RateLimitPlan,
 )
+from recon.policy.request_identity import RequestIdentityPolicy
 from recon.workers.passive_domains import normalize_dns_name
 
 WORKER_NAME = "crawler"
@@ -535,8 +536,11 @@ class KatanaBackend:
     def __init__(
         self,
         config: KatanaConfig | None = None,
+        *,
+        request_identity: RequestIdentityPolicy | None = None,
     ) -> None:
         self.config = config or KatanaConfig()
+        self.request_identity = request_identity or RequestIdentityPolicy()
 
     def ensure_available(self) -> None:
         if _resolve_executable(self.config.binary) is None:
@@ -629,6 +633,7 @@ class KatanaBackend:
                 )
             )
 
+        args.extend(self.request_identity.repeated_cli_args("-H"))
         args.extend(self.config.extra_args)
 
         return tuple(args)

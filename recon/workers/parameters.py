@@ -88,6 +88,7 @@ from recon.policy.rate_limit import (
     RateLimitOutcome,
     RateLimitPlan,
 )
+from recon.policy.request_identity import RequestIdentityPolicy
 from recon.workers.http import normalize_http_url
 from recon.workers.passive_domains import normalize_dns_name
 
@@ -436,8 +437,14 @@ class ArjunBackend:
 
     name = "arjun"
 
-    def __init__(self, config: ArjunConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: ArjunConfig | None = None,
+        *,
+        request_identity: RequestIdentityPolicy | None = None,
+    ) -> None:
         self.config = config or ArjunConfig()
+        self.request_identity = request_identity or RequestIdentityPolicy()
 
     def ensure_available(self) -> None:
         if _resolve_executable(self.config.binary) is None:
@@ -474,6 +481,8 @@ class ArjunBackend:
         else:
             args.extend(("-d", str(pacing.delay_seconds)))
 
+        if self.request_identity.configured:
+            args.extend(("--headers", self.request_identity.newline_cli_value()))
         args.extend(self.config.extra_args)
         return tuple(args)
 

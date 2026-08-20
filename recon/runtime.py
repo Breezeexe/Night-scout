@@ -66,7 +66,7 @@ from recon.core.lifecycle import (
     WorkerExecutionResult,
     WorkerOutcome,
 )
-from recon.core.queue import Task, TaskQueue, TaskStatus, utc_now
+from recon.core.queue import TERMINAL_TASK_STATUSES, Task, TaskQueue, TaskStatus, utc_now
 from recon.core.redaction import sanitize_event_for_storage
 from recon.core.router import Router, RouteRule, RoutingContext
 from recon.core.scheduler import (
@@ -117,6 +117,10 @@ from recon.intelligence.yield_model import (
     yield_observation_from_task,
 )
 from recon.policy.rate_limit import RateLimiter, RateLimitProfile
+from recon.policy.request_identity import (
+    TARGET_HTTP_IDENTITY_WORKERS,
+    RequestIdentityPolicy,
+)
 from recon.policy.restrictions import (
     RestrictionDecision,
     RestrictionEngine,
@@ -423,7 +427,6 @@ class PipelineDocument(BaseModel):
     scope_file: str | None = None
 
     runtime: RuntimeLoopConfig = Field(default_factory=RuntimeLoopConfig)
-
     storage: dict[str, Any]
     scheduler: dict[str, Any]
     budgets: dict[str, Any]
@@ -1699,6 +1702,7 @@ class NightScoutRuntime:
         self._nvd_cache: SQLiteNvdCache | None = None
         self.workspace: WorkspaceRepository
         self.workspace_binding: WorkspaceBinding
+        self.request_identity: RequestIdentityPolicy
 
     @classmethod
     async def build(
@@ -1706,6 +1710,7 @@ class NightScoutRuntime:
         *,
         pipeline_path: str | Path,
         scope_path: str | Path | None = None,
+        request_identity: RequestIdentityPolicy | None = None,
     ) -> "NightScoutRuntime":
         self = cls()
         self.configuration = load_runtime_configuration(
@@ -1715,6 +1720,7 @@ class NightScoutRuntime:
 
         cfg = self.configuration
         pipeline = cfg.pipeline
+        self.request_identity = request_identity or RequestIdentityPolicy()
 
         storage = pipeline.storage
         database_config = runtime_database_config(cfg)
@@ -1948,6 +1954,7 @@ class NightScoutRuntime:
                         template_data.get("root", "nuclei-templates")
                     ),
                     max_template_bytes=int(template_data.get("max_template_bytes", 1024 * 1024)),
+                    protected_header_names=self.request_identity.header_names,
                 )
 
         self.event_bus = RuntimeEventBus(
@@ -2113,6 +2120,7 @@ class NightScoutRuntime:
         disabled: frozenset[str],
     ) -> dict[str, Any]:
         pipeline = self.configuration.pipeline
+        request_identity = self.request_identity
         result: dict[str, Any] = {}
 
         def section(name: str) -> dict[str, Any]:
@@ -2160,7 +2168,10 @@ class NightScoutRuntime:
                 events=self.events,
                 publisher=self.event_bus,
                 rate_limiter=self.rate_limiter,
-                backend=HttpxBackend(HttpxConfig.model_validate(raw.get("backend", {}))),
+                backend=HttpxBackend(
+                    HttpxConfig.model_validate(raw.get("backend", {})),
+                    request_identity=request_identity,
+                ),
                 config=HTTPWorkerConfig.model_validate(raw.get("config", {})),
             )
 
@@ -2198,7 +2209,10 @@ class NightScoutRuntime:
                 events=self.events,
                 publisher=self.event_bus,
                 rate_limiter=self.rate_limiter,
-                backend=KatanaBackend(KatanaConfig.model_validate(raw.get("backend", {}))),
+                backend=KatanaBackend(
+                    KatanaConfig.model_validate(raw.get("backend", {})),
+                    request_identity=request_identity,
+                ),
                 config=CrawlerWorkerConfig.model_validate(raw.get("config", {})),
             )
 
@@ -2210,7 +2224,8 @@ class NightScoutRuntime:
                 rate_limiter=self.rate_limiter,
                 store=WorkspaceContentStore(content_root),
                 backend=HttpxContentBackend(
-                    HttpxContentConfig.model_validate(raw.get("backend", {}))
+                    HttpxContentConfig.model_validate(raw.get("backend", {})),
+                    request_identity=request_identity,
                 ),
                 config=ContentWorkerConfig.model_validate(raw.get("config", {})),
             )
@@ -2232,7 +2247,10 @@ class NightScoutRuntime:
                 candidates=corpus,
                 exploration_cursors=ParameterExplorationCursorStore(),
                 rate_limiter=self.rate_limiter,
-                backend=ArjunBackend(ArjunConfig.model_validate(raw.get("backend", {}))),
+                backend=ArjunBackend(
+                    ArjunConfig.model_validate(raw.get("backend", {})),
+                    request_identity=request_identity,
+                ),
                 config=ParameterDiscoveryConfig.model_validate(raw.get("config", {})),
             )
 
@@ -2244,7 +2262,10 @@ class NightScoutRuntime:
                 candidates=WordlistVHostCandidateProvider(words=corpus),
                 candidate_scope=ScopeEngineVHostCandidateScopeProvider(self.scope_engine),
                 rate_limiter=self.rate_limiter,
-                backend=HttpxVHostBackend(HttpxVHostConfig.model_validate(raw.get("backend", {}))),
+                backend=HttpxVHostBackend(
+                    HttpxVHostConfig.model_validate(raw.get("backend", {})),
+                    request_identity=request_identity,
+                ),
                 config=VHostWorkerConfig.model_validate(raw.get("config", {})),
             )
 
@@ -2260,7 +2281,10 @@ class NightScoutRuntime:
                 rate_limiter=self.rate_limiter,
                 templates=nuclei_catalog,
                 request_scope=ScopeEngineNucleiRequestScopeProvider(self.scope_engine),
-                backend=NucleiBackend(NucleiBackendConfig.model_validate(raw.get("backend", {}))),
+                backend=NucleiBackend(
+                    NucleiBackendConfig.model_validate(raw.get("backend", {})),
+                    request_identity=request_identity,
+                ),
                 config=NucleiWorkerConfig.model_validate(raw.get("config", {})),
             )
 
@@ -2617,16 +2641,30 @@ class NightScoutRuntime:
                     f"workspace contains {len(active)} unfinished task(s). "
                     "Resume them with resume_frontier=true or use a fresh workspace."
                 )
+        else:
+            await self._assert_resumed_frontier_request_identity()
+
+        identity_fingerprint = self.request_identity.fingerprint
+        effective_config_hash = hashlib.sha256(
+            (
+                f"{self.configuration.config_hash}\0"
+                f"{identity_fingerprint or 'no-request-identity'}"
+            ).encode()
+        ).hexdigest()
 
         self._run_id = await self.runs.start(
             target_id=self.configuration.scope.target_id,
-            config_hash=self.configuration.config_hash,
+            config_hash=effective_config_hash,
             metadata={
                 "targets": list(targets),
                 "seed_count": len(targets),
                 "run_kind": run_kind,
                 "profile_id": self.configuration.pipeline.profile_id,
                 "scope_target_id": self.configuration.scope.target_id,
+                "request_identity_header_names": list(
+                    self.request_identity.header_names
+                ),
+                "request_identity_fingerprint": identity_fingerprint,
             },
         )
         self.event_bus.set_run_id(self._run_id)
@@ -2783,6 +2821,54 @@ class NightScoutRuntime:
             self.task_store.set_run_id(None)
             self.attempt_observer.set_run_id(None)
             self._run_id = None
+
+    async def _assert_resumed_frontier_request_identity(self) -> None:
+        """Require the same CLI identity for unfinished work that originated with it."""
+
+        terminal = tuple(status.value for status in TERMINAL_TASK_STATUSES)
+        async with self.database.session() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(
+                            ReconRunRecord.run_id,
+                            ReconRunRecord.metadata_json,
+                        )
+                        .join(TaskRecord, TaskRecord.run_id == ReconRunRecord.run_id)
+                        .where(TaskRecord.status.not_in(terminal))
+                    )
+                ).all()
+            )
+
+        required: dict[str, set[str]] = {}
+        for _run_id, metadata in rows:
+            fingerprint = metadata.get("request_identity_fingerprint")
+            if not isinstance(fingerprint, str) or not fingerprint.strip():
+                continue
+            raw_names = metadata.get("request_identity_header_names", [])
+            names_from_run = {
+                str(name).strip()
+                for name in raw_names
+                if str(name).strip()
+            } if isinstance(raw_names, list) else set()
+            required.setdefault(fingerprint.strip(), set()).update(names_from_run)
+
+        if not required:
+            return
+
+        current = self.request_identity.fingerprint
+        if len(required) == 1 and current in required:
+            return
+
+        required_names = sorted({name for values in required.values() for name in values})
+        configured = ", ".join(self.request_identity.header_names) or "none"
+        raise RuntimeError(
+            "unfinished frontier requires the same CLI identity header values "
+            "used when its tasks were created; required headers="
+            f"{','.join(required_names) or 'unknown'}; "
+            f"currently configured headers={configured}. Repeat the original "
+            "--identity-header options. Values and fingerprints are not displayed."
+        )
 
     async def run_domain(
         self,
@@ -3242,6 +3328,7 @@ async def build_runtime(
     *,
     pipeline_path: str | Path,
     scope_path: str | Path | None = None,
+    request_identity: RequestIdentityPolicy | None = None,
 ) -> NightScoutRuntime:
     # Night Scout intentionally supports only Debian GNU/Linux and Kali Linux.
     # Managed specialist binaries are isolated under the Night Scout tool root
@@ -3252,6 +3339,7 @@ async def build_runtime(
     return await NightScoutRuntime.build(
         pipeline_path=pipeline_path,
         scope_path=scope_path,
+        request_identity=request_identity,
     )
 
 
@@ -3516,6 +3604,7 @@ def doctor_from_files(
     *,
     pipeline_path: str | Path,
     scope_path: str | Path | None = None,
+    request_identity: RequestIdentityPolicy | None = None,
 ) -> DoctorReport:
     """Validate config and external dependency availability without opening DB."""
 
@@ -3549,6 +3638,41 @@ def doctor_from_files(
             ),
         )
     )
+
+    identity = request_identity or RequestIdentityPolicy()
+    identity_workers = tuple(
+        sorted(
+            worker
+            for worker in TARGET_HTTP_IDENTITY_WORKERS
+            if cfg.worker_enabled(worker)
+        )
+    )
+    if identity.configured:
+        checks.append(
+            DoctorCheck(
+                name="request-identity",
+                ok=True,
+                required=True,
+                detail=(
+                    "configured; values=redacted; headers="
+                    f"{','.join(identity.header_names)}; target_http_workers="
+                    f"{','.join(identity_workers) or 'none enabled'}"
+                ),
+            )
+        )
+    else:
+        checks.append(
+            DoctorCheck(
+                name="request-identity",
+                ok=False,
+                required=False,
+                detail=(
+                    "not configured; target HTTP requests are untagged. Add "
+                    "--identity-header when the program requires researcher "
+                    "identification"
+                ),
+            )
+        )
 
     try:
         import aiosqlite  # noqa: F401

@@ -44,7 +44,7 @@ import os
 import shutil
 import tempfile
 from collections import deque
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Collection, Mapping
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -64,6 +64,7 @@ from recon.policy.rate_limit import (
     RateLimitOutcome,
     RateLimitPlan,
 )
+from recon.policy.request_identity import RequestIdentityPolicy
 from recon.policy.scope import (
     ScopeAssetKind,
     ScopeDecision,
@@ -577,10 +578,14 @@ class LocalAuditedTemplateCatalog:
         manifest_path: str | Path,
         templates_root: str | Path,
         max_template_bytes: int = 1024 * 1024,
+        protected_header_names: Collection[str] = (),
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.templates_root = Path(templates_root)
         self.max_template_bytes = max_template_bytes
+        self.protected_header_names = frozenset(
+            name.strip().casefold() for name in protected_header_names if name.strip()
+        )
 
         if max_template_bytes < 1024:
             raise ValueError("max_template_bytes must be at least 1024")
@@ -622,6 +627,7 @@ class LocalAuditedTemplateCatalog:
                     max_requests,
                     entry.max_requests,
                 ),
+                protected_header_names=self.protected_header_names,
             )
 
             if not audit.allowed:
@@ -691,8 +697,11 @@ class NucleiBackend:
     def __init__(
         self,
         config: NucleiBackendConfig | None = None,
+        *,
+        request_identity: RequestIdentityPolicy | None = None,
     ) -> None:
         self.config = config or NucleiBackendConfig()
+        self.request_identity = request_identity or RequestIdentityPolicy()
 
     def ensure_available(self) -> None:
         if shutil.which(self.config.binary) is None:
@@ -758,6 +767,7 @@ class NucleiBackend:
             )
         )
 
+        args.extend(self.request_identity.repeated_cli_args("-H"))
         args.extend(self.config.extra_args)
         return tuple(args)
 
@@ -1251,8 +1261,12 @@ def audit_nuclei_template(
     entry: NucleiTemplateManifestEntry,
     max_template_bytes: int,
     max_requests: int,
+    protected_header_names: Collection[str] = (),
 ) -> NucleiTemplateAudit:
     reasons: list[str] = []
+    protected_headers = frozenset(
+        name.strip().casefold() for name in protected_header_names if name.strip()
+    )
 
     try:
         stat = path.lstat()
@@ -1386,6 +1400,10 @@ def audit_nuclei_template(
                     if name in _DENIED_HEADER_NAMES:
                         reasons.append(
                             f"http[{index}] forbidden header override: {name}"
+                        )
+                    if name in protected_headers:
+                        reasons.append(
+                            f"http[{index}] protected identification header override: {name}"
                         )
 
                     value_text = str(raw_value).lower()
