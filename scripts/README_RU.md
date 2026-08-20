@@ -21,8 +21,9 @@ nightscout tools verify
 ```
 
 По умолчанию binaries живут в `~/.local/share/nightscout/tools/bin`; runtime сам
-добавляет этот каталог в PATH workers. ProjectDiscovery ставится через PDTM,
-Arjun через pipx, mobile helpers — из официальных release assets.
+добавляет этот каталог в PATH workers. Установка APT-first для явно разрешённых
+Debian/Kali пакетов; PDTM, pipx и официальные release assets используются только
+как fallback, если distro-пакета нет или его binary не проходит проверку.
 
 ## `build_binary.py`
 

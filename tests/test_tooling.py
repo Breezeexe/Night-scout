@@ -37,14 +37,25 @@ def test_tools_manifest_loads_and_covers_runtime_tools() -> None:
     assert expected == set(by_id)
 
 
-def test_default_selection_includes_pdtm_dependency() -> None:
+def test_default_selection_defers_pdtm_until_fallback_is_needed() -> None:
     manifest = load_tools_manifest()
     selected = select_tools(manifest)
     ids = [tool.tool_id for tool in selected]
-    assert "pdtm" in ids
+    assert "pdtm" not in ids
     assert "subfinder" in ids
     assert "arjun" in ids
     assert "jadx" not in ids
+
+
+def test_apt_allowlist_handles_kali_httpx_name_collision() -> None:
+    manifest = load_tools_manifest()
+    by_id = manifest.by_id()
+    assert by_id["subfinder"].apt["kali"].package == "subfinder"
+    assert by_id["httpx"].apt["kali"].package == "httpx-toolkit"
+    assert by_id["httpx"].apt["kali"].binary == "httpx-toolkit"
+    # Debian intentionally has no guessed httpx APT mapping: python-httpx would
+    # be the wrong executable for Night Scout.
+    assert "debian" not in by_id["httpx"].apt
 
 
 def test_linux_asset_regex_arch_substitution() -> None:
@@ -87,3 +98,72 @@ def test_platform_gate_accepts_debian_rejects_ubuntu() -> None:
     ubuntu = debian.model_copy(update={"os_id": "ubuntu", "pretty_name": "Ubuntu"})
     with pytest.raises(Exception):
         assert_supported_platform(ubuntu)
+
+
+def test_apt_first_installs_allowlisted_package_before_upstream(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    import recon.tooling as tooling
+
+    manifest = load_tools_manifest()
+    spec = manifest.by_id()["subfinder"]
+    platform_info = PlatformInfo(
+        os_id="kali",
+        pretty_name="Kali GNU/Linux Rolling",
+        version_id=None,
+        architecture="x86_64",
+        goarch="amd64",
+        asset_arch="x64",
+    )
+    monkeypatch.setenv("NIGHTSCOUT_TOOL_ROOT", str(tmp_path / "tools"))
+    monkeypatch.setattr(tooling, "_privilege_prefix", lambda: [])
+    monkeypatch.setattr(tooling, "_apt_candidate_available", lambda package: package == "subfinder")
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(tuple(str(item) for item in command))
+        return SimpleNamespace(returncode=0)
+
+    real_which = tooling.shutil.which
+
+    def fake_which(binary):
+        if binary == "subfinder":
+            return "/usr/bin/subfinder"
+        return real_which(binary)
+
+    monkeypatch.setattr(tooling.subprocess, "run", fake_run)
+    monkeypatch.setattr(tooling.shutil, "which", fake_which)
+    monkeypatch.setattr(
+        tooling,
+        "probe_tool",
+        lambda _spec, _manifest=None: tooling.ToolStatus(
+            tool_id="subfinder",
+            binary="subfinder",
+            installed=True,
+            required=True,
+            path="/usr/bin/subfinder",
+            version="subfinder v2.14.0",
+            identity_ok=True,
+            detail="subfinder v2.14.0",
+        ),
+    )
+
+    result = tooling._try_install_with_apt(
+        spec,
+        manifest,
+        platform_info=platform_info,
+        apt_session=tooling._AptSession(),
+    )
+
+    assert result is not None
+    assert result.source == "apt:kali:subfinder"
+    assert any(command[-3:] == ("--no-install-recommends", "subfinder")[-3:] for command in calls) or any(
+        "install" in command and "subfinder" in command for command in calls
+    )
+
+
+def test_apt_first_does_not_guess_unmapped_debian_projectdiscovery_package() -> None:
+    manifest = load_tools_manifest()
+    for tool_id in ("subfinder", "dnsx", "httpx", "nuclei"):
+        assert "debian" not in manifest.by_id()[tool_id].apt

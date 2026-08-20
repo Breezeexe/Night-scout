@@ -161,11 +161,11 @@ def setup_command(
             typer.echo("  skipped by request")
         else:
             typer.echo(
-                "  first setup can take several minutes: binaries may be downloaded "
-                "from ProjectDiscovery/GitHub and verified one by one"
+                "  first setup can take several minutes: Night Scout tries trusted "
+                "Debian/Kali APT packages first, then upstream fallback when needed"
             )
             typer.echo(
-                "  if one tool is slow, the current tool and phase will remain visible below"
+                "  APT/PDTM/pipx output is shown live, so long downloads are visible below"
             )
             results = install_tools(
                 include_optional=include_optional_tools,
@@ -685,17 +685,27 @@ def tools_list_command(
         typer.echo(f"tools list failed: {type(exc).__name__}: {exc}", err=True)
         raise typer.Exit(code=2) from exc
 
-    rows = [
-        {
-            "tool_id": spec.tool_id,
-            "binary": spec.binary,
-            "requirement": spec.requirement.value,
-            "strategy": spec.strategy.value,
-            "workers": list(spec.workers),
-            "description": spec.description,
-        }
-        for spec in manifest.tools
-    ]
+    rows = []
+    for spec in manifest.tools:
+        apt_spec = spec.apt.get(platform_info.os_id)
+        install_path = (
+            f"apt:{apt_spec.package} -> fallback:{spec.strategy.value}"
+            if apt_spec is not None
+            else f"upstream:{spec.strategy.value}"
+        )
+        rows.append(
+            {
+                "tool_id": spec.tool_id,
+                "binary": spec.binary,
+                "requirement": spec.requirement.value,
+                "strategy": spec.strategy.value,
+                "apt_package": apt_spec.package if apt_spec is not None else None,
+                "apt_binary": apt_spec.binary if apt_spec is not None else None,
+                "install_path": install_path,
+                "workers": list(spec.workers),
+                "description": spec.description,
+            }
+        )
     if json_output:
         typer.echo(
             json.dumps(
@@ -717,7 +727,7 @@ def tools_list_command(
     for row in rows:
         typer.echo(
             f"{row['tool_id']:<14} {row['requirement']:<8} "
-            f"{row['strategy']:<20} {row['description']}"
+            f"{row['install_path']:<36} {row['description']}"
         )
 
 
@@ -781,7 +791,7 @@ def tools_install_command(
     install_prerequisites: bool = typer.Option(
         False,
         "--install-prerequisites",
-        help="Use apt-get (and sudo when needed) for Java/pipx prerequisites.",
+        help="Allow apt-get (and sudo when needed) for fallback prerequisites such as Java/pipx.",
     ),
     allow_unverified: bool = typer.Option(
         False,
@@ -789,11 +799,11 @@ def tools_install_command(
         help="Permit a GitHub asset lacking an upstream SHA-256 digest/checksum.",
     ),
 ) -> None:
-    """Explicitly install managed tools into the Night Scout user tool root."""
+    """Install companion tools using distro APT first, then verified upstream fallback."""
 
     typer.echo(
-        "Installing/verifying companion tools. Network downloads may take several minutes; "
-        "the current tool and phase are shown below."
+        "Installing/verifying companion tools (APT-first, upstream fallback). "
+        "Network downloads may take several minutes; live installer output follows."
     )
     try:
         results = install_tools(

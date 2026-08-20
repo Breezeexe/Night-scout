@@ -12,9 +12,10 @@ Managed layout::
     ├── downloads/
     └── tools.lock.yaml
 
-The runtime prepends ``bin/`` to PATH automatically. ProjectDiscovery tools are
-managed through PDTM. Arjun is installed with pipx. JADX/Gitleaks/TruffleHog and
-Apktool use official GitHub release assets.
+The runtime prepends ``bin/`` to PATH automatically. Installation is APT-first
+for explicitly allow-listed Debian/Kali packages.  Night Scout verifies binary
+identity after package installation and uses PDTM/pipx/official GitHub releases
+only as upstream fallbacks.
 
 No target identifiers or reconnaissance data are sent to these upstreams.
 """
@@ -80,6 +81,28 @@ class ToolRequirement(StrEnum):
     OPTIONAL = "optional"
 
 
+class AptPackageSpec(BaseModel):
+    """Allow-listed distro package for one Night Scout tool.
+
+    ``binary`` may differ from the Night Scout-facing binary name.  Kali, for
+    example, packages ProjectDiscovery httpx as ``httpx-toolkit`` to avoid the
+    Python-httpx name collision.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    package: str
+    binary: str
+
+    @field_validator("package", "binary")
+    @classmethod
+    def apt_nonempty(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("must not be blank")
+        return normalized
+
+
 class PlatformInfo(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -120,6 +143,10 @@ class ToolSpec(BaseModel):
     prerequisite_commands: tuple[str, ...] = ()
     prerequisite_apt_packages: tuple[str, ...] = ()
 
+    # Explicit per-distribution allow-list.  We never infer an APT package from
+    # the tool ID because names can collide (notably ``httpx`` on Debian/Kali).
+    apt: dict[str, AptPackageSpec] = Field(default_factory=dict)
+
     @field_validator("tool_id", "binary")
     @classmethod
     def nonempty(cls, value: str) -> str:
@@ -143,6 +170,9 @@ class ToolSpec(BaseModel):
                 raise ValueError("GitHub strategy requires repository and asset_regex")
         if self.strategy is InstallStrategy.GITHUB_ARCHIVE_APP and not self.entrypoint:
             raise ValueError("github_archive_app requires entrypoint")
+        unknown_apt_os = sorted(set(self.apt) - SUPPORTED_OS_IDS)
+        if unknown_apt_os:
+            raise ValueError(f"unsupported apt OS IDs: {', '.join(unknown_apt_os)}")
         return self
 
 
@@ -456,11 +486,6 @@ def select_tools(
             if tool.requirement is ToolRequirement.REQUIRED or include_optional
         ]
 
-    # PDTM is an implementation dependency of all ProjectDiscovery tools.
-    needs_pdtm = any(tool.strategy is InstallStrategy.PDTM for tool in selected)
-    if needs_pdtm and "pdtm" in by_id and all(tool.tool_id != "pdtm" for tool in selected):
-        selected.insert(0, by_id["pdtm"])
-
     deduped: list[ToolSpec] = []
     seen: set[str] = set()
     for tool in selected:
@@ -469,6 +494,107 @@ def select_tools(
         seen.add(tool.tool_id)
         deduped.append(tool)
     return tuple(deduped)
+
+
+class _AptSession:
+    """One setup/install invocation worth of APT state."""
+
+    def __init__(self) -> None:
+        self.updated = False
+
+
+def _privilege_prefix() -> list[str] | None:
+    if os.geteuid() == 0:
+        return []
+    sudo = shutil.which("sudo")
+    if sudo:
+        return [sudo]
+    return None
+
+
+def _apt_candidate_available(package: str) -> bool:
+    apt_cache = shutil.which("apt-cache")
+    if apt_cache is None:
+        return False
+    result = subprocess.run(
+        [apt_cache, "policy", package],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    if result.returncode != 0:
+        return False
+    return re.search(r"(?m)^\s*Candidate:\s*(?!\(none\))\S+", result.stdout) is not None
+
+
+def _try_install_with_apt(
+    spec: ToolSpec,
+    manifest: ToolsManifest,
+    *,
+    platform_info: PlatformInfo,
+    apt_session: _AptSession,
+) -> ToolInstallResult | None:
+    """Install an explicitly allow-listed distro package, or return ``None``.
+
+    APT is deliberately not guessed from ``tool_id``.  This prevents installing
+    unrelated packages with colliding names.  If the package is unavailable or
+    sudo/root is unavailable, the caller falls back to the upstream strategy.
+    """
+
+    apt_spec = spec.apt.get(platform_info.os_id)
+    if apt_spec is None:
+        return None
+    prefix = _privilege_prefix()
+    if prefix is None:
+        return None
+    if not _apt_candidate_available(apt_spec.package):
+        # Package lists may be stale. Refresh once, then check again.
+        if not apt_session.updated:
+            print("    apt: refreshing package metadata (apt-get update)...", flush=True)
+            update = subprocess.run([*prefix, "apt-get", "update"], check=False)
+            if update.returncode != 0:
+                return None
+            apt_session.updated = True
+        if not _apt_candidate_available(apt_spec.package):
+            return None
+
+    if not apt_session.updated:
+        print("    apt: refreshing package metadata (apt-get update)...", flush=True)
+        update = subprocess.run([*prefix, "apt-get", "update"], check=False)
+        if update.returncode != 0:
+            return None
+        apt_session.updated = True
+
+    print(f"    apt: installing {apt_spec.package}...", flush=True)
+    install = subprocess.run(
+        [*prefix, "apt-get", "install", "-y", "--no-install-recommends", apt_spec.package],
+        check=False,
+    )
+    if install.returncode != 0:
+        return None
+
+    actual = shutil.which(apt_spec.binary)
+    if actual is None:
+        return None
+
+    # If the distro intentionally renames the executable, expose a managed
+    # compatibility symlink under the binary name expected by Night Scout.
+    if apt_spec.binary != spec.binary:
+        _atomic_symlink(Path(actual).resolve(), managed_bin_dir(manifest) / spec.binary)
+
+    verified = probe_tool(spec, manifest)
+    if not verified.installed or not verified.identity_ok:
+        return None
+
+    return ToolInstallResult(
+        tool_id=spec.tool_id,
+        installed=True,
+        path=verified.path,
+        version=verified.version,
+        source=f"apt:{platform_info.os_id}:{apt_spec.package}",
+        detail=f"installed from {platform_info.os_id} APT package {apt_spec.package}",
+    )
 
 
 def install_tools(
@@ -501,10 +627,8 @@ def install_tools(
         all_tools=all_tools,
     )
 
-    if install_prerequisites:
-        _install_apt_prerequisites(selected)
-
     results: list[ToolInstallResult] = []
+    apt_session = _AptSession()
     total = len(selected)
     for index, spec in enumerate(selected, start=1):
         _emit_tool_progress(
@@ -537,47 +661,59 @@ def install_tools(
             )
             continue
 
-        _ensure_prerequisite_commands(spec)
-        if spec.strategy is InstallStrategy.PDTM:
-            install_detail = (
-                "ProjectDiscovery PDTM download/install; this can take several minutes "
-                "(per-tool timeout: 10 minutes)"
-            )
-        elif spec.strategy is InstallStrategy.PIPX:
-            install_detail = (
-                "pipx package install; dependency download can take several minutes "
-                "(timeout: 15 minutes)"
-            )
-        else:
-            install_detail = "official GitHub release lookup/download and SHA-256 verification"
-
+        apt_spec = spec.apt.get(platform_info.os_id)
+        apt_note = (
+            f"APT-first ({apt_spec.package}); upstream fallback if unavailable/incompatible"
+            if apt_spec is not None
+            else "no allow-listed distro package; using upstream installer"
+        )
         _emit_tool_progress(
             progress,
             spec=spec,
             index=index,
             total=total,
             phase=ToolInstallPhase.INSTALLING,
-            detail=install_detail,
+            detail=apt_note,
         )
 
-        if spec.strategy is InstallStrategy.PDTM:
-            result = _install_with_pdtm(spec, manifest, update=update)
-        elif spec.strategy is InstallStrategy.PIPX:
-            result = _install_with_pipx(spec, manifest, update=update)
-        elif spec.strategy in {
-            InstallStrategy.GITHUB_BINARY,
-            InstallStrategy.GITHUB_ARCHIVE_APP,
-            InstallStrategy.GITHUB_JAR,
-        }:
-            result = _install_from_github_release(
-                spec,
-                manifest,
-                platform_info=platform_info,
-                update=update,
-                allow_unverified=allow_unverified,
-            )
-        else:  # pragma: no cover - enum exhaustiveness
-            raise ToolingError(f"unsupported install strategy: {spec.strategy}")
+        result = _try_install_with_apt(
+            spec,
+            manifest,
+            platform_info=platform_info,
+            apt_session=apt_session,
+        )
+        if result is None:
+            if apt_spec is not None:
+                print(
+                    f"    apt: {apt_spec.package} unavailable/incompatible; using upstream fallback",
+                    flush=True,
+                )
+            if install_prerequisites:
+                _install_apt_prerequisites((spec,))
+            _ensure_prerequisite_commands(spec)
+            if spec.strategy is InstallStrategy.PDTM:
+                _ensure_pdtm_available(
+                    manifest,
+                    platform_info=platform_info,
+                    allow_unverified=allow_unverified,
+                )
+                result = _install_with_pdtm(spec, manifest, update=update)
+            elif spec.strategy is InstallStrategy.PIPX:
+                result = _install_with_pipx(spec, manifest, update=update)
+            elif spec.strategy in {
+                InstallStrategy.GITHUB_BINARY,
+                InstallStrategy.GITHUB_ARCHIVE_APP,
+                InstallStrategy.GITHUB_JAR,
+            }:
+                result = _install_from_github_release(
+                    spec,
+                    manifest,
+                    platform_info=platform_info,
+                    update=update,
+                    allow_unverified=allow_unverified,
+                )
+            else:  # pragma: no cover - enum exhaustiveness
+                raise ToolingError(f"unsupported install strategy: {spec.strategy}")
 
         _emit_tool_progress(
             progress,
@@ -654,11 +790,8 @@ def _install_apt_prerequisites(specs: Sequence[ToolSpec]) -> None:
     if not packages:
         return
 
-    if os.geteuid() == 0:
-        prefix: list[str] = []
-    elif shutil.which("sudo"):
-        prefix = ["sudo"]
-    else:
+    prefix = _privilege_prefix()
+    if prefix is None:
         raise ToolingError(
             "system prerequisites are missing and sudo is unavailable; install: "
             + " ".join(packages)
@@ -679,6 +812,35 @@ def _ensure_prerequisite_commands(spec: ToolSpec) -> None:
             f"{spec.tool_id} prerequisites missing: {', '.join(missing)}; "
             f"install {packages} or rerun with --install-prerequisites"
         )
+
+
+def _ensure_pdtm_available(
+    manifest: ToolsManifest,
+    *,
+    platform_info: PlatformInfo,
+    allow_unverified: bool,
+) -> None:
+    status_spec = manifest.by_id().get("pdtm")
+    if status_spec is None:
+        raise ToolingError("tools manifest does not define PDTM fallback helper")
+    status = probe_tool(status_spec, manifest)
+    if status.installed and status.identity_ok:
+        return
+
+    print(
+        "    upstream fallback needs PDTM; installing the small PDTM helper first...",
+        flush=True,
+    )
+    _install_from_github_release(
+        status_spec,
+        manifest,
+        platform_info=platform_info,
+        update=False,
+        allow_unverified=allow_unverified,
+    )
+    verified = probe_tool(status_spec, manifest)
+    if not verified.installed or not verified.identity_ok:
+        raise ToolingError(f"PDTM helper verification failed: {verified.detail}")
 
 
 def _install_with_pdtm(
@@ -702,10 +864,10 @@ def _install_with_pdtm(
         "-duc",
         "-nc",
     ]
-    result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=600)
+    print(f"    upstream: running PDTM for {spec.tool_id} (live output follows)...", flush=True)
+    result = subprocess.run(command, check=False, timeout=600)
     if result.returncode != 0:
-        output = " ".join((result.stdout + " " + result.stderr).strip().split())
-        raise ToolingError(f"PDTM failed for {spec.tool_id}: {output[:1000]}")
+        raise ToolingError(f"PDTM failed for {spec.tool_id} with exit code {result.returncode}")
 
     return ToolInstallResult(
         tool_id=spec.tool_id,
@@ -737,10 +899,10 @@ def _install_with_pipx(
     env["PIPX_BIN_DIR"] = str(managed_bin_dir(manifest))
     env["PIPX_HOME"] = str(managed_root(manifest) / "pipx")
 
-    result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=900, env=env)
+    print(f"    upstream: running pipx for {spec.tool_id} (live output follows)...", flush=True)
+    result = subprocess.run(command, check=False, timeout=900, env=env)
     if result.returncode != 0:
-        output = " ".join((result.stdout + " " + result.stderr).strip().split())
-        raise ToolingError(f"pipx failed for {spec.tool_id}: {output[:1000]}")
+        raise ToolingError(f"pipx failed for {spec.tool_id} with exit code {result.returncode}")
 
     return ToolInstallResult(
         tool_id=spec.tool_id,
@@ -762,6 +924,7 @@ def _install_from_github_release(
     assert spec.repository is not None
     assert spec.asset_regex is not None
 
+    print(f"    upstream: checking latest release for {spec.repository}...", flush=True)
     release = _github_latest_release(spec.repository)
     asset_pattern = re.compile(format_asset_regex(spec.asset_regex, platform_info), re.IGNORECASE)
     matching = [asset for asset in release.assets if asset_pattern.search(asset.name)]
@@ -778,7 +941,11 @@ def _install_from_github_release(
     downloads = root / "downloads"
     downloads.mkdir(parents=True, exist_ok=True)
     download_path = downloads / asset.name
-    _download_file(asset.url, download_path, max_bytes=MAX_ASSET_BYTES)
+    print(
+        f"    upstream: downloading {asset.name} ({asset.size / (1024 * 1024):.1f} MiB)...",
+        flush=True,
+    )
+    _download_file(asset.url, download_path, max_bytes=MAX_ASSET_BYTES, show_progress=True)
     digest = _sha256_file(download_path)
 
     verified = False
@@ -797,7 +964,13 @@ def _install_from_github_release(
         checksum_assets = [asset for asset in release.assets if checksum_pattern.search(asset.name)]
         if len(checksum_assets) == 1:
             checksum_path = downloads / checksum_assets[0].name
-            _download_file(checksum_assets[0].url, checksum_path, max_bytes=16 * 1024 * 1024)
+            print(f"    upstream: downloading checksum {checksum_assets[0].name}...", flush=True)
+            _download_file(
+                checksum_assets[0].url,
+                checksum_path,
+                max_bytes=16 * 1024 * 1024,
+                show_progress=False,
+            )
             expected = _checksum_for_asset(checksum_path, asset.name)
             if expected is None:
                 raise ToolingError(
@@ -993,7 +1166,13 @@ def _github_latest_release(repository: str) -> GitHubRelease:
     return GitHubRelease(tag_name=tag_name, html_url=html_url, assets=tuple(assets))
 
 
-def _download_file(url: str, destination: Path, *, max_bytes: int) -> None:
+def _download_file(
+    url: str,
+    destination: Path,
+    *,
+    max_bytes: int,
+    show_progress: bool = False,
+) -> None:
     if not url.startswith("https://"):
         raise ToolingError("refusing non-HTTPS download")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1006,6 +1185,12 @@ def _download_file(url: str, destination: Path, *, max_bytes: int) -> None:
     try:
         with urllib.request.urlopen(request, timeout=60.0) as response, temp.open("wb") as handle:
             total = 0
+            content_length_raw = response.headers.get("Content-Length")
+            try:
+                expected = int(content_length_raw) if content_length_raw else 0
+            except ValueError:
+                expected = 0
+            last_report = time.monotonic()
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
@@ -1014,9 +1199,26 @@ def _download_file(url: str, destination: Path, *, max_bytes: int) -> None:
                 if total > max_bytes:
                     raise ToolingError(f"download exceeded size limit: {url}")
                 handle.write(chunk)
+                now = time.monotonic()
+                if show_progress and now - last_report >= 2.0:
+                    if expected > 0:
+                        percent = min(100.0, total * 100.0 / expected)
+                        print(
+                            f"      downloaded {total / (1024 * 1024):.1f}/"
+                            f"{expected / (1024 * 1024):.1f} MiB ({percent:.0f}%)",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"      downloaded {total / (1024 * 1024):.1f} MiB...",
+                            flush=True,
+                        )
+                    last_report = now
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, destination)
+        if show_progress:
+            print(f"      download complete: {total / (1024 * 1024):.1f} MiB", flush=True)
     finally:
         temp.unlink(missing_ok=True)
 
@@ -1226,7 +1428,13 @@ def tooling_cli(argv: Sequence[str] | None = None) -> int:
         print(f"managed bin: {managed_bin_dir(manifest)}")
         for spec in manifest.tools:
             marker = "required" if spec.requirement is ToolRequirement.REQUIRED else "optional"
-            print(f"{spec.tool_id:14} {marker:8} {spec.strategy.value:20} {spec.description}")
+            apt_spec = spec.apt.get(platform_info.os_id)
+            install_path = (
+                f"apt:{apt_spec.package} -> fallback:{spec.strategy.value}"
+                if apt_spec is not None
+                else f"upstream:{spec.strategy.value}"
+            )
+            print(f"{spec.tool_id:14} {marker:8} {install_path:36} {spec.description}")
         return 0
 
     if args.action == "verify":

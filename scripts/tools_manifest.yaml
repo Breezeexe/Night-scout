@@ -28,6 +28,8 @@ tools:
     project: subfinder
     version_args: [-version]
     identity_regex: subfinder
+    apt:
+      kali: {package: subfinder, binary: subfinder}
 
   - tool_id: dnsx
     binary: dnsx
@@ -38,6 +40,8 @@ tools:
     project: dnsx
     version_args: [-version]
     identity_regex: dnsx
+    apt:
+      kali: {package: dnsx, binary: dnsx}
 
   - tool_id: httpx
     binary: httpx
@@ -48,6 +52,9 @@ tools:
     project: httpx
     version_args: [-version]
     identity_regex: 'httpx|projectdiscovery'
+    apt:
+      # Kali renames ProjectDiscovery httpx to avoid collision with Python httpx.
+      kali: {package: httpx-toolkit, binary: httpx-toolkit}
 
   - tool_id: tlsx
     binary: tlsx
@@ -98,6 +105,8 @@ tools:
     project: nuclei
     version_args: [-version]
     identity_regex: nuclei
+    apt:
+      kali: {package: nuclei, binary: nuclei}
 
   - tool_id: arjun
     binary: arjun
@@ -110,6 +119,9 @@ tools:
     identity_regex: 'arjun|parameter'
     prerequisite_commands: [pipx]
     prerequisite_apt_packages: [pipx]
+    apt:
+      kali: {package: arjun, binary: arjun}
+      debian: {package: arjun, binary: arjun}
 
   - tool_id: jadx
     binary: jadx
@@ -124,6 +136,8 @@ tools:
     identity_regex: 'jadx|^[0-9]+\.'
     prerequisite_commands: [java]
     prerequisite_apt_packages: [default-jre-headless]
+    apt:
+      kali: {package: jadx, binary: jadx}
 
   - tool_id: apktool
     binary: apktool
@@ -138,6 +152,9 @@ tools:
     identity_regex: '^[0-9]+\.'
     prerequisite_commands: [java]
     prerequisite_apt_packages: [default-jre-headless]
+    apt:
+      kali: {package: apktool, binary: apktool}
+      debian: {package: apktool, binary: apktool}
 
   - tool_id: gitleaks
     binary: gitleaks
@@ -150,6 +167,9 @@ tools:
     checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [version]
     identity_regex: 'gitleaks|^[0-9]+\.'
+    apt:
+      kali: {package: gitleaks, binary: gitleaks}
+      debian: {package: gitleaks, binary: gitleaks}
 
   - tool_id: trufflehog
     binary: trufflehog

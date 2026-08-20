@@ -75,12 +75,14 @@ sudo apt install ./release/nightscout_<version>_amd64.deb
 nightscout setup
 ```
 
-Не запускайте эту команду через `sudo`. Debian-пакет уже установил неизменяемое
+Не запускайте саму команду через `sudo`. Debian-пакет уже установил неизменяемое
 приложение в `/usr`; setup создаёт пользовательские конфиги/state,
 устанавливает или проверяет обязательные companion tools, синхронизирует
-консервативный default-набор публичных словарей и запускает `doctor`. При первом
-setup загрузка companion tools может занять несколько минут; Night Scout теперь
-показывает текущую фазу и конкретный tool, над которым работает.
+консервативный default-набор публичных словарей и запускает `doctor`. Для явно
+разрешённых корректных Debian/Kali пакетов используется APT-first; если APT
+нужны права, setup сам вызовет `sudo apt-get` и при необходимости попросит ваш
+sudo-пароль. При первом setup загрузка может занять несколько минут, но вывод
+APT/PDTM/pipx и текущий tool показываются live.
 
 Пользовательские данные по умолчанию находятся здесь:
 
@@ -2460,11 +2462,15 @@ nightscout wordlists verify
 nightscout doctor
 ```
 
-Канонический manifest — `scripts/tools_manifest.yaml`. ProjectDiscovery tools
-устанавливаются через PDTM, Arjun через pipx, JADX/Apktool/Gitleaks/TruffleHog
-из официальных release assets. Для GitHub binaries требуется upstream SHA-256
-(digest/checksum); обход возможен только явным `--allow-unverified` после ручной
-проверки.
+Канонический manifest — `scripts/tools_manifest.yaml`. Установка утилит теперь
+**APT-first** для явно разрешённых Debian/Kali пакетов с последующей проверкой
+identity/version бинарника. Если совместимого distro-пакета нет, Night Scout
+переходит на fallback из manifest: PDTM, pipx или официальный GitHub release.
+Имена пакетов не угадываются: в Kali ProjectDiscovery HTTPX — это
+`httpx-toolkit`, что исключает конфликт с Python-командой `httpx`. PDTM
+устанавливается только по требованию, когда fallback реально нужен. Для GitHub
+binaries требуется upstream SHA-256 (digest/checksum); обход возможен только
+явным `--allow-unverified` после ручной проверки.
 
 Внутри Night Scout остаётся Python-проектом, а релиз собирается как
 **PyInstaller one-folder distribution**, не one-file. Внешние recon binaries в

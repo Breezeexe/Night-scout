@@ -76,11 +76,14 @@ Run setup once as the **normal user who will run reconnaissance**:
 nightscout setup
 ```
 
-Do not run this command with `sudo`. The Debian package owns the immutable
+Do not run this command itself with `sudo`. The Debian package owns the immutable
 application under `/usr`; setup creates per-user configuration/state, installs
 or verifies the required companion tools, synchronizes the conservative default
-public wordlists, and runs `doctor`. On the first setup, companion-tool downloads
-can take several minutes; setup prints the current phase and tool while it works.
+public wordlists, and runs `doctor`. Tool installation is APT-first for an
+explicit allow-list of correct Debian/Kali packages. When APT needs privileges,
+setup invokes `sudo apt-get` itself and may ask for your sudo password. On the
+first setup, downloads can take several minutes; APT/PDTM/pipx output and the
+current tool are shown live.
 
 The default user state is stored under:
 
@@ -2462,11 +2465,16 @@ nightscout wordlists verify
 nightscout doctor
 ```
 
-The tool manifest is `scripts/tools_manifest.yaml`. ProjectDiscovery tools are
-installed through PDTM; Arjun uses pipx; JADX, Apktool, Gitleaks and TruffleHog
-use official release assets. GitHub binary downloads require an upstream
-SHA-256 digest/checksum unless the operator explicitly opts into
-`--allow-unverified` after manual verification.
+The tool manifest is `scripts/tools_manifest.yaml`. Tool installation is
+**APT-first** for explicitly allow-listed Debian/Kali packages, followed by a
+binary identity/version probe. If no compatible distro package is available,
+Night Scout falls back to PDTM, pipx, or an official GitHub release as defined
+by the manifest. Package names are never guessed: on Kali, ProjectDiscovery
+HTTPX is the `httpx-toolkit` package/binary, avoiding the unrelated Python
+`httpx` command. PDTM is installed on demand only when a fallback actually needs
+it. GitHub binary downloads require an upstream SHA-256 digest/checksum unless
+the operator explicitly opts into `--allow-unverified` after manual
+verification.
 
 The standalone build remains Python internally but is shipped as a
 **PyInstaller one-folder distribution**, not a one-file executable. Specialist

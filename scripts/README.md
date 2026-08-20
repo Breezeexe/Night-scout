@@ -32,9 +32,10 @@ nightscout tools verify
 ```
 
 Managed binaries live under `~/.local/share/nightscout/tools/bin` by default.
-Night Scout prepends this directory to worker PATH automatically. ProjectDiscovery
-tools are installed through official PDTM; Arjun uses pipx; optional mobile tools
-use official release assets.
+Night Scout prepends this directory to worker PATH automatically. Installation
+is APT-first for explicitly allow-listed Debian/Kali packages; verified distro
+binaries are reused directly. PDTM, pipx and official release assets are
+on-demand fallbacks when the distro package is missing or incompatible.
 
 ## `build_binary.py`
 
