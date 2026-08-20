@@ -88,7 +88,7 @@ APT/PDTM/pipx и текущий tool показываются live.
 
 ```text
 ~/.config/nightscout/       конфигурация и scope
-~/.local/share/nightscout/  SQLite workspace, tools, wordlists, artifacts
+~/.local/share/nightscout/  target workspaces, tools, wordlists, artifacts
 ~/.cache/nightscout/        disposable caches
 ```
 
@@ -114,6 +114,13 @@ scope YAML и позволить Night Scout самому получить вс�
 nightscout run --scope ./program.yaml
 ```
 
+Поле `target_id` в scope — это стабильный идентификатор программы. Night Scout
+выбирает для него отдельный workspace в
+`~/.local/share/nightscout/workspaces/<target-id>/` и привязывает SQLite-базу к
+этому идентификатору до чтения persistent frontier или записи Events. Несколько
+разрешённых доменов в одном scope используют общий workspace; другой `target_id`
+выбирает другой workspace.
+
 Scope и seeds — разные вещи. Exact `IN_SCOPE` DOMAIN rule запускается напрямую.
 Wildcard вроде `*.example.org` создаёт passive discovery anchor `example.org`,
 чтобы Subfinder/архивы могли начать поиск, но сам apex **не становится**
@@ -136,11 +143,22 @@ discovery anchor, Night Scout остановится до запуска recursi
 nightscout run example.com
 ```
 
+Managed scope `local-authorized-targets` намеренно использует один workspace для
+всех добавленных в него доменов. Для каждой независимой компании или
+bug-bounty программы используйте отдельный scope с уникальным стабильным
+`target_id`; не используйте quick-start scope как общий workspace разных
+клиентов.
+
 Default scope изначально **fail-closed**. Если для `example.com` ещё нет
 локального scope rule, интерактивный первый запуск отдельно просит подтвердить
 exact-domain и отдельно — wildcard-поддомены. Уже существующий `OUT_OF_SCOPE`,
 `PASSIVE_ONLY` или другой явный classification никогда не переопределяется
 молча.
+
+Встроенные `pipeline.example.yaml` и `scope.example.yaml` — это шаблоны, а не
+рабочая authorization policy. Runtime-команды отклоняют файлы, в имени которых
+есть `.example.`. Выполни `nightscout setup` либо скопируй, переименуй и вручную
+проверь оба шаблона перед использованием.
 
 Для automation/non-interactive режима с локальным managed scope:
 
@@ -189,6 +207,280 @@ rules:
 wildcard, а exclusions получают более высокий priority. Не выводи authorization
 из DNS, сертификатов, ASN, CNAME или общей инфраструктуры.
 
+### Создание `scope.yaml` и `pipeline.yaml`: пример Company
+
+`scope.yaml` отвечает на вопрос, **где Night Scout разрешено работать**, а
+`pipeline.yaml` — **как именно он может работать**. Assets программы,
+исключения и стабильный `target_id` хранятся в scope. Rate limits, budgets,
+настройки workers, routing и storage — в pipeline. Оба документа запрещают
+неизвестные поля верхнего уровня, поэтому нельзя придумывать сокращённые поля
+вроде `allowed`, `active` или `limits`.
+
+Предположим, вымышленная программа Company содержит пять exact domains, три
+wildcard domains, две сети, четыре явно указанных out-of-scope/no-reward
+исключения и ссылку на Android-приложение в стороннем магазине. В примере
+используются зарезервированные `.example` и TEST-NET диапазоны, поэтому
+infrastructure rules не могут случайно указать на реальную организацию.
+
+Создай `company-scope.yaml` со следующим содержимым:
+
+```yaml
+schema_version: 1
+target_id: company-bugbounty
+display_name: Company Bug Bounty Program
+
+gate:
+  allow_unknown_passive: false
+
+rules:
+  # Пять exact domains. Wildcard никогда не включает свой apex.
+  - rule_id: company-apex
+    kind: DOMAIN
+    pattern: company.example
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Exact domain явно указан программой Company
+
+  - rule_id: company-pay-apex
+    kind: DOMAIN
+    pattern: company-pay.example
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Exact domain явно указан программой Company
+
+  - rule_id: company-cloud-apex
+    kind: DOMAIN
+    pattern: company-cloud.example
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Exact domain явно указан программой Company
+
+  - rule_id: company-support-apex
+    kind: DOMAIN
+    pattern: company-support.example
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Exact domain явно указан программой Company
+
+  - rule_id: company-cdn-apex
+    kind: DOMAIN
+    pattern: company-cdn.example
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Exact domain явно указан программой Company
+
+  # Три рекурсивных wildcard. YAML-паттерны с "*" в начале нужно заключать в кавычки.
+  - rule_id: company-subdomains
+    kind: DOMAIN
+    pattern: "*.company.example"
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Wildcard явно указан программой Company
+
+  - rule_id: company-cloud-subdomains
+    kind: DOMAIN
+    pattern: "*.company-cloud.example"
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Wildcard явно указан программой Company
+
+  - rule_id: company-support-subdomains
+    kind: DOMAIN
+    pattern: "*.company-support.example"
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Wildcard явно указан программой Company
+
+  # Четыре исключения перекрывают широкие wildcard за счёт большего priority.
+  - rule_id: excluded-old
+    kind: DOMAIN
+    pattern: old.company.example
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Тестирование запрещено, выплата правилами программы не предусмотрена
+
+  - rule_id: excluded-billing
+    kind: DOMAIN
+    pattern: billing.company.example
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Тестирование запрещено, выплата правилами программы не предусмотрена
+
+  - rule_id: excluded-vpn
+    kind: DOMAIN
+    pattern: vpn.company-cloud.example
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Тестирование запрещено, выплата правилами программы не предусмотрена
+
+  - rule_id: excluded-vendor
+    kind: DOMAIN
+    pattern: vendor.company-support.example
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Сторонняя система явно исключена программой
+
+  # Две сети, явно указанные программой.
+  - rule_id: company-network-a
+    kind: CIDR
+    pattern: 192.0.2.0/28
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Сеть явно указана программой Company
+
+  - rule_id: company-network-b
+    kind: CIDR
+    pattern: 198.51.100.0/28
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Сеть явно указана программой Company
+
+  # Приложение задаётся проверенным package ID. Сторонний магазин — только
+  # источник/provenance артефакта, но не разрешённая цель для recon.
+  - rule_id: company-android-app
+    kind: MOBILE_APP
+    pattern: com.company.mobile
+    state: IN_SCOPE
+    priority: 200
+    tier: bounty
+    reason: "Program listing: https://play.google.com/store/apps/details?id=com.company.mobile"
+```
+
+Четыре исключения выше имеют состояние `OUT_OF_SCOPE`, потому что программа
+Company прямо пометила их находящимися вне testing scope. В другой программе
+сама по себе фраза «выплата не предусмотрена» не обязательно запрещает
+тестирование: если оно разрешено, оставь asset в `IN_SCOPE` и используй метку
+вроде `tier: no-bounty`.
+
+Автоматическими seeds запуска становятся только exact `IN_SCOPE` `DOMAIN`
+rules и discovery anchors для wildcard. CIDR и `MOBILE_APP` остаются правилами
+authorization и не превращаются в DNS-задачи. Не добавляй страницу Google Play,
+App Store или другого стороннего магазина как `IN_SCOPE` `URL`, если сам магазин
+явно не разрешён программой для тестирования. Сохрани listing как provenance в
+`reason`, а в `MOBILE_APP.pattern` укажи проверенный Android package ID или iOS
+bundle ID.
+
+Mobile worker никогда не скачивает APK. Получи приложение отдельно официальным
+разрешённым способом, проверь совпадение package ID с правилом scope и считай
+полученный файл недоверенным input. Night Scout анализирует только явно
+переданный локальный artifact, представленный событием `MOBILE_ARTIFACT`.
+Добавь его в тот же program run, что и domain seeds из scope:
+
+```bash
+nightscout run \
+  --pipeline ./company-pipeline.yaml \
+  --scope ./company-scope.yaml \
+  --mobile-artifact ./company.apk \
+  --mobile-app-id com.company.mobile \
+  --mobile-source-url "https://play.google.com/store/apps/details?id=com.company.mobile"
+```
+
+`--mobile-artifact` и `--mobile-app-id` всегда передаются вместе.
+`--mobile-source-url` — необязательный provenance, Night Scout никогда не
+обращается к нему. До копирования application ID должен совпасть с явным `IN_SCOPE` или
+`PASSIVE_ONLY` правилом `MOBILE_APP`. Night Scout отклоняет symlink, не-файл и
+слишком большой input, сохраняет artifact под его SHA-256 в target-specific
+workspace с read-only правами и повторно сверяет hash и size перед анализом.
+Domain и mobile seeds разделяют один `run_id`, frontier, scheduler, policy
+gates, budgets, rate limiters, статистику и итоговый summary. Поэтому
+получившиеся Event, Task, scope decision, run attribution и worker output идут
+через тот же durable lifecycle, что и domain reconnaissance.
+
+Сам mobile worker работает offline. Извлечённые URLs и backends независимо
+проверяются по тому же scope и могут создать последующие network tasks, если
+pipeline включает соответствующие active routes. Если offline должен оставаться
+весь invocation, а не только mobile worker, используй отдельный pipeline только
+с local/passive routes.
+
+Pipeline намеренно значительно больше scope, потому что каждая подсистема
+описана явно. Начинай с полного валидируемого шаблона, а не собирай частичный
+документ:
+
+```bash
+cp configs/pipeline.example.yaml company-pipeline.yaml
+```
+
+Измени identity и ссылку на scope в начале файла. Относительный `scope_file`
+разрешается относительно директории pipeline-файла:
+
+```yaml
+schema_version: 1
+profile_id: company-30-rps-per-node
+display_name: Company authorized recon — 30 req/s per node
+scope_file: company-scope.yaml
+```
+
+Затем полностью замени секцию `rate_limit` из шаблона на следующую, сохранив
+остальные обязательные секции (`runtime`, `storage`, `scheduler`, `budgets`,
+`routing`, `workers` и `intelligence`):
+
+```yaml
+rate_limit:
+  require_matching_rule: true
+  default_retry_after_seconds: 1.0
+  rules:
+    - rule_id: company-per-host-30-rps
+      scope: PER_RESOURCE
+      resource_pattern: "host:*"
+      requests_per_second: 30.0
+      burst: 1.0
+      max_concurrency: 1
+      workers: [dns, http, tls, crawler, content, parameters, vhost, nuclei]
+      reason: Общий предел 30 req/s для одного нормализованного target hostname
+
+    - rule_id: company-per-ip-30-rps
+      scope: PER_RESOURCE
+      resource_pattern: "ip:*"
+      requests_per_second: 30.0
+      burst: 1.0
+      max_concurrency: 1
+      workers: [http, tls]
+      reason: Общий предел 30 req/s для одного напрямую указанного target IP
+```
+
+Это shared buckets над отдельными tools. `max_concurrency: 1` выдаёт opaque
+multi-request tool эксклюзивную lease на host на время работы, а поддерживаемым
+tools Night Scout передаёт получившийся pacing hint 30 req/s. `burst: 1`
+предотвращает начальный всплеск выше steady rate. В примере «один узел» означает
+один нормализованный hostname либо IP при прямом обращении к нему. Разные
+hostnames, которые разрешаются в один физический IP, сейчас получают разные
+host buckets. Если программа требует единый лимит для всех DNS aliases одного
+IP, используй консервативное `GLOBAL`-правило 30 req/s для всех active workers:
+текущий limiter не объединяет hostname buckets по результату DNS resolution.
+
+Сначала проверь оба файла без отправки трафика к Company, затем ещё раз сверь
+authorization и только после этого запускай единый frontier с полученными из
+scope доменами и самостоятельно загруженным APK:
+
+```bash
+nightscout doctor --pipeline ./company-pipeline.yaml --scope ./company-scope.yaml
+nightscout run \
+  --pipeline ./company-pipeline.yaml \
+  --scope ./company-scope.yaml \
+  --mobile-artifact ./company.apk \
+  --mobile-app-id com.company.mobile \
+  --mobile-source-url "https://play.google.com/store/apps/details?id=com.company.mobile" \
+  --max-steps 100
+```
+
+`doctor` валидирует документы и проверяет наличие необходимых локальных tools,
+не сканируя target. Он всё равно может сообщить об ошибке, если отсутствует
+обязательный companion binary. Следующий `run` уже создаёт target traffic.
+
 ## Основные команды
 
 ```bash
@@ -204,26 +496,47 @@ nightscout run example.com
 # Ограничить один запуск, сохранив frontier в SQLite.
 nightscout run --scope ./program.yaml --max-steps 100
 
+# Скрыть live lifecycle updates, сохранив итоговый summary.
+nightscout run --scope ./program.yaml --no-progress
+
+# Добавить самостоятельно полученный APK в тот же запуск, что и домены программы.
+nightscout run --scope ./program.yaml --mobile-artifact ./company.apk --mobile-app-id com.company.mobile
+
 # Посмотреть persistent runs, tasks, assets и review state.
-nightscout status
+nightscout status --scope ./program.yaml
 
 # Объяснить сохранённый Event по event ID или точному Event value.
-nightscout explain <event-id-or-value>
+nightscout explain <event-id-or-value> --scope ./program.yaml
+
+# Просмотреть и разрешить tasks, приостановленные policy/review gates.
+nightscout review list --scope ./program.yaml
+nightscout review show <case-id> --scope ./program.yaml
+nightscout review approve <case-id> --scope ./program.yaml --reason "разрешено политикой программы"
+nightscout review reject <case-id> --scope ./program.yaml --reason "не разрешено"
 
 # SAFE export сразу в JSONL, TXT и CSV.
-nightscout export
+nightscout export --scope ./program.yaml
 
 # Экспорт одного формата.
-nightscout export --format jsonl
-nightscout export --format text
-nightscout export --format csv
+nightscout export --scope ./program.yaml --format jsonl
+nightscout export --scope ./program.yaml --format text
+nightscout export --scope ./program.yaml --format csv
 
 # Sensitive evidence — отдельная поверхность с двойным opt-in.
-nightscout export --sensitive --confirm-sensitive
+nightscout export --scope ./program.yaml --sensitive --confirm-sensitive
 
 # Проверить конфиг, платформу и companion tools без сканирования.
 nightscout doctor
+
+# Явно назначить владельца старой заполненной БД без target attribution.
+nightscout workspace adopt --scope ./program.yaml --yes
 ```
+
+`nightscout run` выводит в stderr текущий lifecycle step, worker, action,
+outcome, состояние очереди, ожидание retry и финальный статус запуска. JSON
+summary остаётся машиночитаемым в stdout. Короткие deferred retries ожидаются в
+том же запуске; долгие ожидания и ограниченные запуски с оставшейся работой
+завершаются как `PAUSED`, сохраняя durable frontier для следующего вызова.
 
 ### Companion tools
 
@@ -407,7 +720,8 @@ night-scout/
 │   │   ├── provenance.py
 │   │   ├── snapshots.py
 │   │   ├── intelligence.py
-│   │   └── schema.py
+│   │   ├── schema.py
+│   │   └── workspace.py
 │   │
 │   ├── workers/
 │   │   ├── passive_domains.py
@@ -451,7 +765,9 @@ night-scout/
 │   ├── env.py
 │   ├── script.py.mako
 │   └── versions/
-│       └── 0001_initial_schema_*.py
+│       ├── 0001_initial_schema_*.py
+│       ├── ...
+│       └── 0006_workspace_target_binding.py
 ├── tests/
 │   ├── test_migrations.py
 │   ├── test_runtime.py
@@ -487,9 +803,11 @@ night-scout/
 
 ```text
 nightscout setup
-nightscout run <root-domain>
+nightscout run [<root-domain> ...] [--mobile-artifact <artifact> --mobile-app-id <id>]
 nightscout status
 nightscout explain <event-id-or-value>
+nightscout review list|show|approve|reject
+nightscout workspace adopt
 nightscout export
 nightscout doctor
 nightscout tools ...
@@ -1919,26 +2237,36 @@ POSSIBLE_HIGH_IMPACT_SURFACE
 
 Реальные данные цели должны быть изолированы от кода движка.
 
-Концептуальная структура:
+Структура пользовательских данных по умолчанию (безопасные `target_id`
+используются как имена каталогов, для остальных создаётся детерминированное
+имя на основе хеша):
 
 ```text
-workspace/
-└── target-id/
-    ├── scope.yaml
-    ├── policy.yaml
-    ├── recon.db
-    ├── events.jsonl
-    │
-    ├── artifacts/
-    ├── snapshots/
-    ├── exports/
-    ├── logs/
-    └── notes/
+~/.local/share/nightscout/
+├── workspaces/
+│   └── target-id/
+│       ├── nightscout.sqlite3
+│       ├── events.jsonl
+│       ├── content/
+│       ├── artifacts/
+│       ├── sensitive-evidence/
+│       └── exports/
+├── tools/
+└── wordlists/
 ```
 
 Repository содержит engine.
 
 Workspace содержит знания о цели.
+
+Каждая база содержит singleton-привязку `workspace_metadata`. Runtime проверяет,
+что её `target_id` совпадает с активным scope, до загрузки tasks, Events, Genome,
+snapshots, review cases или exports. Несовпадение приводит к fail-closed. `run_id`
+по-прежнему идентифицирует один запуск, а `target_key` каждого seed — отдельный
+domain или mobile discovery anchor внутри той же программы.
+
+`NIGHTSCOUT_WORKSPACE_ROOT` — advanced override, который выбирает точный корень
+одного single-target workspace. Он не отключает проверку идентичности базы.
 
 ```text
 ENGINE
@@ -1951,32 +2279,41 @@ TARGET DATA
 # 28. Пример Scope Model
 
 ```yaml
+schema_version: 1
 target_id: example-program
+display_name: Example Bug Bounty Program
+gate:
+  allow_unknown_passive: false
+rules:
+  - rule_id: exact-apex
+    kind: DOMAIN
+    pattern: example.com
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Явно указан программой
 
-allowed:
-  domains:
-    - example.com
-    - "*.example.com"
+  - rule_id: wildcard-subdomains
+    kind: DOMAIN
+    pattern: "*.example.com"
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Явная wildcard authorization
 
-passive_only:
-  related_domains: true
-  certificate_neighbors: true
-  asn_neighbors: true
-
-active:
-  enabled: true
-
-limits:
-  requests_per_second_per_host: 5
-  max_concurrent_hosts: 10
-
-stop_conditions:
-  private_data: true
-  possible_secret: true
-  auth_boundary: true
+  - rule_id: excluded-admin
+    kind: DOMAIN
+    pattern: admin.example.com
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Явное исключение программы
 ```
 
-Schema намеренно остаётся target-agnostic.
+Это текущая принимаемая форма scope. Rate limits, budgets, routing и настройки
+workers относятся к `pipeline.yaml`, а не к `scope.yaml`; полный walkthrough
+Company находится в разделе **Первый авторизованный запуск**, canonical
+templates — в `configs/`.
 
 Разные bug-bounty programs могут быть представлены без изменения архитектуры engine.
 
@@ -2394,6 +2731,18 @@ Alembic upgrade head
    ├─ совпадает    → stamp baseline revision, данные сохраняются
    └─ не совпадает → fail closed; БД автоматически не переписывается
 ```
+
+Миграция workspace-target переносит существующий `scope_target_id` из истории
+запусков. Ровно один совпадающий исторический target привязывается автоматически;
+смешанная история отклоняется. Заполненная база без надёжной attribution остаётся
+непривязанной, пока оператор не проверит её и явно не выполнит:
+
+```bash
+nightscout workspace adopt --scope ./program.yaml --yes
+```
+
+Старые атрибутированные flat workspaces продолжают использоваться на прежнем
+месте. Новые цели получают изолированную структуру `workspaces/<target-id>/`.
 
 Проверка миграций при разработке:
 

@@ -1794,12 +1794,14 @@ class RunRepository:
     async def start(
         self,
         *,
+        target_id: str | None = None,
         config_hash: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
         async with self._database.transaction() as session:
             record = ReconRunRecord(
                 status="RUNNING",
+                target_id=target_id,
                 config_hash=config_hash,
                 metadata_json=dict(metadata or {}),
             )

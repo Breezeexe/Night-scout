@@ -73,7 +73,8 @@ storage:
   content_store:
     root: .nightscout/content
 
-  # Local APK/IPA artifacts explicitly supplied to Night Scout.
+  # Local APK/IPA artifacts supplied to `nightscout run --mobile-artifact`.
+  # Files are content-addressed and the worker never fetches store URLs.
   artifact_store:
     root: .nightscout/artifacts
 

@@ -74,6 +74,32 @@ def test_incompatible_unversioned_database_fails_closed(tmp_path):
     assert [row[1] for row in columns] == ["asset_id"]
 
 
+def test_workspace_migration_promotes_run_target_from_metadata(tmp_path):
+    path = tmp_path / "pre-workspace-binding.sqlite3"
+    upgrade_database(path)
+    assert downgrade_database(path, "0005_task_attempts") is not None
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO recon_runs(run_id,status,started_at,metadata_json) VALUES(?,?,?,?)",
+            (
+                "run_corp",
+                "RUNNING",
+                "2026-08-20T10:00:00.000000+00:00",
+                '{"scope_target_id":"corp"}',
+            ),
+        )
+        connection.commit()
+
+    upgrade_database(path)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT target_id FROM recon_runs WHERE run_id='run_corp'"
+        ).fetchone() == ("corp",)
+        assert connection.execute("SELECT COUNT(*) FROM workspace_metadata").fetchone() == (0,)
+
+
 def test_claim_fencing_migration_recovers_preexisting_running_task(tmp_path):
     path = tmp_path / "pre-fencing.sqlite3"
     upgrade_database(path)

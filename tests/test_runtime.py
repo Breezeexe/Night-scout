@@ -65,7 +65,7 @@ async def test_recursive_local_runtime_survives_migration_bootstrap(tmp_path, pr
     finally:
         await runtime.close()
 
-    database_path = root / "workspace.sqlite3"
+    database_path = root / "workspaces" / "example-program" / "workspace.sqlite3"
     assert current_revision(database_path) == head_revision(database_path)
 
 

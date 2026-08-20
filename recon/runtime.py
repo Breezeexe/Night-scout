@@ -35,7 +35,7 @@ import json
 import os
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import partial
@@ -179,6 +179,12 @@ from recon.storage.models import (
 from recon.storage.provenance import ProvenanceRepository
 from recon.storage.schema import upgrade_database
 from recon.storage.snapshots import SnapshotKind, SnapshotRepository, SurfaceState
+from recon.storage.workspace import (
+    WorkspaceBinding,
+    WorkspaceRepository,
+    recorded_workspace_target_ids,
+    workspace_directory_name,
+)
 from recon.tooling import (
     ToolRequirement,
     activate_managed_tool_path,
@@ -239,11 +245,14 @@ from recon.workers.javascript import (
 from recon.workers.mobile import (
     ApktoolDecompiler,
     GitleaksSecretScanner,
+    ImportedMobileArtifact,
     JadxDecompiler,
     MobileAnalysisConfig,
+    MobileArtifactKind,
     MobileWorker,
     TruffleHogSecretScanner,
     WorkspaceMobileArtifactProvider,
+    WorkspaceMobileArtifactStore,
     WorkspaceSensitiveEvidenceStore,
     mobile_route_rules,
 )
@@ -504,6 +513,10 @@ class RuntimeSeedSummary(BaseModel):
     matched_rule_id: str | None = None
     source_rule_ids: tuple[str, ...] = ()
     genome_fingerprint: str | None = None
+    artifact_ref: str | None = None
+    artifact_kind: str | None = None
+    artifact_sha256: str | None = None
+    artifact_size_bytes: int | None = Field(default=None, ge=0)
 
 
 class RuntimeProgramRunSummary(BaseModel):
@@ -527,6 +540,53 @@ class RuntimeProgramRunSummary(BaseModel):
     open_review_cases: int
 
     warnings: tuple[str, ...] = ()
+
+
+class RuntimeMobileArtifactInput(BaseModel):
+    """One local mobile artifact supplied as an additional program seed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    artifact_path: Path
+    app_id: str
+    source_url: str | None = None
+    kind: MobileArtifactKind | None = None
+
+    @field_validator("app_id")
+    @classmethod
+    def app_id_required(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("app_id must not be blank")
+        return normalized
+
+    @field_validator("source_url")
+    @classmethod
+    def normalize_source_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedMobileIngress:
+    input: RuntimeMobileArtifactInput
+    subject: ScopeSubject
+    decision: ScopeDecision
+    store: WorkspaceMobileArtifactStore
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeFrontierResult:
+    run_id: str
+    status: str
+    steps: int
+    outcomes: dict[str, int]
+    stopped_idle: bool
+    max_steps_reached: bool
+    paused_deferred: bool
+    next_resume_at: datetime | None
+    status_snapshot: RuntimeStatus
 
 
 class RuntimeProgress(BaseModel):
@@ -562,6 +622,8 @@ RuntimeProgressCallback = Callable[[RuntimeProgress], None]
 class RuntimeStatus(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    target_id: str
+    workspace_root: str
     database_path: str
     event_count: int
     asset_count: int
@@ -1635,6 +1697,8 @@ class NightScoutRuntime:
         self._artifact_root: Path
         self._sensitive_root: Path
         self._nvd_cache: SQLiteNvdCache | None = None
+        self.workspace: WorkspaceRepository
+        self.workspace_binding: WorkspaceBinding
 
     @classmethod
     async def build(
@@ -1653,9 +1717,7 @@ class NightScoutRuntime:
         pipeline = cfg.pipeline
 
         storage = pipeline.storage
-        database_data = dict(storage.get("database", {}))
-        database_data["path"] = cfg.resolve(database_data["path"])
-        database_config = DatabaseConfig.model_validate(database_data)
+        database_config = runtime_database_config(cfg)
 
         # Migrate before the async engine opens pooled connections. Legacy
         # pre-Alembic Night Scout workspaces are adopted only after an exact
@@ -1666,11 +1728,24 @@ class NightScoutRuntime:
         )
 
         self.database = Database(database_config)
+        self.workspace = WorkspaceRepository(self.database)
+        try:
+            self.workspace_binding = await self.workspace.bind_or_validate(cfg.scope.target_id)
+        except Exception:
+            await self.database.dispose()
+            raise
         self.warnings.append(
             "schema: "
             f"{migration_result.action.value.lower()} "
             f"revision={migration_result.current_revision or 'none'}"
         )
+        if self.workspace_binding.created:
+            action = (
+                "adopted from run history"
+                if self.workspace_binding.adopted_from_history
+                else "created"
+            )
+            self.warnings.append(f"workspace: {action} target={self.workspace_binding.target_id}")
 
         self.events = EventRepository(self.database)
         self.branches = BranchRepository(self.database)
@@ -2315,30 +2390,222 @@ class NightScoutRuntime:
         self,
         domains: Sequence[str] = (),
         *,
+        mobile_artifact: RuntimeMobileArtifactInput | None = None,
         max_steps: int | None = None,
         progress: RuntimeProgressCallback | None = None,
     ) -> RuntimeProgramRunSummary:
-        """Run one program frontier from many explicit or scope-derived domain seeds."""
+        """Run one program frontier from domain and optional local mobile seeds."""
 
         plan = self.plan_domain_seeds(domains)
-        if not plan.seeds:
+        prepared_mobile = (
+            self._prepare_mobile_ingress(mobile_artifact)
+            if mobile_artifact is not None
+            else None
+        )
+        if not plan.seeds and prepared_mobile is None:
             raise ValueError(
-                "scope produced no domain seeds; add at least one IN_SCOPE DOMAIN rule "
-                "or provide explicit authorized domain seeds"
+                "run has no seeds; add an IN_SCOPE DOMAIN rule, provide explicit "
+                "authorized domains, or supply --mobile-artifact with --mobile-app-id"
             )
         return await self._run_seed_plan(
             plan,
+            mobile_artifact=prepared_mobile,
             max_steps=max_steps,
             progress=progress,
+        )
+
+    def _prepare_mobile_ingress(
+        self,
+        mobile: RuntimeMobileArtifactInput,
+    ) -> _PreparedMobileIngress:
+        """Authorize and configure a mobile seed before touching its source file."""
+
+        subject = ScopeSubject(kind=ScopeAssetKind.MOBILE_APP, value=mobile.app_id)
+        decision = self.scope_engine.evaluate(subject)
+        if decision.state not in {ScopeState.IN_SCOPE, ScopeState.PASSIVE_ONLY}:
+            raise ValueError(
+                f"mobile application {subject.value!r} is {decision.state.value}; "
+                "add an explicit IN_SCOPE or PASSIVE_ONLY MOBILE_APP rule"
+            )
+        if "mobile" not in self.workers:
+            raise RuntimeError("mobile worker is not enabled or available in this pipeline")
+
+        enabled_rule_ids = {
+            str(rule_id).strip()
+            for rule_id in self.configuration.pipeline.routing.get("enabled_rule_ids", [])
+            if str(rule_id).strip()
+        }
+        mobile_route_id = "mobile.analyze.local-artifact"
+        if enabled_rule_ids and mobile_route_id not in enabled_rule_ids:
+            raise RuntimeError(f"pipeline routing does not enable {mobile_route_id}")
+
+        mobile_section = self.configuration.worker("mobile")
+        mobile_config = MobileAnalysisConfig.model_validate(mobile_section.get("config", {}))
+        return _PreparedMobileIngress(
+            input=mobile,
+            subject=subject,
+            decision=decision,
+            store=WorkspaceMobileArtifactStore(
+                self._artifact_root,
+                max_artifact_bytes=mobile_config.max_artifact_bytes,
+            ),
         )
 
     async def _run_seed_plan(
         self,
         plan: DomainSeedPlan,
         *,
+        mobile_artifact: _PreparedMobileIngress | None = None,
         max_steps: int | None = None,
         progress: RuntimeProgressCallback | None = None,
     ) -> RuntimeProgramRunSummary:
+        seed_pairs: list[tuple[DomainSeedSpec, Event]] = []
+        mobile_pair: tuple[ImportedMobileArtifact, Event] | None = None
+        seed_summaries: list[RuntimeSeedSummary] = []
+
+        async def initialize() -> None:
+            nonlocal mobile_pair
+            for seed_spec in plan.seeds:
+                event = await self.seed_domain(seed_spec.domain, seed_spec=seed_spec)
+                seed_pairs.append((seed_spec, event))
+
+            if mobile_artifact is None:
+                return
+
+            imported = await mobile_artifact.store.import_file(
+                mobile_artifact.input.artifact_path,
+                kind=mobile_artifact.input.kind,
+            )
+            metadata: dict[str, Any] = {
+                "target_key": mobile_artifact.subject.value,
+                "app_id": mobile_artifact.subject.value,
+                "artifact_ref": imported.artifact_ref,
+                "artifact_kind": imported.kind.value,
+                "artifact_sha256": imported.sha256,
+                "artifact_size_bytes": imported.size_bytes,
+                "scope_matched_rule_id": mobile_artifact.decision.matched_rule_id,
+                "scope_tier": mobile_artifact.decision.tier,
+                "network_request_performed": False,
+            }
+            if mobile_artifact.input.source_url is not None:
+                metadata["source_url"] = mobile_artifact.input.source_url
+
+            artifact_event = Event(
+                type=EventType.MOBILE_ARTIFACT,
+                value=(
+                    f"{mobile_artifact.subject.value}@sha256:{imported.sha256}"
+                ),
+                source="cli:run:mobile-artifact",
+                scope_state=mobile_artifact.decision.state,
+                confidence=1.0,
+                novelty=0.95,
+                depth=0,
+                tags={"seed", "local", "mobile", imported.kind.value.lower()},
+                metadata=metadata,
+            )
+            with self.event_bus.bind_branch(artifact_event.event_id):
+                published = await self.event_bus.publish(artifact_event)
+            if not published:
+                raise RuntimeError("mobile artifact event was not published")
+            mobile_pair = (imported, artifact_event)
+
+        async def finalize() -> None:
+            for seed_spec, seed in seed_pairs:
+                genome_fingerprint = await self._build_seed_genome(seed)
+                seed_summaries.append(
+                    RuntimeSeedSummary(
+                        seed_event_id=seed.event_id,
+                        target=seed.value,
+                        scope_state=seed.scope_state,
+                        mode=seed_spec.mode.value,
+                        matched_rule_id=seed_spec.matched_rule_id,
+                        source_rule_ids=seed_spec.source_rule_ids,
+                        genome_fingerprint=genome_fingerprint,
+                    )
+                )
+
+            if mobile_artifact is not None:
+                assert mobile_pair is not None
+                imported, seed = mobile_pair
+                genome_fingerprint = await self._build_seed_genome(seed)
+                seed_summaries.append(
+                    RuntimeSeedSummary(
+                        seed_event_id=seed.event_id,
+                        target=mobile_artifact.subject.value,
+                        scope_state=seed.scope_state,
+                        mode="MOBILE_ARTIFACT",
+                        matched_rule_id=mobile_artifact.decision.matched_rule_id,
+                        source_rule_ids=mobile_artifact.decision.matched_rule_ids,
+                        genome_fingerprint=genome_fingerprint,
+                        artifact_ref=imported.artifact_ref,
+                        artifact_kind=imported.kind.value,
+                        artifact_sha256=imported.sha256,
+                        artifact_size_bytes=imported.size_bytes,
+                    )
+                )
+
+        targets = tuple(seed.domain for seed in plan.seeds) + (
+            (mobile_artifact.subject.value,) if mobile_artifact is not None else ()
+        )
+        if plan.seeds and mobile_artifact is not None:
+            run_kind = "mixed"
+        elif mobile_artifact is not None:
+            run_kind = "mobile-artifact"
+        else:
+            run_kind = "domain"
+        frontier = await self._run_frontier(
+            targets=targets,
+            run_kind=run_kind,
+            initialize=initialize,
+            finalize=finalize,
+            max_steps=max_steps,
+            progress=progress,
+        )
+        status = frontier.status_snapshot
+        return RuntimeProgramRunSummary(
+            run_id=frontier.run_id,
+            status=frontier.status,
+            seeds=tuple(seed_summaries),
+            steps=frontier.steps,
+            outcomes=frontier.outcomes,
+            stopped_idle=frontier.stopped_idle,
+            max_steps_reached=frontier.max_steps_reached,
+            paused_deferred=frontier.paused_deferred,
+            next_resume_at=frontier.next_resume_at,
+            task_counts=status.task_counts,
+            attempt_counts=status.attempt_counts,
+            event_count=status.event_count,
+            asset_count=status.asset_count,
+            open_review_cases=status.open_review_cases,
+            warnings=tuple(dict.fromkeys((*plan.warnings, *self.warnings))),
+        )
+
+    async def _build_seed_genome(self, seed: Event) -> str | None:
+        if not self.configuration.pipeline.runtime.build_genome_on_finish:
+            return None
+        try:
+            genome, _report = await self.genome_builder.build(seed)
+            await self.intelligence.genome_store.save(genome)
+            return genome.fingerprint
+        except Exception as exc:
+            self.warnings.append(
+                f"Target Genome build failed for {seed.value}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
+    async def _run_frontier(
+        self,
+        *,
+        targets: Sequence[str],
+        run_kind: str,
+        initialize: Callable[[], Awaitable[None]],
+        finalize: Callable[[], Awaitable[None]] | None = None,
+        max_steps: int | None = None,
+        progress: RuntimeProgressCallback | None = None,
+    ) -> _RuntimeFrontierResult:
+        """Run any authorized ingress through the shared durable lifecycle."""
+
         if self._run_id is not None:
             raise RuntimeError("runtime already has an active run")
 
@@ -2351,12 +2618,13 @@ class NightScoutRuntime:
                     "Resume them with resume_frontier=true or use a fresh workspace."
                 )
 
-        targets = [seed.domain for seed in plan.seeds]
         self._run_id = await self.runs.start(
+            target_id=self.configuration.scope.target_id,
             config_hash=self.configuration.config_hash,
             metadata={
-                "targets": targets,
+                "targets": list(targets),
                 "seed_count": len(targets),
+                "run_kind": run_kind,
                 "profile_id": self.configuration.pipeline.profile_id,
                 "scope_target_id": self.configuration.scope.target_id,
             },
@@ -2369,10 +2637,7 @@ class NightScoutRuntime:
         steps = 0
 
         try:
-            seed_pairs: list[tuple[DomainSeedSpec, Event]] = []
-            for seed_spec in plan.seeds:
-                event = await self.seed_domain(seed_spec.domain, seed_spec=seed_spec)
-                seed_pairs.append((seed_spec, event))
+            await initialize()
 
             outcomes: Counter[str] = Counter()
             stopped_idle = False
@@ -2459,31 +2724,8 @@ class NightScoutRuntime:
                     result=result,
                 )
 
-            seed_summaries: list[RuntimeSeedSummary] = []
-            for seed_spec, seed in seed_pairs:
-                genome_fingerprint: str | None = None
-                if self.configuration.pipeline.runtime.build_genome_on_finish:
-                    try:
-                        genome, _report = await self.genome_builder.build(seed)
-                        await self.intelligence.genome_store.save(genome)
-                        genome_fingerprint = genome.fingerprint
-                    except Exception as exc:
-                        self.warnings.append(
-                            f"Target Genome build failed for {seed.value}: "
-                            f"{type(exc).__name__}: {exc}"
-                        )
-
-                seed_summaries.append(
-                    RuntimeSeedSummary(
-                        seed_event_id=seed.event_id,
-                        target=seed.value,
-                        scope_state=seed.scope_state,
-                        mode=seed_spec.mode.value,
-                        matched_rule_id=seed_spec.matched_rule_id,
-                        source_rule_ids=seed_spec.source_rule_ids,
-                        genome_fingerprint=genome_fingerprint,
-                    )
-                )
+            if finalize is not None:
+                await finalize()
 
             max_steps_reached = steps >= limit and not stopped_idle
             if max_steps_reached and next_resume_at is None:
@@ -2510,22 +2752,16 @@ class NightScoutRuntime:
                 ),
             )
 
-            return RuntimeProgramRunSummary(
+            return _RuntimeFrontierResult(
                 run_id=run_id,
                 status=run_status,
-                seeds=tuple(seed_summaries),
                 steps=steps,
                 outcomes=dict(sorted(outcomes.items())),
                 stopped_idle=stopped_idle,
                 max_steps_reached=max_steps_reached,
                 paused_deferred=paused_deferred,
                 next_resume_at=next_resume_at,
-                task_counts=status.task_counts,
-                attempt_counts=status.attempt_counts,
-                event_count=status.event_count,
-                asset_count=status.asset_count,
-                open_review_cases=status.open_review_cases,
-                warnings=tuple(dict.fromkeys((*plan.warnings, *self.warnings))),
+                status_snapshot=status,
             )
         except BaseException as exc:
             self._emit_progress(
@@ -2731,6 +2967,8 @@ class NightScoutRuntime:
             )
 
         return RuntimeStatus(
+            target_id=self.configuration.scope.target_id,
+            workspace_root=str(self.configuration.workspace_root),
             database_path=str(self.database.config.path),
             event_count=event_count,
             asset_count=asset_count,
@@ -3072,16 +3310,22 @@ def load_runtime_configuration(
     workspace_override = os.environ.get("NIGHTSCOUT_WORKSPACE_ROOT", "").strip()
     if workspace_override:
         workspace_root = Path(workspace_override).expanduser().resolve()
-    elif is_standalone_bundle():
-        workspace_root = user_paths().data_root.resolve()
     else:
-        paths = user_paths()
-        try:
-            pipeline_file.relative_to(paths.config_root.resolve())
-        except ValueError:
-            workspace_root = project_root
+        if is_standalone_bundle():
+            workspace_base_root = user_paths().data_root.resolve()
         else:
-            workspace_root = paths.data_root.resolve()
+            paths = user_paths()
+            try:
+                pipeline_file.relative_to(paths.config_root.resolve())
+            except ValueError:
+                workspace_base_root = project_root
+            else:
+                workspace_base_root = paths.data_root.resolve()
+        workspace_root = _target_workspace_root(
+            base_root=workspace_base_root,
+            target_id=scope.target_id,
+            pipeline=pipeline,
+        )
 
     return LoadedRuntimeConfiguration(
         project_root=project_root,
@@ -3092,6 +3336,44 @@ def load_runtime_configuration(
         scope=scope,
         config_hash=digest.hexdigest(),
     )
+
+
+def runtime_database_config(configuration: LoadedRuntimeConfiguration) -> DatabaseConfig:
+    """Resolve the database inside the selected single-target workspace."""
+
+    database_data = dict(configuration.pipeline.storage.get("database", {}))
+    database_data["path"] = configuration.resolve(database_data["path"])
+    return DatabaseConfig.model_validate(database_data)
+
+
+def _target_workspace_root(
+    *,
+    base_root: Path,
+    target_id: str,
+    pipeline: PipelineDocument,
+) -> Path:
+    """Select a target directory while retaining attributable flat workspaces."""
+
+    target_root = base_root / "workspaces" / workspace_directory_name(target_id)
+    database_value = Path(str(pipeline.storage.get("database", {}).get("path", ""))).expanduser()
+    if database_value.is_absolute():
+        return target_root.resolve()
+
+    target_database = (target_root / database_value).resolve()
+    if target_database.is_file():
+        return target_root.resolve()
+
+    legacy_database = (base_root / database_value).resolve()
+    if legacy_database.is_file():
+        recorded = recorded_workspace_target_ids(legacy_database)
+        # An unattributed legacy DB is selected so runtime can fail closed and
+        # direct the operator to the explicit adoption command. A mixed DB is
+        # also selected so binding rejects it visibly. A legacy DB attributed
+        # to one different target does not block creation of this target's DB.
+        if not recorded or recorded == {target_id} or len(recorded) > 1:
+            return base_root.resolve()
+
+    return target_root.resolve()
 
 
 def all_runtime_route_rules() -> tuple[RouteRule, ...]:

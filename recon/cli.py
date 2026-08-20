@@ -21,11 +21,16 @@ from recon.exporters.jsonl import ExportMode
 from recon.policy.scope import ScopeAssetKind, ScopeEngine, ScopeSubject
 from recon.policy.seeds import effective_scope_rules
 from recon.runtime import (
+    RuntimeMobileArtifactInput,
     RuntimeProgress,
     build_runtime,
     doctor_from_files,
     load_runtime_configuration,
+    runtime_database_config,
 )
+from recon.storage.database import Database
+from recon.storage.schema import upgrade_database
+from recon.storage.workspace import WorkspaceRepository
 from recon.tooling import (
     ToolInstallProgress,
     ToolInstallResult,
@@ -43,12 +48,15 @@ from recon.userenv import (
     refresh_user_wordlist_resources,
     user_paths,
 )
+from recon.workers.mobile import MobileArtifactKind
 from scripts.wordlists_sync import build_local_manifest
 from scripts.wordlists_sync import main as wordlists_sync_main
 
+_SCOPE_WORKSPACE_HELP = "Scope YAML override; target_id selects its isolated workspace."
+
 app = typer.Typer(
     name="nightscout",
-    help="Recursive, scope-aware attack-surface intelligence for authorized reconnaissance.",
+    help="Recursive, scope-aware attack-surface intelligence with isolated target workspaces.",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -69,6 +77,14 @@ wordlists_app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(wordlists_app, name="wordlists")
+
+workspace_app = typer.Typer(
+    name="workspace",
+    help="Inspect or explicitly adopt isolated target workspaces.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(workspace_app, name="workspace")
 
 review_app = typer.Typer(
     name="review",
@@ -138,7 +154,7 @@ def setup_command(
     skip_tools: bool = typer.Option(
         False,
         "--skip-tools",
-        help="Initialize user config/workspace without installing companion tools.",
+        help="Initialize user config/workspace base without installing companion tools.",
     ),
     skip_wordlists: bool = typer.Option(
         False,
@@ -168,10 +184,10 @@ def setup_command(
         platform_info = assert_supported_platform()
         typer.echo(f"  {platform_info.pretty_name} / {platform_info.architecture}: supported")
 
-        typer.echo("[setup 2/5] Preparing per-user config and workspace...")
+        typer.echo("[setup 2/5] Preparing per-user config and workspace base...")
         paths = initialize_user_environment()
         typer.echo(f"  config:    {paths.config_root}")
-        typer.echo(f"  workspace: {paths.data_root}")
+        typer.echo(f"  workspace base: {paths.data_root}")
 
         typer.echo("[setup 3/5] Preparing wordlists...")
         if skip_wordlists:
@@ -237,7 +253,7 @@ def setup_command(
         f"Night Scout setup complete: {platform_info.pretty_name} / {platform_info.architecture}"
     )
     typer.echo(f"config:    {paths.config_root}")
-    typer.echo(f"workspace: {paths.data_root}")
+    typer.echo(f"workspace base: {paths.data_root}")
     typer.echo(f"cache:     {paths.cache_root}")
     typer.echo(
         "wordlists: bundled baseline corpus ready"
@@ -329,13 +345,34 @@ def run_command(
         None,
         "--scope",
         "-s",
-        help="Scope YAML override.",
+        help=_SCOPE_WORKSPACE_HELP,
     ),
     max_steps: int | None = typer.Option(
         None,
         "--max-steps",
         min=1,
         help="Maximum lifecycle executions before returning control.",
+    ),
+    mobile_artifact: Path | None = typer.Option(
+        None,
+        "--mobile-artifact",
+        help="Local APK/IPA to add to this run; requires --mobile-app-id.",
+    ),
+    mobile_app_id: str | None = typer.Option(
+        None,
+        "--mobile-app-id",
+        help="Scoped Android package ID or iOS bundle ID; requires --mobile-artifact.",
+    ),
+    mobile_source_url: str | None = typer.Option(
+        None,
+        "--mobile-source-url",
+        help="Store/listing provenance only; Night Scout never fetches this URL.",
+    ),
+    mobile_kind: MobileArtifactKind | None = typer.Option(
+        None,
+        "--mobile-kind",
+        case_sensitive=False,
+        help="Artifact kind when it cannot be inferred from .apk or .ipa.",
     ),
     authorize_exact: bool = typer.Option(
         False,
@@ -358,10 +395,36 @@ def run_command(
         help="Emit live lifecycle state to stderr while recon is running.",
     ),
 ) -> None:
-    """Run a program frontier from explicit seeds or scope-derived domain seeds."""
+    """Run one program frontier from domain and optional local mobile seeds."""
 
     pipeline = _resolve_pipeline(pipeline)
     normalized_targets = tuple(targets or ())
+    if (mobile_artifact is None) != (mobile_app_id is None):
+        typer.echo(
+            "run failed: --mobile-artifact and --mobile-app-id must be provided together",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if mobile_app_id is not None and not mobile_app_id.strip():
+        typer.echo("run failed: --mobile-app-id must not be blank", err=True)
+        raise typer.Exit(code=2)
+    if mobile_artifact is None and (mobile_source_url is not None or mobile_kind is not None):
+        typer.echo(
+            "run failed: --mobile-source-url and --mobile-kind require --mobile-artifact",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    mobile_input = None
+    if mobile_artifact is not None and mobile_app_id is not None:
+        # Preserve the final path component so the storage boundary can reject
+        # a symlink instead of receiving its already-resolved target.
+        mobile_input = RuntimeMobileArtifactInput(
+            artifact_path=mobile_artifact.expanduser().absolute(),
+            app_id=mobile_app_id,
+            source_url=mobile_source_url,
+            kind=mobile_kind,
+        )
     _prepare_default_scope_for_run(
         targets=normalized_targets,
         pipeline=pipeline,
@@ -376,11 +439,19 @@ def run_command(
             scope_path=scope,
         )
         try:
-            summary = await runtime.run_domains(
-                normalized_targets,
-                max_steps=max_steps,
-                progress=_render_run_progress if progress else None,
-            )
+            if mobile_input is None:
+                summary = await runtime.run_domains(
+                    normalized_targets,
+                    max_steps=max_steps,
+                    progress=_render_run_progress if progress else None,
+                )
+            else:
+                summary = await runtime.run_domains(
+                    normalized_targets,
+                    mobile_artifact=mobile_input,
+                    max_steps=max_steps,
+                    progress=_render_run_progress if progress else None,
+                )
             return summary.model_dump(mode="json")
         finally:
             await runtime.close()
@@ -405,6 +476,12 @@ def run_command(
     typer.echo(f"seeds:       {len(summary['seeds'])}")
     for seed in summary["seeds"]:
         typer.echo(f"  {seed['target']}  scope={seed['scope_state']}  mode={seed['mode']}")
+        if seed.get("artifact_ref"):
+            typer.echo(
+                "    "
+                f"artifact={seed['artifact_ref']} kind={seed['artifact_kind']} "
+                f"sha256={seed['artifact_sha256']} size={seed['artifact_size_bytes']} bytes"
+            )
     typer.echo(f"steps:       {summary['steps']}")
     typer.echo(f"events:      {summary['event_count']}")
     typer.echo(f"assets:      {summary['asset_count']}")
@@ -443,7 +520,12 @@ def run_command(
 @app.command("status")
 def status_command(
     pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
-    scope: Path | None = typer.Option(None, "--scope", "-s"),
+    scope: Path | None = typer.Option(
+        None,
+        "--scope",
+        "-s",
+        help=_SCOPE_WORKSPACE_HELP,
+    ),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Show persistent workspace/frontier status."""
@@ -468,6 +550,8 @@ def status_command(
         typer.echo(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
+    typer.echo(f"target:       {status['target_id']}")
+    typer.echo(f"workspace:    {status['workspace_root']}")
     typer.echo(f"database:     {status['database_path']}")
     typer.echo(f"events:       {status['event_count']}")
     typer.echo(f"assets:       {status['asset_count']}")
@@ -492,6 +576,59 @@ def status_command(
         typer.echo(f"warning: {warning}")
 
 
+@workspace_app.command("adopt")
+def workspace_adopt_command(
+    pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
+    scope: Path | None = typer.Option(
+        None,
+        "--scope",
+        "-s",
+        help="Scope whose target_id will become the workspace owner.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm ownership assignment for an unattributed legacy workspace.",
+    ),
+) -> None:
+    """Explicitly bind a populated, unattributed legacy workspace to one target."""
+
+    if not yes:
+        typer.echo(
+            "workspace adoption requires --yes after inspecting the selected scope and data",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    pipeline = _resolve_pipeline(pipeline)
+
+    async def _adopt() -> tuple[str, str]:
+        configuration = load_runtime_configuration(
+            pipeline_path=pipeline,
+            scope_path=scope,
+        )
+        database_config = runtime_database_config(configuration)
+        await asyncio.to_thread(upgrade_database, database_config.path)
+        database = Database(database_config)
+        try:
+            binding = await WorkspaceRepository(database).bind_or_validate(
+                configuration.scope.target_id,
+                allow_unattributed_adoption=True,
+            )
+            return binding.target_id, str(database.config.path)
+        finally:
+            await database.dispose()
+
+    try:
+        target_id, database_path = asyncio.run(_adopt())
+    except Exception as exc:
+        typer.echo(f"workspace adopt failed: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    typer.echo(f"workspace bound to target: {target_id}")
+    typer.echo(f"database: {database_path}")
+
+
 @app.command("explain")
 def explain_command(
     query: str = typer.Argument(
@@ -499,7 +636,7 @@ def explain_command(
         help="Event ID or exact persisted Event value.",
     ),
     pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
-    scope: Path | None = typer.Option(None, "--scope", "-s"),
+    scope: Path | None = typer.Option(None, "--scope", "-s", help=_SCOPE_WORKSPACE_HELP),
     max_depth: int = typer.Option(8, "--max-depth", min=1, max=64),
 ) -> None:
     """Show event, provenance path, routed tasks and scheduler decisions."""
@@ -529,7 +666,7 @@ def explain_command(
 @review_app.command("list")
 def review_list_command(
     pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
-    scope: Path | None = typer.Option(None, "--scope", "-s"),
+    scope: Path | None = typer.Option(None, "--scope", "-s", help=_SCOPE_WORKSPACE_HELP),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """List open review cases without exposing raw sensitive evidence."""
@@ -569,7 +706,7 @@ def review_list_command(
 def review_show_command(
     case_id: str = typer.Argument(...),
     pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
-    scope: Path | None = typer.Option(None, "--scope", "-s"),
+    scope: Path | None = typer.Option(None, "--scope", "-s", help=_SCOPE_WORKSPACE_HELP),
 ) -> None:
     """Show one review case and its paused task."""
     pipeline = _resolve_pipeline(pipeline)
@@ -631,7 +768,7 @@ def review_approve_command(
     case_id: str = typer.Argument(...),
     reason: str | None = typer.Option(None, "--reason"),
     pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
-    scope: Path | None = typer.Option(None, "--scope", "-s"),
+    scope: Path | None = typer.Option(None, "--scope", "-s", help=_SCOPE_WORKSPACE_HELP),
 ) -> None:
     """Approve and release exactly one paused task."""
     _resolve_review_from_cli(
@@ -648,7 +785,7 @@ def review_reject_command(
     case_id: str = typer.Argument(...),
     reason: str | None = typer.Option(None, "--reason"),
     pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
-    scope: Path | None = typer.Option(None, "--scope", "-s"),
+    scope: Path | None = typer.Option(None, "--scope", "-s", help=_SCOPE_WORKSPACE_HELP),
 ) -> None:
     """Reject and permanently block exactly one paused task."""
     _resolve_review_from_cli(
@@ -669,7 +806,7 @@ def export_command(
         help="jsonl, text, csv, or all.",
     ),
     pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
-    scope: Path | None = typer.Option(None, "--scope", "-s"),
+    scope: Path | None = typer.Option(None, "--scope", "-s", help=_SCOPE_WORKSPACE_HELP),
     output: Path | None = typer.Option(
         None,
         "--output",

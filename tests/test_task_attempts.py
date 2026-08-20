@@ -125,6 +125,10 @@ async def test_resumed_preclaim_review_is_attributed_to_current_run(tmp_path) ->
                 database=database,
                 task_store=store,
                 warnings=[],
+                configuration=SimpleNamespace(
+                    scope=SimpleNamespace(target_id="fixture-target"),
+                    workspace_root=tmp_path,
+                ),
             ),
             run_id=current_run_id,
         )

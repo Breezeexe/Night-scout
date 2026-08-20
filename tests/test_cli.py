@@ -22,6 +22,7 @@ def test_cli_version_and_help():
         "explain",
         "export",
         "review",
+        "workspace",
         "tools",
         "wordlists",
     ):
@@ -31,6 +32,124 @@ def test_cli_version_and_help():
     assert review_help.exit_code == 0
     for command in ("list", "show", "approve", "reject"):
         assert command in review_help.stdout
+
+    workspace_help = runner.invoke(app, ["workspace", "--help"])
+    assert workspace_help.exit_code == 0
+    assert "adopt" in workspace_help.stdout
+
+    adopt_help = runner.invoke(app, ["workspace", "adopt", "--help"])
+    assert adopt_help.exit_code == 0
+    assert "target_id" in adopt_help.stdout
+
+    run_help = runner.invoke(app, ["run", "--help"])
+    assert run_help.exit_code == 0
+    assert "target_id selects" in run_help.stdout
+    assert "workspace" in run_help.stdout
+    assert "--mobile-artifact" in run_help.stdout
+    assert "--mobile-app-id" in run_help.stdout
+    assert "--mobile-source" in run_help.stdout
+    assert "provenance only" in run_help.stdout
+
+    removed_mobile_command = runner.invoke(app, ["mobile", "--help"])
+    assert removed_mobile_command.exit_code != 0
+
+
+def test_cli_run_combines_domain_and_mobile_ingress(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    calls: dict[str, object] = {}
+
+    class FakeRuntime:
+        async def run_domains(self, domains, **kwargs):
+            calls["domains"] = domains
+            calls.update(kwargs)
+            return SimpleNamespace(
+                model_dump=lambda mode="json": {
+                    "run_id": "run-mobile",
+                    "status": "SUCCEEDED",
+                    "seeds": [
+                        {
+                            "seed_event_id": "evt-domain",
+                            "target": "company.example",
+                            "scope_state": "IN_SCOPE",
+                            "mode": "EXPLICIT",
+                        },
+                        {
+                            "seed_event_id": "evt-mobile",
+                            "target": "com.company.mobile",
+                            "scope_state": "IN_SCOPE",
+                            "mode": "MOBILE_ARTIFACT",
+                            "artifact_ref": "abc.apk",
+                            "artifact_kind": "APK",
+                            "artifact_sha256": "a" * 64,
+                            "artifact_size_bytes": 123,
+                        },
+                    ],
+                    "steps": 1,
+                    "outcomes": {"SUCCEEDED": 1},
+                    "task_counts": {"SUCCEEDED": 1},
+                    "attempt_counts": {"SUCCEEDED": 1},
+                    "event_count": 2,
+                    "asset_count": 1,
+                    "open_review_cases": 0,
+                    "warnings": [],
+                }
+            )
+
+        async def close(self):
+            calls["closed"] = True
+
+    async def fake_build_runtime(**kwargs):
+        calls["build"] = kwargs
+        return FakeRuntime()
+
+    monkeypatch.setattr("recon.cli.build_runtime", fake_build_runtime)
+    artifact = tmp_path / "company.apk"
+    artifact.write_bytes(b"fixture")
+    scope = tmp_path / "scope.yaml"
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            "company.example",
+            "--mobile-artifact",
+            str(artifact),
+            "--mobile-app-id",
+            "com.company.mobile",
+            "--mobile-source-url",
+            "https://play.google.com/store/apps/details?id=com.company.mobile",
+            "--scope",
+            str(scope),
+            "--max-steps",
+            "3",
+            "--no-progress",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert calls["domains"] == ("company.example",)
+    mobile_input = calls["mobile_artifact"]
+    assert mobile_input.artifact_path == artifact.absolute()
+    assert mobile_input.app_id == "com.company.mobile"
+    assert isinstance(mobile_input.source_url, str)
+    assert mobile_input.source_url.startswith("https://play.google.com/")
+    assert calls["max_steps"] == 3
+    assert calls["closed"] is True
+    assert "com.company.mobile" in result.stdout
+    assert "artifact=abc.apk" in result.stdout
+
+
+def test_cli_run_requires_mobile_artifact_and_app_id_together(tmp_path) -> None:
+    artifact = tmp_path / "company.apk"
+    artifact.write_bytes(b"fixture")
+
+    result = CliRunner().invoke(
+        app,
+        ["run", "--mobile-artifact", str(artifact), "--no-progress"],
+    )
+
+    assert result.exit_code == 2
+    assert "must be provided together" in result.output
 
 
 def test_cli_tools_list() -> None:

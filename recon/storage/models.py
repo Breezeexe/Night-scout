@@ -130,6 +130,44 @@ class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
 
+class WorkspaceMetadataRecord(Base):
+    """Singleton identity binding for one physical target workspace."""
+
+    __tablename__ = "workspace_metadata"
+
+    singleton_id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        default=1,
+    )
+    target_id: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        unique=True,
+    )
+    schema_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "singleton_id = 1",
+            name="workspace_metadata_singleton",
+        ),
+        CheckConstraint(
+            "schema_version >= 1",
+            name="workspace_metadata_schema_version_positive",
+        ),
+    )
+
+
 class ReconRunRecord(Base):
     """One reconnaissance execution/session inside a target workspace."""
 
@@ -161,6 +199,14 @@ class ReconRunRecord(Base):
     config_hash: Mapped[str | None] = mapped_column(
         String(128),
         nullable=True,
+    )
+
+    # First-class audit attribution. The workspace-level binding remains the
+    # authorization boundary; this field records which target owned the run.
+    target_id: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        index=True,
     )
 
     metadata_json: Mapped[dict[str, Any]] = mapped_column(

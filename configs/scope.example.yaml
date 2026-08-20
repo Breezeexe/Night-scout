@@ -182,7 +182,11 @@ rules:
 
   # Mobile identifiers are local/static-analysis scope subjects. This does not
   # automatically authorize every backend URL found inside the application;
-  # each discovered network target is reclassified independently.
+  # each discovered network target is reclassified independently. Add an
+  # independently obtained artifact to the normal program run with:
+  #   nightscout run --scope scope.yaml --mobile-artifact app.apk \
+  #     --mobile-app-id com.example.mobile
+  # A third-party store URL is provenance, not an IN_SCOPE URL target.
   - rule_id: android-app
     kind: MOBILE_APP
     pattern: com.example.mobile

@@ -89,7 +89,7 @@ The default user state is stored under:
 
 ```text
 ~/.config/nightscout/       configuration and scope
-~/.local/share/nightscout/  SQLite workspace, tools, wordlists, artifacts
+~/.local/share/nightscout/  target workspaces, tools, wordlists, artifacts
 ~/.cache/nightscout/        disposable caches
 ```
 
@@ -115,6 +115,12 @@ Night Scout derive all domain discovery seeds from it:
 nightscout run --scope ./program.yaml
 ```
 
+`target_id` in that scope is the stable program identity. Night Scout selects a
+separate workspace under `~/.local/share/nightscout/workspaces/<target-id>/`
+and binds its SQLite database to that identity before reading the persistent
+frontier or writing Events. Several authorized domains in the same scope share
+one workspace; a different `target_id` selects a different workspace.
+
 Scope and seeds are different concepts. Exact `IN_SCOPE` DOMAIN rules are
 started directly. A wildcard such as `*.example.org` creates a passive discovery
 anchor at `example.org` so passive enumeration can start, but the apex itself is
@@ -136,6 +142,11 @@ For a one-domain quick start, the managed local scope can still be used:
 ```bash
 nightscout run example.com
 ```
+
+The managed `local-authorized-targets` scope intentionally shares one workspace
+across every domain added to it. Use a dedicated scope with a unique stable
+`target_id` for each independent company or bug-bounty program; do not use the
+quick-start scope as a cross-client workspace.
 
 The default scope starts **fail-closed**. If `example.com` has no local scope
 rule yet, an interactive first run asks for explicit authorization of the exact
@@ -195,6 +206,280 @@ Copy the program's scope literally: exact assets become exact rules, wildcards
 remain wildcards, and exclusions get a higher priority. Do not infer scope from
 DNS, certificates, ASN ownership, CNAMEs, or shared infrastructure.
 
+### Building `scope.yaml` and `pipeline.yaml`: Company example
+
+`scope.yaml` answers **where Night Scout is authorized to operate**;
+`pipeline.yaml` answers **how it may operate**. Keep program assets, exclusions,
+and the stable `target_id` in the scope. Keep rate limits, budgets, worker
+settings, routing, and storage in the pipeline. Both documents reject unknown
+top-level fields, so do not invent shorthand keys such as `allowed`, `active`,
+or `limits`.
+
+Assume the fictional Company program lists five exact domains, three wildcard
+domains, two networks, four explicitly out-of-scope/no-reward domain exceptions,
+and a link to its Android application in a third-party application store. The
+examples use reserved `.example` and TEST-NET ranges, so the infrastructure
+rules cannot accidentally target a real organization.
+
+Create `company-scope.yaml` as follows:
+
+```yaml
+schema_version: 1
+target_id: company-bugbounty
+display_name: Company Bug Bounty Program
+
+gate:
+  allow_unknown_passive: false
+
+rules:
+  # Five exact domains. A wildcard never includes its apex.
+  - rule_id: company-apex
+    kind: DOMAIN
+    pattern: company.example
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Exact domain listed by the Company program
+
+  - rule_id: company-pay-apex
+    kind: DOMAIN
+    pattern: company-pay.example
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Exact domain listed by the Company program
+
+  - rule_id: company-cloud-apex
+    kind: DOMAIN
+    pattern: company-cloud.example
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Exact domain listed by the Company program
+
+  - rule_id: company-support-apex
+    kind: DOMAIN
+    pattern: company-support.example
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Exact domain listed by the Company program
+
+  - rule_id: company-cdn-apex
+    kind: DOMAIN
+    pattern: company-cdn.example
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Exact domain listed by the Company program
+
+  # Three recursive wildcards. Quote YAML patterns that begin with "*".
+  - rule_id: company-subdomains
+    kind: DOMAIN
+    pattern: "*.company.example"
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Wildcard explicitly listed by the Company program
+
+  - rule_id: company-cloud-subdomains
+    kind: DOMAIN
+    pattern: "*.company-cloud.example"
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Wildcard explicitly listed by the Company program
+
+  - rule_id: company-support-subdomains
+    kind: DOMAIN
+    pattern: "*.company-support.example"
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Wildcard explicitly listed by the Company program
+
+  # Four explicit exceptions override the broad wildcards by higher priority.
+  - rule_id: excluded-old
+    kind: DOMAIN
+    pattern: old.company.example
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Testing prohibited; no reward under the program rules
+
+  - rule_id: excluded-billing
+    kind: DOMAIN
+    pattern: billing.company.example
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Testing prohibited; no reward under the program rules
+
+  - rule_id: excluded-vpn
+    kind: DOMAIN
+    pattern: vpn.company-cloud.example
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Testing prohibited; no reward under the program rules
+
+  - rule_id: excluded-vendor
+    kind: DOMAIN
+    pattern: vendor.company-support.example
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Third-party system explicitly excluded by the program
+
+  # Two networks explicitly listed by the program.
+  - rule_id: company-network-a
+    kind: CIDR
+    pattern: 192.0.2.0/28
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Network explicitly listed by the Company program
+
+  - rule_id: company-network-b
+    kind: CIDR
+    pattern: 198.51.100.0/28
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Network explicitly listed by the Company program
+
+  # Scope the application by its verified package ID. The third-party store is
+  # only the artifact source/provenance; it is not a target authorized for recon.
+  - rule_id: company-android-app
+    kind: MOBILE_APP
+    pattern: com.company.mobile
+    state: IN_SCOPE
+    priority: 200
+    tier: bounty
+    reason: "Program listing: https://play.google.com/store/apps/details?id=com.company.mobile"
+```
+
+The four exceptions above are `OUT_OF_SCOPE` because the Company program labels
+them outside its testing scope. For a different program, “no payout” by itself
+does not necessarily prohibit testing: if testing remains authorized, keep the
+asset `IN_SCOPE` and use a label such as `tier: no-bounty`.
+
+Only exact `IN_SCOPE` `DOMAIN` rules and wildcard discovery anchors become
+automatic run seeds. CIDRs and `MOBILE_APP` remain authorization rules and are
+not silently converted into DNS work. Do not add a Google Play, App Store, or
+other third-party store page as an `IN_SCOPE` `URL` unless that store itself is
+explicitly authorized; retain the listing as provenance in `reason` and use the
+verified Android package ID or iOS bundle ID as the `MOBILE_APP` pattern.
+
+The mobile worker never downloads an APK. Obtain the application independently
+through an authorized official method, verify that its package ID matches the
+scope rule, and treat the resulting file as untrusted input. Night Scout only
+analyzes an explicitly supplied local artifact referenced from its trusted
+workspace by a `MOBILE_ARTIFACT` event. Add it to the same program run as the
+scope-derived domain seeds with:
+
+```bash
+nightscout run \
+  --pipeline ./company-pipeline.yaml \
+  --scope ./company-scope.yaml \
+  --mobile-artifact ./company.apk \
+  --mobile-app-id com.company.mobile \
+  --mobile-source-url "https://play.google.com/store/apps/details?id=com.company.mobile"
+```
+
+`--mobile-artifact` and `--mobile-app-id` must be provided together.
+`--mobile-source-url` is optional provenance and is never fetched. Before copying,
+Night Scout requires the application ID to match an explicit `IN_SCOPE` or
+`PASSIVE_ONLY` `MOBILE_APP` rule. It rejects symlink/non-file/oversized input,
+stores the artifact under its SHA-256 in the target-specific workspace with
+read-only permissions, and verifies its hash and size again before analysis.
+The domain and mobile seeds share one `run_id`, frontier, scheduler, policy
+gates, budgets, rate limiters, statistics, and final summary. The resulting
+Event, Task, scope decision, run attribution, and worker output therefore use
+the same durable lifecycle as domain reconnaissance.
+
+The mobile worker itself is offline. Its extracted URLs and backends are
+classified independently against this same scope and can create downstream
+network tasks when the pipeline enables their active routes. Use a dedicated
+pipeline containing only local/passive routes when the whole invocation—not
+only the mobile worker—must remain offline.
+
+A pipeline is intentionally much larger than a scope because every subsystem
+is explicit. Start from the complete validated template instead of constructing
+a partial document:
+
+```bash
+cp configs/pipeline.example.yaml company-pipeline.yaml
+```
+
+Change its identity and scope reference near the top. A relative `scope_file`
+is resolved relative to the pipeline file:
+
+```yaml
+schema_version: 1
+profile_id: company-30-rps-per-node
+display_name: Company authorized recon — 30 req/s per node
+scope_file: company-scope.yaml
+```
+
+Then replace the template's complete `rate_limit` section with this one, while
+leaving the other required sections (`runtime`, `storage`, `scheduler`,
+`budgets`, `routing`, `workers`, and `intelligence`) in place:
+
+```yaml
+rate_limit:
+  require_matching_rule: true
+  default_retry_after_seconds: 1.0
+  rules:
+    - rule_id: company-per-host-30-rps
+      scope: PER_RESOURCE
+      resource_pattern: "host:*"
+      requests_per_second: 30.0
+      burst: 1.0
+      max_concurrency: 1
+      workers: [dns, http, tls, crawler, content, parameters, vhost, nuclei]
+      reason: Shared 30 req/s ceiling for one normalized target hostname
+
+    - rule_id: company-per-ip-30-rps
+      scope: PER_RESOURCE
+      resource_pattern: "ip:*"
+      requests_per_second: 30.0
+      burst: 1.0
+      max_concurrency: 1
+      workers: [http, tls]
+      reason: Shared 30 req/s ceiling for one directly addressed target IP
+```
+
+These are shared buckets above the individual tools. `max_concurrency: 1`
+gives an opaque multi-request tool an exclusive lease for that host while it
+runs, and Night Scout passes the resulting 30 req/s pacing hint to supported
+tools. `burst: 1` avoids an initial burst above the steady rate. This example
+interprets “one node” as one normalized hostname, or one IP when addressed
+directly. Different hostnames that resolve to the same physical IP currently
+use different host buckets. If the program means one aggregate ceiling across
+all DNS aliases of an IP, use a conservative `GLOBAL` 30 req/s rule for all
+active workers; the current limiter does not merge hostname buckets by DNS
+resolution.
+
+Validate both files without sending traffic to Company, then start one
+frontier containing the scope-derived domains and the independently obtained
+APK only after checking the authorization again:
+
+```bash
+nightscout doctor --pipeline ./company-pipeline.yaml --scope ./company-scope.yaml
+nightscout run \
+  --pipeline ./company-pipeline.yaml \
+  --scope ./company-scope.yaml \
+  --mobile-artifact ./company.apk \
+  --mobile-app-id com.company.mobile \
+  --mobile-source-url "https://play.google.com/store/apps/details?id=com.company.mobile" \
+  --max-steps 100
+```
+
+`doctor` validates the documents and checks required local tools without
+scanning the target. It can still report a failure when a required companion
+binary is missing. The subsequent `run` does generate target traffic.
+
 ## Everyday Usage
 
 ```bash
@@ -213,31 +498,37 @@ nightscout run --scope ./program.yaml --max-steps 100
 # Suppress live lifecycle updates (the final summary is still printed).
 nightscout run --scope ./program.yaml --no-progress
 
+# Add an independently obtained APK to the same run as the program's domains.
+nightscout run --scope ./program.yaml --mobile-artifact ./company.apk --mobile-app-id com.company.mobile
+
 # Inspect persistent runs, tasks, assets and review state.
-nightscout status
+nightscout status --scope ./program.yaml
 
 # Explain a persisted Event by event ID or exact Event value.
-nightscout explain <event-id-or-value>
+nightscout explain <event-id-or-value> --scope ./program.yaml
 
 # Inspect and resolve tasks paused by policy/review gates.
-nightscout review list
-nightscout review show <case-id>
-nightscout review approve <case-id> --reason "authorized by program policy"
-nightscout review reject <case-id> --reason "not authorized"
+nightscout review list --scope ./program.yaml
+nightscout review show <case-id> --scope ./program.yaml
+nightscout review approve <case-id> --scope ./program.yaml --reason "authorized by program policy"
+nightscout review reject <case-id> --scope ./program.yaml --reason "not authorized"
 
 # Export SAFE JSONL, TXT and CSV views.
-nightscout export
+nightscout export --scope ./program.yaml
 
 # Export one format.
-nightscout export --format jsonl
-nightscout export --format text
-nightscout export --format csv
+nightscout export --scope ./program.yaml --format jsonl
+nightscout export --scope ./program.yaml --format text
+nightscout export --scope ./program.yaml --format csv
 
 # Sensitive evidence is a separate double-opt-in export surface.
-nightscout export --sensitive --confirm-sensitive
+nightscout export --scope ./program.yaml --sensitive --confirm-sensitive
 
 # Check configuration, platform and companion tools without scanning.
 nightscout doctor
+
+# Explicitly assign an old populated DB with no target attribution.
+nightscout workspace adopt --scope ./program.yaml --yes
 ```
 
 `nightscout run` reports the current lifecycle step, worker, action, outcome,
@@ -428,7 +719,8 @@ night-scout/
 │   │   ├── provenance.py
 │   │   ├── snapshots.py
 │   │   ├── intelligence.py
-│   │   └── schema.py
+│   │   ├── schema.py
+│   │   └── workspace.py
 │   │
 │   ├── workers/
 │   │   ├── passive_domains.py
@@ -472,7 +764,9 @@ night-scout/
 │   ├── env.py
 │   ├── script.py.mako
 │   └── versions/
-│       └── 0001_initial_schema_*.py
+│       ├── 0001_initial_schema_*.py
+│       ├── ...
+│       └── 0006_workspace_target_binding.py
 ├── tests/
 │   ├── test_migrations.py
 │   ├── test_runtime.py
@@ -508,10 +802,11 @@ Thin Typer command-line entry point. The initial runtime exposes:
 
 ```text
 nightscout setup
-nightscout run <root-domain>
+nightscout run [<root-domain> ...] [--mobile-artifact <artifact> --mobile-app-id <id>]
 nightscout status
 nightscout explain <event-id-or-value>
 nightscout review list|show|approve|reject
+nightscout workspace adopt
 nightscout export
 nightscout doctor
 nightscout tools ...
@@ -1946,26 +2241,35 @@ POSSIBLE_HIGH_IMPACT_SURFACE
 
 Real target data must be isolated from the engine code.
 
-Conceptual layout:
+Default per-user layout (safe target IDs are used as directory names; other IDs
+receive a deterministic hashed directory name):
 
 ```text
-workspace/
-└── target-id/
-    ├── scope.yaml
-    ├── policy.yaml
-    ├── recon.db
-    ├── events.jsonl
-    │
-    ├── artifacts/
-    ├── snapshots/
-    ├── exports/
-    ├── logs/
-    └── notes/
+~/.local/share/nightscout/
+├── workspaces/
+│   └── target-id/
+│       ├── nightscout.sqlite3
+│       ├── events.jsonl
+│       ├── content/
+│       ├── artifacts/
+│       ├── sensitive-evidence/
+│       └── exports/
+├── tools/
+└── wordlists/
 ```
 
 The repository contains the engine.
 
 The workspace contains target knowledge.
+
+Each database contains a singleton `workspace_metadata` binding. Runtime checks
+that its `target_id` equals the active scope before loading tasks, events, Genome
+data, snapshots, review cases, or exports. A mismatch fails closed. `run_id`
+continues to identify one execution, while per-seed `target_key` values identify
+individual domain or mobile discovery anchors inside the same program.
+
+`NIGHTSCOUT_WORKSPACE_ROOT` is an advanced override selecting one exact
+single-target workspace root. It does not disable the database identity check.
 
 ```text
 ENGINE
@@ -1978,32 +2282,41 @@ TARGET DATA
 # 28. Example Scope Model
 
 ```yaml
+schema_version: 1
 target_id: example-program
+display_name: Example Bug Bounty Program
+gate:
+  allow_unknown_passive: false
+rules:
+  - rule_id: exact-apex
+    kind: DOMAIN
+    pattern: example.com
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Explicitly listed by the program
 
-allowed:
-  domains:
-    - example.com
-    - "*.example.com"
+  - rule_id: wildcard-subdomains
+    kind: DOMAIN
+    pattern: "*.example.com"
+    state: IN_SCOPE
+    priority: 100
+    tier: bounty
+    reason: Explicit wildcard authorization
 
-passive_only:
-  related_domains: true
-  certificate_neighbors: true
-  asn_neighbors: true
-
-active:
-  enabled: true
-
-limits:
-  requests_per_second_per_host: 5
-  max_concurrent_hosts: 10
-
-stop_conditions:
-  private_data: true
-  possible_secret: true
-  auth_boundary: true
+  - rule_id: excluded-admin
+    kind: DOMAIN
+    pattern: admin.example.com
+    state: OUT_OF_SCOPE
+    priority: 300
+    tier: excluded
+    reason: Explicit program exception
 ```
 
-The schema is intentionally target-agnostic.
+This is the current accepted scope shape. Rate limits, budgets, routing, and
+worker settings belong to `pipeline.yaml`, not `scope.yaml`; see the complete
+Company walkthrough in **First Authorized Run** and the canonical templates in
+`configs/`.
 
 Different bug-bounty programs can be represented without changing the engine architecture.
 
@@ -2421,6 +2734,18 @@ exact table/column compatibility check
    ├─ match    → stamp baseline revision, preserve data
    └─ mismatch → fail closed; do not rewrite the DB
 ```
+
+The workspace-target migration promotes the existing `scope_target_id` from run
+history. Exactly one matching historical target is bound automatically. Mixed
+history is rejected. A populated database without trustworthy attribution stays
+unbound until the operator inspects it and explicitly runs:
+
+```bash
+nightscout workspace adopt --scope ./program.yaml --yes
+```
+
+Older attributable flat workspaces remain usable in place. New targets use the
+isolated `workspaces/<target-id>/` layout.
 
 Development migration checks:
 

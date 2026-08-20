@@ -40,7 +40,7 @@ def test_setup_creates_fail_closed_user_environment(monkeypatch, tmp_path: Path)
 
     cfg = load_runtime_configuration(pipeline_path=paths.pipeline_path)
     assert cfg.scope_path == paths.scope_path
-    assert cfg.workspace_root == paths.data_root
+    assert cfg.workspace_root == paths.data_root / "workspaces" / "local-authorized-targets"
     # Bundled/source resources do not get re-rooted into ~/.config/nightscout.
     assert cfg.resolve_resource("wordlists/manifest.yaml").is_file()
 

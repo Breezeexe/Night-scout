@@ -70,6 +70,7 @@ analysis.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -147,6 +148,31 @@ class MobileArtifactMaterial(BaseModel):
             raise ValueError("must not be blank")
 
         return normalized
+
+
+class ImportedMobileArtifact(BaseModel):
+    """Content-addressed mobile artifact materialized in a workspace."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: Path
+    artifact_ref: str
+    kind: MobileArtifactKind
+    sha256: str
+    size_bytes: int = Field(ge=0)
+
+    @field_validator("artifact_ref")
+    @classmethod
+    def artifact_ref_required(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("artifact_ref must not be blank")
+        return normalized
+
+    @field_validator("sha256")
+    @classmethod
+    def normalize_sha256(cls, value: str) -> str:
+        return MobileArtifactMaterial.normalize_sha256(value)
 
 
 class MobileArtifactProvider(Protocol):
@@ -240,6 +266,28 @@ class WorkspaceMobileArtifactProvider:
             candidate,
         )
 
+        expected_digest = event.metadata.get("artifact_sha256")
+        if expected_digest is not None:
+            try:
+                normalized_expected = MobileArtifactMaterial.normalize_sha256(
+                    str(expected_digest)
+                )
+            except ValueError:
+                return None
+            if digest != normalized_expected:
+                return None
+
+        expected_size = event.metadata.get("artifact_size_bytes")
+        if expected_size is not None:
+            if isinstance(expected_size, bool):
+                return None
+            try:
+                normalized_size = int(expected_size)
+            except (TypeError, ValueError):
+                return None
+            if size_bytes != normalized_size:
+                return None
+
         return MobileArtifactMaterial(
             path=candidate,
             kind=kind,
@@ -248,6 +296,142 @@ class WorkspaceMobileArtifactProvider:
             content_ref=relative.as_posix(),
             source="workspace",
         )
+
+
+class WorkspaceMobileArtifactStore:
+    """Safely import immutable APK/IPA content into one target workspace."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        max_artifact_bytes: int,
+    ) -> None:
+        if max_artifact_bytes < 1:
+            raise ValueError("max_artifact_bytes must be positive")
+        self._root = root.expanduser().resolve()
+        self._max_artifact_bytes = max_artifact_bytes
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    async def import_file(
+        self,
+        source: Path,
+        *,
+        kind: MobileArtifactKind | None = None,
+    ) -> ImportedMobileArtifact:
+        return await asyncio.to_thread(
+            self._import_file_sync,
+            source,
+            kind,
+        )
+
+    def _import_file_sync(
+        self,
+        source: Path,
+        kind: MobileArtifactKind | None,
+    ) -> ImportedMobileArtifact:
+        source = source.expanduser()
+        if source.is_symlink():
+            raise ValueError("mobile artifact source cannot be a symlink")
+
+        selected_kind = mobile_artifact_kind(kind or source.suffix)
+        self._prepare_root()
+
+        source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            source_fd = os.open(source, source_flags)
+        except OSError as exc:
+            raise ValueError(f"cannot open mobile artifact: {exc}") from exc
+
+        tmp: Path | None = None
+        tmp_fd: int | None = None
+        digest = hashlib.sha256()
+        size_bytes = 0
+
+        try:
+            source_stat = os.fstat(source_fd)
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise ValueError("mobile artifact source must be a regular file")
+            if source_stat.st_size > self._max_artifact_bytes:
+                raise ValueError(
+                    "mobile artifact exceeds configured size limit: "
+                    f"{source_stat.st_size} > {self._max_artifact_bytes}"
+                )
+
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                prefix=".mobile-import-",
+                suffix=".tmp",
+                dir=self._root,
+            )
+            tmp = Path(tmp_name)
+            os.fchmod(tmp_fd, stat.S_IRUSR | stat.S_IWUSR)
+
+            with os.fdopen(source_fd, "rb", closefd=False) as source_handle, os.fdopen(
+                tmp_fd,
+                "wb",
+                closefd=False,
+            ) as destination_handle:
+                while True:
+                    chunk = source_handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size_bytes += len(chunk)
+                    if size_bytes > self._max_artifact_bytes:
+                        raise ValueError(
+                            "mobile artifact exceeded configured size limit while importing: "
+                            f"> {self._max_artifact_bytes}"
+                        )
+                    digest.update(chunk)
+                    destination_handle.write(chunk)
+                destination_handle.flush()
+                os.fsync(destination_handle.fileno())
+
+            sha256 = digest.hexdigest()
+            suffix = ".apk" if selected_kind is MobileArtifactKind.APK else ".ipa"
+            destination = self._root / f"{sha256}{suffix}"
+
+            try:
+                os.link(tmp, destination)
+            except FileExistsError:
+                self._validate_existing(destination, sha256, size_bytes)
+            os.chmod(destination, stat.S_IRUSR)
+
+            return ImportedMobileArtifact(
+                path=destination,
+                artifact_ref=destination.relative_to(self._root).as_posix(),
+                kind=selected_kind,
+                sha256=sha256,
+                size_bytes=size_bytes,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(source_fd)
+            if tmp_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(tmp_fd)
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+
+    def _prepare_root(self) -> None:
+        self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not self._root.is_dir() or self._root.is_symlink():
+            raise ValueError("mobile artifact root must be a real directory")
+        os.chmod(self._root, 0o700)
+
+    @staticmethod
+    def _validate_existing(
+        destination: Path,
+        expected_sha256: str,
+        expected_size: int,
+    ) -> None:
+        if destination.is_symlink() or not destination.is_file():
+            raise ValueError("existing mobile artifact destination is unsafe")
+        actual_sha256, actual_size = hash_file(destination)
+        if actual_sha256 != expected_sha256 or actual_size != expected_size:
+            raise ValueError("existing content-addressed mobile artifact is inconsistent")
 
 
 class MobileAnalysisConfig(BaseModel):
