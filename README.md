@@ -210,6 +210,9 @@ nightscout run example.com
 # Bound one invocation while keeping the persistent frontier in SQLite.
 nightscout run --scope ./program.yaml --max-steps 100
 
+# Suppress live lifecycle updates (the final summary is still printed).
+nightscout run --scope ./program.yaml --no-progress
+
 # Inspect persistent runs, tasks, assets and review state.
 nightscout status
 
@@ -236,6 +239,12 @@ nightscout export --sensitive --confirm-sensitive
 # Check configuration, platform and companion tools without scanning.
 nightscout doctor
 ```
+
+`nightscout run` reports the current lifecycle step, worker, action, outcome,
+queue state, retry waits, and final run status to stderr. JSON summaries remain
+machine-readable on stdout. Short deferred retries are awaited in the same run;
+long waits and bounded runs with remaining work finish as `PAUSED` while keeping
+the frontier durable for the next invocation.
 
 ### Companion tools
 

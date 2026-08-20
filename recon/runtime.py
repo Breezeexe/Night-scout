@@ -35,11 +35,12 @@ import json
 import os
 import time
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import yaml
@@ -60,13 +61,14 @@ from recon.core.lifecycle import (
     GateOutcome,
     Lifecycle,
     LifecycleOutcome,
+    LifecycleResult,
     LifecycleReviewCoordinator,
     WorkerExecutionResult,
     WorkerOutcome,
 )
 from recon.core.queue import Task, TaskQueue, TaskStatus, utc_now
 from recon.core.redaction import sanitize_event_for_storage
-from recon.core.router import RouteRule, Router, RoutingContext
+from recon.core.router import Router, RouteRule, RoutingContext
 from recon.core.scheduler import (
     ScheduleDecision,
     Scheduler,
@@ -114,7 +116,7 @@ from recon.intelligence.yield_model import (
     target_key_for_event,
     yield_observation_from_task,
 )
-from recon.policy.rate_limit import RateLimitProfile, RateLimiter
+from recon.policy.rate_limit import RateLimiter, RateLimitProfile
 from recon.policy.restrictions import (
     RestrictionDecision,
     RestrictionEngine,
@@ -134,14 +136,6 @@ from recon.policy.review_gate import (
     ReviewSeverity,
     ReviewSignal,
 )
-from recon.resources import bundled_resource_root, is_standalone_bundle
-from recon.userenv import user_paths
-from recon.policy.seeds import (
-    DomainSeedPlan,
-    DomainSeedSpec,
-    effective_scope_rules,
-    plan_domain_seeds,
-)
 from recon.policy.scope import (
     ScopeAssetKind,
     ScopeDecision,
@@ -152,6 +146,13 @@ from recon.policy.scope import (
     StaticWorkerActivityProvider,
     WorkerActivity,
 )
+from recon.policy.seeds import (
+    DomainSeedPlan,
+    DomainSeedSpec,
+    effective_scope_rules,
+    plan_domain_seeds,
+)
+from recon.resources import bundled_resource_root, is_standalone_bundle
 from recon.storage.database import (
     BranchRepository,
     Database,
@@ -174,8 +175,8 @@ from recon.storage.models import (
     TaskRecord,
 )
 from recon.storage.provenance import ProvenanceRepository
-from recon.storage.snapshots import SnapshotKind, SnapshotRepository, SurfaceState
 from recon.storage.schema import upgrade_database
+from recon.storage.snapshots import SnapshotKind, SnapshotRepository, SurfaceState
 from recon.tooling import (
     ToolRequirement,
     activate_managed_tool_path,
@@ -184,6 +185,7 @@ from recon.tooling import (
     load_tools_manifest,
     probe_tool,
 )
+from recon.userenv import user_paths
 from recon.workers.archives import (
     ArchivesWorker,
     ArchivesWorkerConfig,
@@ -191,7 +193,13 @@ from recon.workers.archives import (
     URLFinderSource,
     archive_route_rules,
 )
-from recon.workers.asn import ASNWorker, ASNWorkerConfig, AsnmapBackend, AsnmapConfig, asn_route_rules
+from recon.workers.asn import (
+    AsnmapBackend,
+    AsnmapConfig,
+    ASNWorker,
+    ASNWorkerConfig,
+    asn_route_rules,
+)
 from recon.workers.content import (
     ContentWorker,
     ContentWorkerConfig,
@@ -208,8 +216,18 @@ from recon.workers.crawler import (
     crawler_route_rules,
 )
 from recon.workers.dns import DNSWorker, DNSWorkerConfig, DnsxBackend, DnsxConfig, dns_route_rules
-from recon.workers.fingerprints import FingerprintWorker, FingerprintWorkerConfig, fingerprint_route_rules
-from recon.workers.http import HTTPWorker, HTTPWorkerConfig, HttpxBackend, HttpxConfig, http_route_rules
+from recon.workers.fingerprints import (
+    FingerprintWorker,
+    FingerprintWorkerConfig,
+    fingerprint_route_rules,
+)
+from recon.workers.http import (
+    HTTPWorker,
+    HTTPWorkerConfig,
+    HttpxBackend,
+    HttpxConfig,
+    http_route_rules,
+)
 from recon.workers.javascript import (
     FileJavaScriptContentProvider,
     JavaScriptAnalysisConfig,
@@ -239,10 +257,12 @@ from recon.workers.nuclei import (
 from recon.workers.parameters import (
     ArjunBackend,
     ArjunConfig,
-    InMemoryExplorationCursorStore as ParameterExplorationCursorStore,
     ParameterDiscoveryConfig,
     ParametersWorker,
     parameter_route_rules,
+)
+from recon.workers.parameters import (
+    InMemoryExplorationCursorStore as ParameterExplorationCursorStore,
 )
 from recon.workers.passive_domains import (
     PassiveDomainsConfig,
@@ -254,6 +274,8 @@ from recon.workers.passive_domains import (
 )
 from recon.workers.permutations import (
     InMemoryExplorationCursorStore as PermutationExplorationCursorStore,
+)
+from recon.workers.permutations import (
     PermutationsConfig,
     PermutationsWorker,
     permutation_route_rules,
@@ -361,6 +383,7 @@ class RuntimeLoopConfig(BaseModel):
     heartbeat_interval_seconds: int = Field(default=60, ge=5)
     recover_retry_delay_seconds: int = Field(default=0, ge=0)
     resume_frontier: bool = True
+    max_deferred_wait_seconds: float = Field(default=60.0, ge=0.0, le=3600.0)
 
     project_vocabulary: bool = True
     vulnerability_enrichment: bool = True
@@ -447,6 +470,7 @@ class RuntimeRunSummary(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     run_id: str
+    status: str
     seed_event_id: str
     target: str
     scope_state: ScopeState
@@ -455,6 +479,8 @@ class RuntimeRunSummary(BaseModel):
     outcomes: dict[str, int]
     stopped_idle: bool
     max_steps_reached: bool
+    paused_deferred: bool = False
+    next_resume_at: datetime | None = None
 
     task_counts: dict[str, int]
     event_count: int
@@ -481,12 +507,15 @@ class RuntimeProgramRunSummary(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     run_id: str
+    status: str
     seeds: tuple[RuntimeSeedSummary, ...]
 
     steps: int
     outcomes: dict[str, int]
     stopped_idle: bool
     max_steps_reached: bool
+    paused_deferred: bool = False
+    next_resume_at: datetime | None = None
 
     task_counts: dict[str, int]
     event_count: int
@@ -494,6 +523,36 @@ class RuntimeProgramRunSummary(BaseModel):
     open_review_cases: int
 
     warnings: tuple[str, ...] = ()
+
+
+class RuntimeProgress(BaseModel):
+    """One live, non-persistent progress update for a running CLI/API client."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: str
+    phase: Literal[
+        "STARTED",
+        "EXECUTING",
+        "STEP",
+        "WAITING",
+        "FINISHED",
+        "FAILED",
+    ]
+    step: int = Field(default=0, ge=0)
+    max_steps: int = Field(ge=1)
+    outcome: LifecycleOutcome | None = None
+    task_id: str | None = None
+    worker: str | None = None
+    action: str | None = None
+    reason: str | None = None
+    queue_status: TaskStatus | None = None
+    wait_seconds: float | None = Field(default=None, ge=0.0)
+    next_resume_at: datetime | None = None
+    run_status: str | None = None
+
+
+RuntimeProgressCallback = Callable[[RuntimeProgress], None]
 
 
 class RuntimeStatus(BaseModel):
@@ -2263,6 +2322,7 @@ class NightScoutRuntime:
         domains: Sequence[str] = (),
         *,
         max_steps: int | None = None,
+        progress: RuntimeProgressCallback | None = None,
     ) -> RuntimeProgramRunSummary:
         """Run one program frontier from many explicit or scope-derived domain seeds."""
 
@@ -2272,16 +2332,30 @@ class NightScoutRuntime:
                 "scope produced no domain seeds; add at least one IN_SCOPE DOMAIN rule "
                 "or provide explicit authorized domain seeds"
             )
-        return await self._run_seed_plan(plan, max_steps=max_steps)
+        return await self._run_seed_plan(
+            plan,
+            max_steps=max_steps,
+            progress=progress,
+        )
 
     async def _run_seed_plan(
         self,
         plan: DomainSeedPlan,
         *,
         max_steps: int | None = None,
+        progress: RuntimeProgressCallback | None = None,
     ) -> RuntimeProgramRunSummary:
         if self._run_id is not None:
             raise RuntimeError("runtime already has an active run")
+
+        if not self.configuration.pipeline.runtime.resume_frontier:
+            active = [task for task in await self.task_store.all() if not task.is_terminal]
+            if active:
+                raise RuntimeError(
+                    "resume_frontier=false requires an empty active frontier; "
+                    f"workspace contains {len(active)} unfinished task(s). "
+                    "Resume them with resume_frontier=true or use a fresh workspace."
+                )
 
         targets = [seed.domain for seed in plan.seeds]
         self._run_id = await self.runs.start(
@@ -2296,6 +2370,8 @@ class NightScoutRuntime:
         self.event_bus.set_run_id(self._run_id)
         self.task_store.set_run_id(self._run_id)
         run_id = self._run_id
+        limit = max_steps or self.configuration.pipeline.runtime.max_steps
+        steps = 0
 
         try:
             seed_pairs: list[tuple[DomainSeedSpec, Event]] = []
@@ -2303,18 +2379,94 @@ class NightScoutRuntime:
                 event = await self.seed_domain(seed_spec.domain, seed_spec=seed_spec)
                 seed_pairs.append((seed_spec, event))
 
-            limit = max_steps or self.configuration.pipeline.runtime.max_steps
             outcomes: Counter[str] = Counter()
-            steps = 0
             stopped_idle = False
+            paused_deferred = False
+            next_resume_at: datetime | None = None
+            self._emit_progress(
+                progress,
+                RuntimeProgress(
+                    run_id=run_id,
+                    phase="STARTED",
+                    max_steps=limit,
+                ),
+            )
 
             while steps < limit:
-                result = await self.lifecycle.run_once()
-                outcomes[result.outcome.value] += 1
+                current_step = steps + 1
+                result = await self.lifecycle.run_once(
+                    on_claimed=partial(
+                        self._emit_claimed_progress,
+                        callback=progress,
+                        run_id=run_id,
+                        step=current_step,
+                        max_steps=limit,
+                    ),
+                )
                 if result.outcome is LifecycleOutcome.IDLE:
-                    stopped_idle = True
-                    break
+                    next_ready_at = await self.task_store.next_ready_at()
+                    if next_ready_at is None:
+                        outcomes[result.outcome.value] += 1
+                        stopped_idle = True
+                        self._emit_lifecycle_progress(
+                            progress,
+                            run_id=run_id,
+                            step=steps,
+                            max_steps=limit,
+                            result=result,
+                        )
+                        break
+
+                    wait_seconds = max(
+                        0.0,
+                        (next_ready_at - utc_now()).total_seconds(),
+                    )
+                    max_wait = (
+                        self.configuration.pipeline.runtime.max_deferred_wait_seconds
+                    )
+                    if wait_seconds > max_wait:
+                        paused_deferred = True
+                        next_resume_at = next_ready_at
+                        self._emit_progress(
+                            progress,
+                            RuntimeProgress(
+                                run_id=run_id,
+                                phase="WAITING",
+                                step=steps,
+                                max_steps=limit,
+                                wait_seconds=wait_seconds,
+                                next_resume_at=next_ready_at,
+                                reason=(
+                                    "deferred task exceeds this run's maximum wait"
+                                ),
+                            ),
+                        )
+                        break
+
+                    self._emit_progress(
+                        progress,
+                        RuntimeProgress(
+                            run_id=run_id,
+                            phase="WAITING",
+                            step=steps,
+                            max_steps=limit,
+                            wait_seconds=wait_seconds,
+                            next_resume_at=next_ready_at,
+                            reason="waiting for deferred task",
+                        ),
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    continue
+
+                outcomes[result.outcome.value] += 1
                 steps += 1
+                self._emit_lifecycle_progress(
+                    progress,
+                    run_id=run_id,
+                    step=steps,
+                    max_steps=limit,
+                    result=result,
+                )
 
             seed_summaries: list[RuntimeSeedSummary] = []
             for seed_spec, seed in seed_pairs:
@@ -2342,23 +2494,57 @@ class NightScoutRuntime:
                     )
                 )
 
-            await self.runs.finish(run_id, status="SUCCEEDED")
+            max_steps_reached = steps >= limit and not stopped_idle
+            if max_steps_reached and next_resume_at is None:
+                next_resume_at = await self.task_store.next_ready_at()
+            run_status = (
+                "PAUSED"
+                if paused_deferred or next_resume_at is not None
+                else "SUCCEEDED"
+            )
+            await self.runs.finish(run_id, status=run_status)
             status = await self.status(run_id=run_id)
+
+            self._emit_progress(
+                progress,
+                RuntimeProgress(
+                    run_id=run_id,
+                    phase="FINISHED",
+                    step=steps,
+                    max_steps=limit,
+                    next_resume_at=next_resume_at,
+                    run_status=run_status,
+                ),
+            )
 
             return RuntimeProgramRunSummary(
                 run_id=run_id,
+                status=run_status,
                 seeds=tuple(seed_summaries),
                 steps=steps,
                 outcomes=dict(sorted(outcomes.items())),
                 stopped_idle=stopped_idle,
-                max_steps_reached=(steps >= limit and not stopped_idle),
+                max_steps_reached=max_steps_reached,
+                paused_deferred=paused_deferred,
+                next_resume_at=next_resume_at,
                 task_counts=status.task_counts,
                 event_count=status.event_count,
                 asset_count=status.asset_count,
                 open_review_cases=status.open_review_cases,
                 warnings=tuple(dict.fromkeys((*plan.warnings, *self.warnings))),
             )
-        except BaseException:
+        except BaseException as exc:
+            self._emit_progress(
+                progress,
+                RuntimeProgress(
+                    run_id=run_id,
+                    phase="FAILED",
+                    step=steps,
+                    max_steps=limit,
+                    reason=f"{type(exc).__name__}: {exc}",
+                    run_status="FAILED",
+                ),
+            )
             with contextlib.suppress(Exception):
                 await self.runs.finish(run_id, status="FAILED")
             raise
@@ -2372,13 +2558,19 @@ class NightScoutRuntime:
         domain: str,
         *,
         max_steps: int | None = None,
+        progress: RuntimeProgressCallback | None = None,
     ) -> RuntimeRunSummary:
         """Backward-compatible single-domain wrapper over the program runner."""
 
-        program = await self.run_domains((domain,), max_steps=max_steps)
+        program = await self.run_domains(
+            (domain,),
+            max_steps=max_steps,
+            progress=progress,
+        )
         seed = program.seeds[0]
         return RuntimeRunSummary(
             run_id=program.run_id,
+            status=program.status,
             seed_event_id=seed.seed_event_id,
             target=seed.target,
             scope_state=seed.scope_state,
@@ -2386,12 +2578,77 @@ class NightScoutRuntime:
             outcomes=program.outcomes,
             stopped_idle=program.stopped_idle,
             max_steps_reached=program.max_steps_reached,
+            paused_deferred=program.paused_deferred,
+            next_resume_at=program.next_resume_at,
             task_counts=program.task_counts,
             event_count=program.event_count,
             asset_count=program.asset_count,
             open_review_cases=program.open_review_cases,
             genome_fingerprint=seed.genome_fingerprint,
             warnings=program.warnings,
+        )
+
+    def _emit_progress(
+        self,
+        callback: RuntimeProgressCallback | None,
+        item: RuntimeProgress,
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback(item)
+        except Exception as exc:
+            self.warnings.append(
+                "progress callback failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _emit_lifecycle_progress(
+        self,
+        callback: RuntimeProgressCallback | None,
+        *,
+        run_id: str,
+        step: int,
+        max_steps: int,
+        result: LifecycleResult,
+    ) -> None:
+        self._emit_progress(
+            callback,
+            RuntimeProgress(
+                run_id=run_id,
+                phase="STEP",
+                step=step,
+                max_steps=max_steps,
+                outcome=result.outcome,
+                task_id=result.task_id,
+                worker=result.worker,
+                action=result.action,
+                reason=result.reason,
+                queue_status=result.queue_status,
+            ),
+        )
+
+    def _emit_claimed_progress(
+        self,
+        task: Task,
+        *,
+        callback: RuntimeProgressCallback | None,
+        run_id: str,
+        step: int,
+        max_steps: int,
+    ) -> None:
+        self._emit_progress(
+            callback,
+            RuntimeProgress(
+                run_id=run_id,
+                phase="EXECUTING",
+                step=step,
+                max_steps=max_steps,
+                task_id=task.task_id,
+                worker=task.worker,
+                action=task.action,
+                queue_status=task.status,
+            ),
         )
 
     async def status(self, *, run_id: str | None = None) -> RuntimeStatus:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typer.testing import CliRunner
 
 from recon.cli import app
+from recon.runtime import RuntimeProgress
 
 
 def test_cli_version_and_help():
@@ -195,12 +196,31 @@ def test_cli_run_accepts_many_explicit_seeds(monkeypatch, tmp_path) -> None:
     calls: dict[str, object] = {}
 
     class FakeRuntime:
-        async def run_domains(self, domains, *, max_steps=None):
+        async def run_domains(self, domains, *, max_steps=None, progress=None):
             calls["domains"] = tuple(domains)
             calls["max_steps"] = max_steps
+            if progress is not None:
+                progress(
+                    RuntimeProgress(
+                        run_id="run-many",
+                        phase="STARTED",
+                        max_steps=max_steps or 10_000,
+                    )
+                )
+                progress(
+                    RuntimeProgress(
+                        run_id="run-many",
+                        phase="EXECUTING",
+                        step=1,
+                        max_steps=max_steps or 10_000,
+                        worker="http",
+                        action="probe",
+                    )
+                )
             return SimpleNamespace(
                 model_dump=lambda mode="json": {
                     "run_id": "run-many",
+                    "status": "SUCCEEDED",
                     "seeds": [
                         {
                             "seed_event_id": "seed-a",
@@ -261,6 +281,8 @@ def test_cli_run_accepts_many_explicit_seeds(monkeypatch, tmp_path) -> None:
     assert "seeds:       2" in result.stdout
     assert "a.example.com" in result.stdout
     assert "b.example.com" in result.stdout
+    assert "recon: run=run-many phase=STARTED" in result.stderr
+    assert "phase=EXECUTING step=1/7 worker=http action=probe" in result.stderr
 
 
 def test_cli_run_can_derive_seeds_from_scope_when_no_positional_targets(monkeypatch, tmp_path) -> None:
@@ -269,11 +291,12 @@ def test_cli_run_can_derive_seeds_from_scope_when_no_positional_targets(monkeypa
     calls: dict[str, object] = {}
 
     class FakeRuntime:
-        async def run_domains(self, domains, *, max_steps=None):
+        async def run_domains(self, domains, *, max_steps=None, progress=None):
             calls["domains"] = tuple(domains)
             return SimpleNamespace(
                 model_dump=lambda mode="json": {
                     "run_id": "run-scope",
+                    "status": "SUCCEEDED",
                     "seeds": [
                         {
                             "seed_event_id": "seed-anchor",

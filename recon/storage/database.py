@@ -69,6 +69,7 @@ from recon.core.queue import (
     Task,
     TaskStatus,
     fair_lane_limits,
+    new_claim_token,
 )
 from recon.core.redaction import sanitize_event_for_storage
 from recon.core.scheduler import ScheduleDecision
@@ -540,16 +541,45 @@ class SQLiteTaskStore:
             record = await session.get(TaskRecord, task_id)
             return _task_from_record(record) if record is not None else None
 
-    async def save(self, task: Task) -> None:
+    async def save(
+        self,
+        task: Task,
+        *,
+        expected_status: TaskStatus,
+        expected_claim_token: str | None = None,
+        expected_lease_expires_at: datetime | None = None,
+    ) -> Task:
         try:
             async with self._database.transaction(immediate=True) as session:
-                record = await session.get(TaskRecord, task.task_id)
-                if record is None:
-                    raise KeyError(f"unknown task_id: {task.task_id}")
-
                 values = _task_values(task)
-                for key, value in values.items():
-                    setattr(record, key, value)
+                conditions: list[Any] = [
+                    TaskRecord.task_id == task.task_id,
+                    TaskRecord.status == expected_status.value,
+                ]
+                if expected_claim_token is None:
+                    conditions.append(TaskRecord.claim_token.is_(None))
+                else:
+                    conditions.append(TaskRecord.claim_token == expected_claim_token)
+                if expected_lease_expires_at is not None:
+                    conditions.append(
+                        TaskRecord.lease_expires_at == expected_lease_expires_at
+                    )
+                statement = (
+                    update(TaskRecord)
+                    .where(*conditions)
+                    .values(**values)
+                    .returning(TaskRecord)
+                )
+                record = (await session.execute(statement)).scalar_one_or_none()
+                if record is not None:
+                    return _task_from_record(record)
+
+                current = await session.get(TaskRecord, task.task_id)
+                if current is None:
+                    raise KeyError(f"unknown task_id: {task.task_id}")
+                raise ValueError(
+                    f"task {task.task_id} changed concurrently or claim token is stale"
+                )
         except IntegrityError as exc:
             duplicate = await self.active_by_dedupe_key(task.dedupe_key)
             if duplicate is not None and duplicate.task_id != task.task_id:
@@ -571,6 +601,7 @@ class SQLiteTaskStore:
         _require_aware(lease_expires_at, name="lease_expires_at")
 
         async with self._database.transaction(immediate=True) as session:
+            claim_token = new_claim_token()
             statement = (
                 update(TaskRecord)
                 .where(
@@ -588,6 +619,7 @@ class SQLiteTaskStore:
                     finished_at=None,
                     status=TaskStatus.RUNNING.value,
                     lease_expires_at=lease_expires_at,
+                    claim_token=claim_token,
                     updated_at=now,
                     last_error=None,
                 )
@@ -691,6 +723,24 @@ class SQLiteTaskStore:
                 if len(selected) >= limit:
                     break
             return [_task_from_record(row) for row in selected]
+
+    async def next_ready_at(self) -> datetime | None:
+        conditions: list[Any] = [
+            TaskRecord.status.in_(
+                (TaskStatus.PENDING.value, TaskStatus.DEFERRED.value)
+            )
+        ]
+        if not self._resume_frontier and self._run_id is not None:
+            conditions.append(TaskRecord.run_id == self._run_id)
+        statement = (
+            select(TaskRecord.available_at)
+            .where(*conditions)
+            .order_by(TaskRecord.available_at, TaskRecord.task_id)
+            .limit(1)
+        )
+        async with self._database.session() as session:
+            value = await session.scalar(statement)
+            return value if isinstance(value, datetime) else None
 
     async def active_by_dedupe_key(
         self,
@@ -1930,6 +1980,7 @@ def _task_values(task: Task) -> dict[str, Any]:
         "started_at": task.started_at,
         "finished_at": task.finished_at,
         "lease_expires_at": task.lease_expires_at,
+        "claim_token": task.claim_token,
         "last_error": task.last_error,
         "dedupe_key": task.dedupe_key,
     }
@@ -1963,6 +2014,7 @@ def _task_from_record(record: TaskRecord) -> Task:
         started_at=record.started_at,
         finished_at=record.finished_at,
         lease_expires_at=record.lease_expires_at,
+        claim_token=record.claim_token,
         last_error=record.last_error,
     )
 

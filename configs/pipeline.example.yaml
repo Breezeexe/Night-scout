@@ -39,6 +39,10 @@ runtime:
   # Origin and execution run attribution remain separate in storage.
   resume_frontier: true
 
+  # Short worker/rate-limit retries are awaited in the same run. Longer
+  # deferrals leave the durable frontier intact and finish the run as PAUSED.
+  max_deferred_wait_seconds: 60
+
   project_vocabulary: true
   vulnerability_enrichment: true
   snapshot_capture: true

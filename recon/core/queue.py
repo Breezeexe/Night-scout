@@ -28,6 +28,11 @@ def new_task_id() -> str:
     return f"tsk_{uuid4().hex}"
 
 
+def new_claim_token() -> str:
+    """Return an opaque token fencing one concrete task execution attempt."""
+    return f"clm_{uuid4().hex}"
+
+
 class TaskStatus(StrEnum):
     """Lifecycle states understood by the queue and future scheduler."""
 
@@ -93,6 +98,7 @@ class Task(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     lease_expires_at: datetime | None = None
+    claim_token: str | None = None
 
     last_error: str | None = None
 
@@ -135,6 +141,16 @@ class Task(BaseModel):
             return None
         return value.strip().upper() or None
 
+    @field_validator("claim_token")
+    @classmethod
+    def normalize_claim_token(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("claim_token must not be blank")
+        return normalized
+
     @field_validator(
         "created_at",
         "updated_at",
@@ -165,8 +181,14 @@ class Task(BaseModel):
         if self.status == TaskStatus.RUNNING and self.started_at is None:
             raise ValueError("RUNNING tasks require started_at")
 
+        if self.status == TaskStatus.RUNNING and self.claim_token is None:
+            raise ValueError("RUNNING tasks require a claim_token")
+
         if self.status != TaskStatus.RUNNING and self.lease_expires_at is not None:
             raise ValueError("only RUNNING tasks may hold a lease")
+
+        if self.status != TaskStatus.RUNNING and self.claim_token is not None:
+            raise ValueError("only RUNNING tasks may hold a claim_token")
 
         return self
 
@@ -209,8 +231,15 @@ class TaskStore(Protocol):
         """Return a task by identifier."""
         ...
 
-    async def save(self, task: Task) -> None:
-        """Persist an existing task."""
+    async def save(
+        self,
+        task: Task,
+        *,
+        expected_status: TaskStatus,
+        expected_claim_token: str | None = None,
+        expected_lease_expires_at: datetime | None = None,
+    ) -> Task:
+        """Compare-and-swap an existing task or raise ValueError."""
         ...
 
     async def claim(
@@ -231,6 +260,10 @@ class TaskStore(Protocol):
         fair: bool = False,
     ) -> list[Task]:
         """Return runnable tasks ordered for scheduler consumption."""
+        ...
+
+    async def next_ready_at(self) -> datetime | None:
+        """Return the earliest availability in the visible runnable frontier."""
         ...
 
     async def active_by_dedupe_key(self, dedupe_key: str) -> Task | None:
@@ -280,12 +313,31 @@ class InMemoryTaskStore:
             task = self._tasks.get(task_id)
             return task.model_copy(deep=True) if task is not None else None
 
-    async def save(self, task: Task) -> None:
+    async def save(
+        self,
+        task: Task,
+        *,
+        expected_status: TaskStatus,
+        expected_claim_token: str | None = None,
+        expected_lease_expires_at: datetime | None = None,
+    ) -> Task:
         async with self._lock:
             if task.task_id not in self._tasks:
                 raise KeyError(f"unknown task_id: {task.task_id}")
 
             previous = self._tasks[task.task_id]
+            if previous.status is not expected_status:
+                raise ValueError(
+                    f"task {task.task_id} changed from expected {expected_status} "
+                    f"to {previous.status}"
+                )
+            if previous.claim_token != expected_claim_token:
+                raise ValueError(f"task {task.task_id} claim token is stale")
+            if (
+                expected_lease_expires_at is not None
+                and previous.lease_expires_at != expected_lease_expires_at
+            ):
+                raise ValueError(f"task {task.task_id} lease changed concurrently")
 
             if self._active_keys.get(previous.dedupe_key) == task.task_id:
                 self._active_keys.pop(previous.dedupe_key, None)
@@ -300,6 +352,7 @@ class InMemoryTaskStore:
                         f"active task already exists for dedupe key: {stored.dedupe_key}"
                     )
                 self._active_keys[stored.dedupe_key] = stored.task_id
+            return stored.model_copy(deep=True)
 
     async def claim(
         self,
@@ -331,6 +384,7 @@ class InMemoryTaskStore:
                     "finished_at": None,
                     "status": TaskStatus.RUNNING,
                     "lease_expires_at": lease_expires_at,
+                    "claim_token": new_claim_token(),
                     "updated_at": now,
                     "last_error": None,
                 }
@@ -413,6 +467,15 @@ class InMemoryTaskStore:
                 candidates = candidates[:limit]
 
             return [task.model_copy(deep=True) for task in candidates]
+
+    async def next_ready_at(self) -> datetime | None:
+        async with self._lock:
+            values = (
+                task.available_at
+                for task in self._tasks.values()
+                if task.status in {TaskStatus.PENDING, TaskStatus.DEFERRED}
+            )
+            return min(values, default=None)
 
     async def active_by_dedupe_key(self, dedupe_key: str) -> Task | None:
         async with self._lock:
@@ -516,6 +579,7 @@ class TaskQueue:
         self,
         task_id: str,
         *,
+        claim_token: str,
         lease_for: timedelta = timedelta(minutes=5),
     ) -> Task:
         """Extend the lease of a running worker task."""
@@ -527,22 +591,31 @@ class TaskQueue:
 
             if task.status != TaskStatus.RUNNING:
                 raise ValueError("only RUNNING tasks can be heartbeated")
+            self._require_claim_token(task, claim_token)
 
             now = utc_now()
             task.lease_expires_at = now + lease_for
             task.updated_at = now
 
-            await self._store.save(task)
-            return task
+            return await self._store.save(
+                task,
+                expected_status=TaskStatus.RUNNING,
+                expected_claim_token=claim_token,
+            )
 
-    async def succeed(self, task_id: str) -> Task:
+    async def succeed(self, task_id: str, *, claim_token: str) -> Task:
         """Mark a running task as successfully completed."""
-        return await self._finish(task_id, status=TaskStatus.SUCCEEDED)
+        return await self._finish(
+            task_id,
+            status=TaskStatus.SUCCEEDED,
+            claim_token=claim_token,
+        )
 
     async def fail(
         self,
         task_id: str,
         *,
+        claim_token: str,
         error: str,
         retry_delay: timedelta | None = None,
     ) -> Task:
@@ -555,26 +628,38 @@ class TaskQueue:
 
         async with self._transition_lock:
             task = await self._require_running(task_id)
+            self._require_claim_token(task, claim_token)
             now = utc_now()
-
-            task.last_error = normalized_error
-            task.lease_expires_at = None
-            task.updated_at = now
 
             if retry_delay is not None and task.attempts < task.max_attempts:
                 if retry_delay < timedelta(0):
                     raise ValueError("retry_delay cannot be negative")
-
-                task.status = TaskStatus.DEFERRED
-                task.available_at = now + retry_delay
-                task.started_at = None
-                task.finished_at = None
+                updates = {
+                    "status": TaskStatus.DEFERRED,
+                    "available_at": now + retry_delay,
+                    "started_at": None,
+                    "finished_at": None,
+                }
             else:
-                task.status = TaskStatus.FAILED
-                task.finished_at = now
+                updates = {
+                    "status": TaskStatus.FAILED,
+                    "finished_at": now,
+                }
 
-            await self._store.save(task)
-            return task
+            task = self._updated_task(
+                task,
+                **updates,
+                last_error=normalized_error,
+                lease_expires_at=None,
+                claim_token=None,
+                updated_at=now,
+            )
+
+            return await self._store.save(
+                task,
+                expected_status=TaskStatus.RUNNING,
+                expected_claim_token=claim_token,
+            )
 
     async def defer(
         self,
@@ -592,6 +677,7 @@ class TaskQueue:
 
             if task.status not in {TaskStatus.PENDING, TaskStatus.DEFERRED}:
                 raise ValueError("only PENDING or DEFERRED tasks can be deferred")
+            previous_status = task.status
 
             now = utc_now()
             task.status = TaskStatus.DEFERRED
@@ -601,8 +687,10 @@ class TaskQueue:
             if reason:
                 task.last_error = reason.strip() or None
 
-            await self._store.save(task)
-            return task
+            return await self._store.save(
+                task,
+                expected_status=previous_status,
+            )
 
     async def block(self, task_id: str, *, reason: str) -> Task:
         """Terminate a task because policy or scope forbids execution."""
@@ -620,17 +708,26 @@ class TaskQueue:
 
             if task.is_terminal:
                 raise ValueError("terminal tasks cannot be sent to review")
+            previous_status = task.status
+            previous_claim_token = task.claim_token
 
             now = utc_now()
-            task.lease_expires_at = None
-            task.status = TaskStatus.REVIEW
-            task.started_at = None
-            task.finished_at = None
-            task.updated_at = now
-            task.last_error = reason.strip() or "manual review required"
+            task = self._updated_task(
+                task,
+                lease_expires_at=None,
+                claim_token=None,
+                status=TaskStatus.REVIEW,
+                started_at=None,
+                finished_at=None,
+                updated_at=now,
+                last_error=reason.strip() or "manual review required",
+            )
 
-            await self._store.save(task)
-            return task
+            return await self._store.save(
+                task,
+                expected_status=previous_status,
+                expected_claim_token=previous_claim_token,
+            )
 
     async def release_review(
         self,
@@ -657,8 +754,10 @@ class TaskQueue:
             )
             task.started_at = None
 
-            await self._store.save(task)
-            return task
+            return await self._store.save(
+                task,
+                expected_status=TaskStatus.REVIEW,
+            )
 
     async def cancel(self, task_id: str, *, reason: str | None = None) -> Task:
         """Cancel any unfinished task."""
@@ -694,21 +793,44 @@ class TaskQueue:
                 ):
                     continue
 
-                task.lease_expires_at = None
-                task.updated_at = now
-                task.last_error = "worker lease expired"
+                claim_token = task.claim_token
+                lease_expires_at = task.lease_expires_at
+                assert claim_token is not None
+                assert lease_expires_at is not None
 
                 if task.attempts < task.max_attempts:
-                    task.status = TaskStatus.DEFERRED
-                    task.started_at = None
-                    task.available_at = now + retry_delay
-                    task.finished_at = None
+                    updates = {
+                        "status": TaskStatus.DEFERRED,
+                        "started_at": None,
+                        "available_at": now + retry_delay,
+                        "finished_at": None,
+                    }
                 else:
-                    task.status = TaskStatus.FAILED
-                    task.finished_at = now
+                    updates = {
+                        "status": TaskStatus.FAILED,
+                        "finished_at": now,
+                    }
 
-                await self._store.save(task)
-                recovered.append(task)
+                task = self._updated_task(
+                    task,
+                    **updates,
+                    lease_expires_at=None,
+                    claim_token=None,
+                    updated_at=now,
+                    last_error="worker lease expired",
+                )
+
+                try:
+                    stored = await self._store.save(
+                        task,
+                        expected_status=TaskStatus.RUNNING,
+                        expected_claim_token=claim_token,
+                        expected_lease_expires_at=lease_expires_at,
+                    )
+                except ValueError:
+                    # A concurrent heartbeat or completion won the CAS.
+                    continue
+                recovered.append(stored)
 
         return recovered
 
@@ -719,6 +841,7 @@ class TaskQueue:
         status: TaskStatus,
         error: str | None = None,
         require_running: bool = True,
+        claim_token: str | None = None,
     ) -> Task:
         if status not in TERMINAL_TASK_STATUSES:
             raise ValueError("_finish requires a terminal task status")
@@ -729,20 +852,45 @@ class TaskQueue:
             if require_running and task.status != TaskStatus.RUNNING:
                 raise ValueError("task must be RUNNING before completion")
 
+            if require_running:
+                if claim_token is None:
+                    raise ValueError("claim_token is required to complete a RUNNING task")
+                self._require_claim_token(task, claim_token)
+
             if task.is_terminal:
                 raise ValueError("task is already terminal")
 
+            previous_status = task.status
+            previous_claim_token = task.claim_token
             now = utc_now()
-            task.lease_expires_at = None
-            task.status = status
-            task.updated_at = now
-            task.finished_at = now
-
+            updates: dict[str, object] = {
+                "lease_expires_at": None,
+                "claim_token": None,
+                "status": status,
+                "updated_at": now,
+                "finished_at": now,
+            }
             if error is not None:
-                task.last_error = error.strip() or None
+                updates["last_error"] = error.strip() or None
+            task = self._updated_task(task, **updates)
 
-            await self._store.save(task)
-            return task
+            return await self._store.save(
+                task,
+                expected_status=previous_status,
+                expected_claim_token=previous_claim_token,
+            )
+
+    @staticmethod
+    def _require_claim_token(task: Task, claim_token: str) -> None:
+        normalized = claim_token.strip()
+        if not normalized or task.claim_token != normalized:
+            raise ValueError(f"task {task.task_id} claim token is stale")
+
+    @staticmethod
+    def _updated_task(task: Task, **updates: object) -> Task:
+        payload = task.model_dump(mode="python")
+        payload.update(updates)
+        return Task.model_validate(payload)
 
     async def _require(self, task_id: str) -> Task:
         task = await self._store.get(task_id)

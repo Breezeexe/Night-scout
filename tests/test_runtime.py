@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import shutil
+from datetime import timedelta
 
 import pytest
 import yaml
 from sqlalchemy import select
 
 from recon.core.events import Event, EventType
-from recon.core.lifecycle import LifecycleOutcome
-from recon.core.queue import Task, TaskStatus
+from recon.core.lifecycle import LifecycleOutcome, LifecycleResult
+from recon.core.queue import Task, TaskStatus, utc_now
 from recon.policy.review_gate import ReviewCategory, ReviewSignal
-from recon.runtime import build_runtime
+from recon.runtime import RuntimeProgress, build_runtime
 from recon.storage.models import EventObservationRecord, TaskRecord
 from recon.storage.schema import current_revision, head_revision
 
@@ -335,8 +336,17 @@ async def test_runtime_search_tier_controls_worker_candidate_limit(
 
     runtime = await build_runtime(pipeline_path=pipeline_path)
     try:
-        summary = await runtime.run_domain("example.com", max_steps=1)
+        updates: list[RuntimeProgress] = []
+        summary = await runtime.run_domain(
+            "example.com",
+            max_steps=1,
+            progress=updates.append,
+        )
         assert summary.outcomes == {LifecycleOutcome.SUCCEEDED.value: 1}
+        assert any(
+            item.phase == "EXECUTING" and item.worker == "permutations"
+            for item in updates
+        )
         async with runtime.database.session() as session:
             rows = list(
                 (
@@ -428,5 +438,166 @@ async def test_persistent_frontier_keeps_origin_and_attributes_resume_to_new_run
         assert sum(global_status.task_counts.values()) > sum(
             second.task_counts.values()
         )
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_frontier_false_rejects_hidden_active_frontier(
+    tmp_path,
+    project_root,
+):
+    root = tmp_path / "isolated-frontier"
+    (root / "configs").mkdir(parents=True)
+    shutil.copy(project_root / "pyproject.toml", root / "pyproject.toml")
+    shutil.copy(
+        project_root / "configs" / "scope.example.yaml",
+        root / "configs" / "scope.yaml",
+    )
+    shutil.copytree(project_root / "wordlists", root / "wordlists")
+    pipeline = yaml.safe_load(
+        (project_root / "configs" / "pipeline.example.yaml").read_text()
+    )
+    pipeline["scope_file"] = "configs/scope.yaml"
+    pipeline["storage"]["database"]["path"] = "isolated.sqlite3"
+    pipeline["storage"]["event_log"]["enabled"] = False
+    pipeline["runtime"].update(
+        {
+            "resume_frontier": False,
+            "project_vocabulary": False,
+            "vulnerability_enrichment": False,
+            "snapshot_capture": False,
+            "build_genome_on_finish": False,
+        }
+    )
+    pipeline["routing"]["enabled_rule_ids"] = [
+        "permutations.root.targeted",
+        "permutations.root.exploration",
+    ]
+    for worker in pipeline["workers"].values():
+        worker["enabled"] = False
+    pipeline["workers"]["permutations"]["enabled"] = True
+    pipeline["workers"]["permutations"]["config"]["max_candidates"] = 2
+    pipeline_path = root / "configs" / "pipeline.yaml"
+    pipeline_path.write_text(
+        yaml.safe_dump(pipeline, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    runtime = await build_runtime(pipeline_path=pipeline_path)
+    try:
+        first = await runtime.run_domain("example.com", max_steps=1)
+        assert first.status == "PAUSED"
+        assert any(not task.is_terminal for task in await runtime.task_store.all())
+
+        with pytest.raises(RuntimeError, match="requires an empty active frontier"):
+            await runtime.run_domain("example.com", max_steps=1)
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_waits_for_short_deferred_frontier(
+    tmp_path,
+    project_root,
+    monkeypatch,
+):
+    root = tmp_path / "deferred-wait"
+    (root / "configs").mkdir(parents=True)
+    shutil.copy(project_root / "pyproject.toml", root / "pyproject.toml")
+    shutil.copy(
+        project_root / "configs" / "scope.example.yaml",
+        root / "configs" / "scope.yaml",
+    )
+    shutil.copytree(project_root / "wordlists", root / "wordlists")
+    pipeline = yaml.safe_load(
+        (project_root / "configs" / "pipeline.example.yaml").read_text()
+    )
+    pipeline["scope_file"] = "configs/scope.yaml"
+    pipeline["storage"]["database"]["path"] = "deferred.sqlite3"
+    pipeline["storage"]["event_log"]["enabled"] = False
+    pipeline["runtime"].update(
+        {
+            "max_deferred_wait_seconds": 1,
+            "project_vocabulary": False,
+            "vulnerability_enrichment": False,
+            "snapshot_capture": False,
+            "build_genome_on_finish": False,
+        }
+    )
+    pipeline["routing"]["enabled_rule_ids"] = []
+    for worker in pipeline["workers"].values():
+        worker["enabled"] = False
+    pipeline_path = root / "configs" / "pipeline.yaml"
+    pipeline_path.write_text(
+        yaml.safe_dump(pipeline, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    class FakeLifecycle:
+        def __init__(self) -> None:
+            self.results = iter(
+                (
+                    LifecycleResult(outcome=LifecycleOutcome.RETRY),
+                    LifecycleResult(outcome=LifecycleOutcome.IDLE),
+                    LifecycleResult(outcome=LifecycleOutcome.SUCCEEDED),
+                    LifecycleResult(outcome=LifecycleOutcome.IDLE),
+                )
+            )
+            self.calls = 0
+
+        async def run_once(self, *, on_claimed=None) -> LifecycleResult:
+            del on_claimed
+            self.calls += 1
+            return next(self.results)
+
+    runtime = await build_runtime(pipeline_path=pipeline_path)
+    fake_lifecycle = FakeLifecycle()
+    next_ready_values = iter((utc_now() + timedelta(milliseconds=10), None))
+
+    async def fake_next_ready_at():
+        return next(next_ready_values)
+
+    monkeypatch.setattr(runtime, "lifecycle", fake_lifecycle)
+    monkeypatch.setattr(runtime.task_store, "next_ready_at", fake_next_ready_at)
+    updates: list[RuntimeProgress] = []
+    try:
+        summary = await runtime.run_domain(
+            "example.com",
+            max_steps=3,
+            progress=updates.append,
+        )
+        assert fake_lifecycle.calls == 4
+        assert summary.status == "SUCCEEDED"
+        assert summary.stopped_idle is True
+        assert summary.outcomes == {"IDLE": 1, "RETRY": 1, "SUCCEEDED": 1}
+        assert any(item.phase == "WAITING" for item in updates)
+
+        class LongDeferredLifecycle:
+            def __init__(self) -> None:
+                self.results = iter(
+                    (
+                        LifecycleResult(outcome=LifecycleOutcome.RETRY),
+                        LifecycleResult(outcome=LifecycleOutcome.IDLE),
+                    )
+                )
+
+            async def run_once(self, *, on_claimed=None) -> LifecycleResult:
+                del on_claimed
+                return next(self.results)
+
+        async def long_deferred_ready_at():
+            return utc_now() + timedelta(seconds=5)
+
+        monkeypatch.setattr(runtime, "lifecycle", LongDeferredLifecycle())
+        monkeypatch.setattr(
+            runtime.task_store,
+            "next_ready_at",
+            long_deferred_ready_at,
+        )
+        paused = await runtime.run_domain("example.com", max_steps=3)
+        assert paused.status == "PAUSED"
+        assert paused.paused_deferred is True
+        assert paused.next_resume_at is not None
     finally:
         await runtime.close()

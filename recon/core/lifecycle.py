@@ -33,7 +33,8 @@ Another critical invariant:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+import contextlib
+from collections.abc import Callable, Iterable
 from datetime import timedelta
 from enum import StrEnum
 from typing import Protocol
@@ -363,7 +364,11 @@ class Lifecycle:
             expired_budget_reservations=len(expired_reservations),
         )
 
-    async def run_once(self) -> LifecycleResult:
+    async def run_once(
+        self,
+        *,
+        on_claimed: Callable[[Task], None] | None = None,
+    ) -> LifecycleResult:
         """Evaluate and, when permitted, execute one ready task."""
         schedule = await self._scheduler.select_next()
 
@@ -469,9 +474,14 @@ class Lifecycle:
                 queue_status=current.status if current is not None else None,
             )
 
+        if on_claimed is not None:
+            with contextlib.suppress(Exception):
+                on_claimed(running)
+
         heartbeat = asyncio.create_task(
             self._heartbeat_loop(
                 task_id=running.task_id,
+                claim_token=running.claim_token,
                 reservation_id=reservation_id,
             )
         )
@@ -487,11 +497,20 @@ class Lifecycle:
             if reservation_id is not None:
                 await self._budgets.commit(reservation_id)
 
-            failed = await self._queue.fail(
-                running.task_id,
-                error=f"executor exception: {type(exc).__name__}: {exc}",
-                retry_delay=None,
-            )
+            try:
+                failed = await self._queue.fail(
+                    running.task_id,
+                    claim_token=self._claim_token(running),
+                    error=f"executor exception: {type(exc).__name__}: {exc}",
+                    retry_delay=None,
+                )
+            except (KeyError, ValueError) as transition_error:
+                return await self._stale_completion_result(
+                    running,
+                    schedule,
+                    reservation_id=reservation_id,
+                    error=transition_error,
+                )
 
             return LifecycleResult(
                 outcome=LifecycleOutcome.FAILED,
@@ -514,7 +533,18 @@ class Lifecycle:
             await self._budgets.commit(reservation_id)
 
         if execution.outcome is WorkerOutcome.SUCCEEDED:
-            succeeded = await self._queue.succeed(running.task_id)
+            try:
+                succeeded = await self._queue.succeed(
+                    running.task_id,
+                    claim_token=self._claim_token(running),
+                )
+            except (KeyError, ValueError) as exc:
+                return await self._stale_completion_result(
+                    running,
+                    schedule,
+                    reservation_id=reservation_id,
+                    error=exc,
+                )
             return LifecycleResult(
                 outcome=LifecycleOutcome.SUCCEEDED,
                 task_id=running.task_id,
@@ -529,11 +559,20 @@ class Lifecycle:
             retry_delay = timedelta(
                 seconds=execution.retry_after_seconds or 0.0
             )
-            retried = await self._queue.fail(
-                running.task_id,
-                error=execution.error or "worker requested retry",
-                retry_delay=retry_delay,
-            )
+            try:
+                retried = await self._queue.fail(
+                    running.task_id,
+                    claim_token=self._claim_token(running),
+                    error=execution.error or "worker requested retry",
+                    retry_delay=retry_delay,
+                )
+            except (KeyError, ValueError) as exc:
+                return await self._stale_completion_result(
+                    running,
+                    schedule,
+                    reservation_id=reservation_id,
+                    error=exc,
+                )
 
             lifecycle_outcome = (
                 LifecycleOutcome.RETRY
@@ -552,11 +591,20 @@ class Lifecycle:
                 queue_status=retried.status,
             )
 
-        failed = await self._queue.fail(
-            running.task_id,
-            error=execution.error or "worker failed",
-            retry_delay=None,
-        )
+        try:
+            failed = await self._queue.fail(
+                running.task_id,
+                claim_token=self._claim_token(running),
+                error=execution.error or "worker failed",
+                retry_delay=None,
+            )
+        except (KeyError, ValueError) as exc:
+            return await self._stale_completion_result(
+                running,
+                schedule,
+                reservation_id=reservation_id,
+                error=exc,
+            )
 
         return LifecycleResult(
             outcome=LifecycleOutcome.FAILED,
@@ -657,10 +705,13 @@ class Lifecycle:
         self,
         *,
         task_id: str,
+        claim_token: str | None,
         reservation_id: str | None,
     ) -> None:
         """Keep queue and budget leases alive while a worker is running."""
         interval = self._heartbeat_interval.total_seconds()
+        if claim_token is None:
+            return
 
         try:
             while True:
@@ -668,6 +719,7 @@ class Lifecycle:
 
                 await self._queue.heartbeat(
                     task_id,
+                    claim_token=claim_token,
                     lease_for=self._task_lease_for,
                 )
 
@@ -688,7 +740,31 @@ class Lifecycle:
     async def _stop_heartbeat(task: asyncio.Task[None]) -> None:
         """Cancel and fully await the background heartbeat task."""
         task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await task
-        except asyncio.CancelledError:
-            pass
+
+    @staticmethod
+    def _claim_token(task: Task) -> str:
+        if task.claim_token is None:
+            raise ValueError(f"RUNNING task {task.task_id} has no claim token")
+        return task.claim_token
+
+    async def _stale_completion_result(
+        self,
+        task: Task,
+        schedule: ScheduleDecision,
+        *,
+        reservation_id: str | None,
+        error: Exception,
+    ) -> LifecycleResult:
+        current = await self._queue.get(task.task_id)
+        return LifecycleResult(
+            outcome=LifecycleOutcome.STALE,
+            task_id=task.task_id,
+            worker=task.worker,
+            action=task.action,
+            reason=f"stale execution could not finalize task: {error}",
+            schedule_score=schedule.score,
+            reservation_id=reservation_id,
+            queue_status=current.status if current is not None else None,
+        )

@@ -42,13 +42,13 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     Float,
     ForeignKey,
     Index,
     Integer,
-    JSON,
     MetaData,
     String,
     Text,
@@ -847,6 +847,10 @@ class TaskRecord(Base):
         UTCDateTime(),
         nullable=True,
     )
+    claim_token: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
 
     last_error: Mapped[str | None] = mapped_column(
         Text,
@@ -870,6 +874,11 @@ class TaskRecord(Base):
         CheckConstraint(
             "attempts <= max_attempts",
             name="task_attempts_within_budget",
+        ),
+        CheckConstraint(
+            "(status = 'RUNNING' AND claim_token IS NOT NULL) OR "
+            "(status != 'RUNNING' AND claim_token IS NULL)",
+            name="task_claim_token_matches_status",
         ),
         Index(
             "ix_tasks_ready",

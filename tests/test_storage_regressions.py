@@ -139,8 +139,12 @@ async def test_semantic_task_dedupe_survives_repeated_observation_and_completion
         assert await queue.enqueue(first_task) is True
         assert await queue.enqueue(repeated_task) is False
 
-        await queue.claim(first_task.task_id)
-        await queue.succeed(first_task.task_id)
+        claimed = await queue.claim(first_task.task_id)
+        assert claimed.claim_token is not None
+        await queue.succeed(
+            first_task.task_id,
+            claim_token=claimed.claim_token,
+        )
         third = Event(type=EventType.DNS_NAME, value="api.example.com", source="three")
         await events.ingest(third)
         assert await queue.enqueue(router.expand(third, context=RoutingContext())[0]) is False
@@ -183,5 +187,45 @@ async def test_sqlite_task_claim_is_atomic_across_queue_instances(tmp_path):
         persisted = await SQLiteTaskStore(database).get(task.task_id)
         assert persisted is not None
         assert persisted.attempts == 1
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_cannot_finalize_reclaimed_task(tmp_path):
+    path = tmp_path / "claim-fencing.sqlite3"
+    upgrade_database(path)
+    database = Database.from_path(path)
+    try:
+        event = Event(type=EventType.ROOT_DOMAIN, value="example.com", source="test")
+        await EventRepository(database).ingest(event)
+        task = Task(
+            worker="fixture",
+            action="claim-fencing",
+            input_event_id=event.event_id,
+            max_attempts=3,
+        )
+        store_a = SQLiteTaskStore(database)
+        store_b = SQLiteTaskStore(database)
+        queue_a = TaskQueue(store_a)
+        queue_b = TaskQueue(store_b)
+        assert await store_a.put(task) is True
+
+        first = await queue_a.claim(task.task_id, lease_for=timedelta(milliseconds=1))
+        assert first.claim_token is not None
+        await asyncio.sleep(0.01)
+        assert len(await queue_b.recover_expired_leases()) == 1
+        second = await queue_b.claim(task.task_id)
+        assert second.claim_token is not None
+        assert second.claim_token != first.claim_token
+
+        with pytest.raises(ValueError, match="claim token is stale"):
+            await queue_a.succeed(task.task_id, claim_token=first.claim_token)
+
+        persisted = await store_b.get(task.task_id)
+        assert persisted is not None
+        assert persisted.status is TaskStatus.RUNNING
+        assert persisted.claim_token == second.claim_token
+        await queue_b.succeed(task.task_id, claim_token=second.claim_token)
     finally:
         await database.dispose()

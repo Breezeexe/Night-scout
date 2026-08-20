@@ -18,19 +18,14 @@ import typer
 from recon import __version__
 from recon.core.events import ScopeState
 from recon.exporters.jsonl import ExportMode
-from recon.policy.seeds import effective_scope_rules
 from recon.policy.scope import ScopeAssetKind, ScopeEngine, ScopeSubject
-from recon.runtime import build_runtime, doctor_from_files, load_runtime_configuration
-from recon.userenv import (
-    add_confirmed_domain_scope,
-    initialize_user_environment,
-    is_default_user_pipeline,
-    preferred_pipeline_path,
-    refresh_user_wordlist_resources,
-    user_paths,
+from recon.policy.seeds import effective_scope_rules
+from recon.runtime import (
+    RuntimeProgress,
+    build_runtime,
+    doctor_from_files,
+    load_runtime_configuration,
 )
-from scripts.wordlists_sync import build_local_manifest, main as wordlists_sync_main
-
 from recon.tooling import (
     ToolInstallProgress,
     assert_supported_platform,
@@ -39,7 +34,16 @@ from recon.tooling import (
     managed_bin_dir,
     probe_all_tools,
 )
-
+from recon.userenv import (
+    add_confirmed_domain_scope,
+    initialize_user_environment,
+    is_default_user_pipeline,
+    preferred_pipeline_path,
+    refresh_user_wordlist_resources,
+    user_paths,
+)
+from scripts.wordlists_sync import build_local_manifest
+from scripts.wordlists_sync import main as wordlists_sync_main
 
 app = typer.Typer(
     name="nightscout",
@@ -89,6 +93,31 @@ def _render_tool_progress(item: ToolInstallProgress) -> None:
         f"  [tool {item.index}/{item.total}] {item.tool_id}: "
         f"{item.phase.value} - {item.detail}"
     )
+
+
+def _render_run_progress(item: RuntimeProgress) -> None:
+    parts = [
+        "recon:",
+        f"run={item.run_id}",
+        f"phase={item.phase}",
+        f"step={item.step}/{item.max_steps}",
+    ]
+    if item.outcome is not None:
+        parts.append(f"outcome={item.outcome.value}")
+    if item.worker:
+        parts.append(f"worker={item.worker}")
+    if item.action:
+        parts.append(f"action={item.action}")
+    if item.queue_status is not None:
+        parts.append(f"queue={item.queue_status.value}")
+    if item.wait_seconds is not None:
+        parts.append(f"wait={item.wait_seconds:.1f}s")
+    if item.run_status:
+        parts.append(f"status={item.run_status}")
+    if item.reason:
+        reason = " ".join(item.reason.split())
+        parts.append(f"reason={reason[:240]}")
+    typer.echo(" ".join(parts), err=True)
 
 
 @app.callback()
@@ -325,6 +354,11 @@ def run_command(
         "--json",
         help="Emit final run summary as JSON.",
     ),
+    progress: bool = typer.Option(
+        True,
+        "--progress/--no-progress",
+        help="Emit live lifecycle state to stderr while recon is running.",
+    ),
 ) -> None:
     """Run a program frontier from explicit seeds or scope-derived domain seeds."""
 
@@ -347,6 +381,7 @@ def run_command(
             summary = await runtime.run_domains(
                 normalized_targets,
                 max_steps=max_steps,
+                progress=_render_run_progress if progress else None,
             )
             return summary.model_dump(mode="json")
         finally:
@@ -366,6 +401,7 @@ def run_command(
         return
 
     typer.echo(f"run_id:      {summary['run_id']}")
+    typer.echo(f"status:      {summary['status']}")
     typer.echo(f"seeds:       {len(summary['seeds'])}")
     for seed in summary["seeds"]:
         typer.echo(
