@@ -29,7 +29,8 @@ tools:
     asset_regex: '^subfinder_.*_linux_{goarch}\.zip$'
     checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: 'subfinder|projectdiscovery'
+    identity_args: [-h]
+    identity_regex: '\bsubfinder\b'
     apt:
       kali: {package: subfinder, binary: subfinder}
 
@@ -43,7 +44,8 @@ tools:
     asset_regex: '^dnsx_.*_linux_{goarch}\.zip$'
     checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: 'dnsx|projectdiscovery'
+    identity_args: [-h]
+    identity_regex: '\bdnsx\b'
     apt:
       kali: {package: dnsx, binary: dnsx}
 
@@ -57,7 +59,8 @@ tools:
     asset_regex: '^httpx_.*_linux_{goarch}\.zip$'
     checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: 'httpx|projectdiscovery'
+    identity_args: [-h]
+    identity_regex: '\bhttpx\b'
     apt:
       # Kali renames ProjectDiscovery httpx to avoid collision with Python httpx.
       kali: {package: httpx-toolkit, binary: httpx-toolkit}
@@ -72,7 +75,8 @@ tools:
     asset_regex: '^tlsx_.*_linux_{goarch}\.zip$'
     checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: 'tlsx|projectdiscovery'
+    identity_args: [-h]
+    identity_regex: '\btlsx\b'
 
   - tool_id: asnmap
     binary: asnmap
@@ -84,7 +88,8 @@ tools:
     asset_regex: '^asnmap_.*_linux_{goarch}\.zip$'
     checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: 'asnmap|projectdiscovery'
+    identity_args: [-h]
+    identity_regex: '\basnmap\b'
 
   - tool_id: katana
     binary: katana
@@ -96,7 +101,8 @@ tools:
     asset_regex: '^katana_.*_linux_{goarch}\.zip$'
     checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: 'katana|projectdiscovery'
+    identity_args: [-h]
+    identity_regex: '\bkatana\b'
 
   - tool_id: urlfinder
     binary: urlfinder
@@ -108,7 +114,8 @@ tools:
     asset_regex: '^urlfinder_.*_linux_{goarch}\.zip$'
     checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: 'urlfinder|projectdiscovery'
+    identity_args: [-h]
+    identity_regex: '\burlfinder\b'
 
   - tool_id: nuclei
     binary: nuclei
@@ -120,7 +127,8 @@ tools:
     asset_regex: '^nuclei_.*_linux_{goarch}\.zip$'
     checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [-version]
-    identity_regex: 'nuclei|projectdiscovery'
+    identity_args: [-h]
+    identity_regex: '\bnuclei\b'
     apt:
       kali: {package: nuclei, binary: nuclei}
 
@@ -198,4 +206,3 @@ tools:
     checksum_asset_regex: '(?i)checksums.*\.txt$'
     version_args: [--version]
     identity_regex: 'trufflehog|^[0-9]+\.'
-                                             
