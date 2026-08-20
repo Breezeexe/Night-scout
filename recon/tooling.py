@@ -58,6 +58,9 @@ MAX_RELEASE_JSON_BYTES = 8 * 1024 * 1024
 MAX_ASSET_BYTES = 1024 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 200_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
+APT_UPDATE_TIMEOUT_SECONDS = 300
+APT_INSTALL_TIMEOUT_SECONDS = 900
+PDTM_TIMEOUT_SECONDS = 300
 
 
 class ToolingError(RuntimeError):
@@ -516,12 +519,18 @@ def _apt_candidate_available(package: str) -> bool:
     apt_cache = shutil.which("apt-cache")
     if apt_cache is None:
         return False
+    # apt-cache emits translated field names.  Parse a stable machine locale so
+    # installations running under ru_RU and other non-English locales do not
+    # mistake an available package for a missing one.
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "LANG": "C", "LANGUAGE": "C"})
     result = subprocess.run(
         [apt_cache, "policy", package],
         capture_output=True,
         text=True,
         check=False,
         timeout=20,
+        env=env,
     )
     if result.returncode != 0:
         return False
@@ -547,32 +556,57 @@ def _try_install_with_apt(
         return None
     prefix = _privilege_prefix()
     if prefix is None:
+        print(
+            f"    apt: {apt_spec.package} is allow-listed, but sudo/root is unavailable; "
+            "using upstream fallback",
+            flush=True,
+        )
         return None
     if not _apt_candidate_available(apt_spec.package):
         # Package lists may be stale. Refresh once, then check again.
         if not apt_session.updated:
             print("    apt: refreshing package metadata (apt-get update)...", flush=True)
-            update = subprocess.run([*prefix, "apt-get", "update"], check=False)
+            try:
+                update = subprocess.run(
+                    [*prefix, "apt-get", "update"],
+                    check=False,
+                    timeout=APT_UPDATE_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ToolingError(
+                    f"apt-get update timed out after {APT_UPDATE_TIMEOUT_SECONDS}s; "
+                    "refusing to hide the APT failure behind an upstream fallback"
+                ) from exc
             if update.returncode != 0:
-                return None
+                raise ToolingError(
+                    f"apt-get update failed with exit code {update.returncode}; "
+                    "refusing to hide the APT failure behind an upstream fallback"
+                )
             apt_session.updated = True
         if not _apt_candidate_available(apt_spec.package):
+            print(
+                f"    apt: no candidate for {apt_spec.package} after metadata refresh",
+                flush=True,
+            )
             return None
-
-    if not apt_session.updated:
-        print("    apt: refreshing package metadata (apt-get update)...", flush=True)
-        update = subprocess.run([*prefix, "apt-get", "update"], check=False)
-        if update.returncode != 0:
-            return None
-        apt_session.updated = True
 
     print(f"    apt: installing {apt_spec.package}...", flush=True)
-    install = subprocess.run(
-        [*prefix, "apt-get", "install", "-y", "--no-install-recommends", apt_spec.package],
-        check=False,
-    )
+    try:
+        install = subprocess.run(
+            [*prefix, "apt-get", "install", "-y", "--no-install-recommends", apt_spec.package],
+            check=False,
+            timeout=APT_INSTALL_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ToolingError(
+            f"APT installation of {apt_spec.package} timed out after "
+            f"{APT_INSTALL_TIMEOUT_SECONDS}s"
+        ) from exc
     if install.returncode != 0:
-        return None
+        raise ToolingError(
+            f"APT installation of {apt_spec.package} failed with exit code "
+            f"{install.returncode}"
+        )
 
     actual = shutil.which(apt_spec.binary)
     if actual is None:
@@ -865,7 +899,13 @@ def _install_with_pdtm(
         "-nc",
     ]
     print(f"    upstream: running PDTM for {spec.tool_id} (live output follows)...", flush=True)
-    result = subprocess.run(command, check=False, timeout=600)
+    try:
+        result = subprocess.run(command, check=False, timeout=PDTM_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise ToolingError(
+            f"PDTM timed out while installing {spec.tool_id} after "
+            f"{PDTM_TIMEOUT_SECONDS}s; check DNS/proxy access to api.pdtm.sh and GitHub"
+        ) from exc
     if result.returncode != 0:
         raise ToolingError(f"PDTM failed for {spec.tool_id} with exit code {result.returncode}")
 
