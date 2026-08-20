@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from recon.tooling import (
+    InstallStrategy,
     PlatformInfo,
     ToolingError,
     assert_supported_platform,
@@ -37,7 +39,7 @@ def test_tools_manifest_loads_and_covers_runtime_tools() -> None:
     assert expected == set(by_id)
 
 
-def test_default_selection_defers_pdtm_until_fallback_is_needed() -> None:
+def test_default_selection_excludes_optional_pdtm_helper() -> None:
     manifest = load_tools_manifest()
     selected = select_tools(manifest)
     ids = [tool.tool_id for tool in selected]
@@ -45,6 +47,72 @@ def test_default_selection_defers_pdtm_until_fallback_is_needed() -> None:
     assert "subfinder" in ids
     assert "arjun" in ids
     assert "jadx" not in ids
+
+
+def test_required_projectdiscovery_tools_use_verified_github_releases() -> None:
+    manifest = load_tools_manifest()
+    by_id = manifest.by_id()
+
+    for tool_id in (
+        "subfinder",
+        "dnsx",
+        "httpx",
+        "tlsx",
+        "asnmap",
+        "katana",
+        "urlfinder",
+        "nuclei",
+    ):
+        spec = by_id[tool_id]
+        assert spec.strategy is InstallStrategy.GITHUB_BINARY
+        assert spec.repository == f"projectdiscovery/{tool_id}"
+        assert spec.asset_regex
+        assert spec.checksum_asset_regex
+
+
+def test_dnsx_version_banner_passes_identity_probe(monkeypatch, tmp_path) -> None:
+    import recon.tooling as tooling
+
+    manifest = load_tools_manifest()
+    spec = manifest.by_id()["dnsx"]
+    binary = tmp_path / "dnsx"
+    binary.write_text("placeholder", encoding="utf-8")
+    binary.chmod(0o755)
+
+    monkeypatch.setattr(tooling, "resolve_binary", lambda _binary, _manifest=None: str(binary))
+    monkeypatch.setattr(
+        tooling.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="projectdiscovery.io\n[INF] Current Version: 1.3.0\n",
+            stderr="",
+        ),
+    )
+
+    status = tooling.probe_tool(spec, manifest)
+
+    assert status.installed is True
+    assert status.identity_ok is True
+
+
+def test_apt_candidate_probe_forces_machine_locale(monkeypatch) -> None:
+    import recon.tooling as tooling
+
+    monkeypatch.setattr(tooling.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+
+    def fake_run(command, **kwargs):
+        assert command == ["/usr/bin/apt-cache", "policy", "dnsx"]
+        assert kwargs["env"]["LC_ALL"] == "C"
+        assert kwargs["env"]["LANG"] == "C"
+        return SimpleNamespace(
+            returncode=0,
+            stdout="dnsx:\n  Installed: 1.3.0-0kali1\n  Candidate: 1.3.0-0kali1\n",
+        )
+
+    monkeypatch.setattr(tooling.subprocess, "run", fake_run)
+
+    assert tooling._apt_candidate_available("dnsx") is True
 
 
 def test_apt_allowlist_handles_kali_httpx_name_collision() -> None:
@@ -101,8 +169,6 @@ def test_platform_gate_accepts_debian_rejects_ubuntu() -> None:
 
 
 def test_apt_first_installs_allowlisted_package_before_upstream(monkeypatch, tmp_path) -> None:
-    from types import SimpleNamespace
-
     import recon.tooling as tooling
 
     manifest = load_tools_manifest()
@@ -158,6 +224,7 @@ def test_apt_first_installs_allowlisted_package_before_upstream(monkeypatch, tmp
 
     assert result is not None
     assert result.source == "apt:kali:subfinder"
+    assert not any("update" in command for command in calls)
     assert any(command[-3:] == ("--no-install-recommends", "subfinder")[-3:] for command in calls) or any(
         "install" in command and "subfinder" in command for command in calls
     )
