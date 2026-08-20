@@ -52,8 +52,8 @@ nightscout --version
 For development or a local build:
 
 ```bash
-git clone <night-scout-repository-url>
-cd Night-scout-main
+git clone https://github.com/Breezeexe/Night-scout
+cd Night-scout
 
 python3 -m venv .venv
 source .venv/bin/activate
