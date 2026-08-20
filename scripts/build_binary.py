@@ -64,6 +64,8 @@ def pyinstaller_command(*, dist_dir: Path, work_dir: Path, spec_dir: Path) -> li
         "--hidden-import",
         "aiosqlite",
         "--hidden-import",
+        "logging.config",
+        "--hidden-import",
         "sqlalchemy.dialects.sqlite.aiosqlite",
         "--collect-submodules",
         "alembic",
