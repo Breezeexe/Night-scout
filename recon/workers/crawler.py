@@ -87,12 +87,11 @@ from recon.core.router import RouteRule, RoutingContext
 from recon.policy.rate_limit import (
     RateLimitContext,
     RateLimitDemand,
+    RateLimiter,
     RateLimitOutcome,
     RateLimitPlan,
-    RateLimiter,
 )
 from recon.workers.passive_domains import normalize_dns_name
-
 
 WORKER_NAME = "crawler"
 ACTION_CRAWL = "crawl"
@@ -205,7 +204,7 @@ class CrawlBackend(Protocol):
     def ensure_available(self) -> None:
         ...
 
-    async def crawl(
+    def crawl(
         self,
         url: str,
         *,

@@ -30,13 +30,12 @@ from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network, ip_add
 from typing import Protocol
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from recon.core.events import ScopeState
 from recon.core.lifecycle import GateDecision, GateOutcome
 from recon.core.queue import Task
 from recon.core.scheduler import ScheduleDecision
-
 
 IPAddress = IPv4Address | IPv6Address
 IPNetwork = IPv4Network | IPv6Network
@@ -747,10 +746,15 @@ def _match_network_pattern(
 
     if subject.kind is ScopeAssetKind.CIDR:
         candidate = ip_network(subject.value, strict=False)
-        return (
-            candidate.version == rule_network.version
-            and candidate.subnet_of(rule_network)
-        )
+        if isinstance(candidate, IPv4Network) and isinstance(
+            rule_network, IPv4Network
+        ):
+            return candidate.subnet_of(rule_network)
+        if isinstance(candidate, IPv6Network) and isinstance(
+            rule_network, IPv6Network
+        ):
+            return candidate.subnet_of(rule_network)
+        return False
 
     return False
 

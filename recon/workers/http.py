@@ -61,12 +61,11 @@ from recon.core.router import RouteRule
 from recon.policy.rate_limit import (
     RateLimitContext,
     RateLimitDemand,
-    RateLimitOutcome,
     RateLimiter,
+    RateLimitOutcome,
     tool_integer_rps_hint,
 )
 from recon.workers.passive_domains import normalize_dns_name
-
 
 WORKER_NAME = "http"
 ACTION_PROBE = "probe"
@@ -181,7 +180,7 @@ class HTTPProbeBackend(Protocol):
     def ensure_available(self) -> None:
         ...
 
-    async def probe(
+    def probe(
         self,
         url: str,
         *,

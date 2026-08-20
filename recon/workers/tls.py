@@ -41,11 +41,10 @@ from recon.core.router import RouteRule
 from recon.policy.rate_limit import (
     RateLimitContext,
     RateLimitDemand,
-    RateLimitOutcome,
     RateLimiter,
+    RateLimitOutcome,
 )
 from recon.workers.passive_domains import normalize_dns_name
-
 
 WORKER_NAME = "tls"
 ACTION_INSPECT = "inspect"
@@ -158,7 +157,7 @@ class TLSProbeBackend(Protocol):
     def ensure_available(self) -> None:
         ...
 
-    async def inspect(
+    def inspect(
         self,
         target: TLSTarget,
     ) -> AsyncIterator[TLSProbeResult]:
@@ -798,9 +797,9 @@ def _extract_sha256(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
 
-    value = value.strip().lower().replace(":", "")
-    if len(value) == 64 and _HEX_RE.fullmatch(value):
-        return value
+    normalized = value.strip().lower().replace(":", "")
+    if len(normalized) == 64 and _HEX_RE.fullmatch(normalized):
+        return normalized
     return None
 
 

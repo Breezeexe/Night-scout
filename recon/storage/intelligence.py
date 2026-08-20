@@ -37,6 +37,7 @@ in the separate protected evidence store used by mobile/export workflows.
 from __future__ import annotations
 
 from collections.abc import Sequence
+
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,6 +57,7 @@ from recon.intelligence.yield_model import (
     PatternYieldCredit,
     TokenYieldCredit,
     YieldAggregate,
+    YieldExecutionOutcome,
     YieldObservation,
     YieldQuery,
     aggregate_observations_for_query,
@@ -657,7 +659,7 @@ def _yield_from_record(record: YieldObservationRecord) -> YieldObservation:
         route_rule_id=record.route_rule_id,
         input_source=record.input_source,
         source_ids=frozenset(record.source_ids_json),
-        execution_outcome=record.execution_outcome,
+        execution_outcome=YieldExecutionOutcome(record.execution_outcome),
         attempted_units=record.attempted_units,
         successful_hits=record.successful_hits,
         new_assets=record.new_assets,
@@ -758,6 +760,7 @@ def _confidence_candidate_statement(
 ) -> Select[tuple[EventObservationRecord]]:
     """Narrow candidate event types without changing domain subject semantics."""
 
+    types: tuple[str, ...]
     if subject_key.startswith("dns:"):
         types = (
             EventType.DNS_NAME.value,

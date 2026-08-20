@@ -83,12 +83,11 @@ from recon.core.router import RouteRule
 from recon.policy.rate_limit import (
     RateLimitContext,
     RateLimitDemand,
-    RateLimitOutcome,
     RateLimiter,
+    RateLimitOutcome,
     tool_integer_rps_hint,
 )
 from recon.workers.passive_domains import normalize_dns_name
-
 
 WORKER_NAME = "dns"
 ACTION_RESOLVE = "resolve"
@@ -183,7 +182,7 @@ class DNSQueryBackend(Protocol):
         """Raise when the backend cannot execute locally."""
         ...
 
-    async def query(
+    def query(
         self,
         hostname: str,
         *,

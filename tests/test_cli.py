@@ -14,7 +14,17 @@ def test_cli_version_and_help():
 
     help_result = runner.invoke(app, ["--help"])
     assert help_result.exit_code == 0
-    for command in ("setup", "doctor", "run", "status", "explain", "export", "review", "tools", "wordlists"):
+    for command in (
+        "setup",
+        "doctor",
+        "run",
+        "status",
+        "explain",
+        "export",
+        "review",
+        "tools",
+        "wordlists",
+    ):
         assert command in help_result.stdout
 
     review_help = runner.invoke(app, ["review", "--help"])
@@ -285,7 +295,53 @@ def test_cli_run_accepts_many_explicit_seeds(monkeypatch, tmp_path) -> None:
     assert "phase=EXECUTING step=1/7 worker=http action=probe" in result.stderr
 
 
-def test_cli_run_can_derive_seeds_from_scope_when_no_positional_targets(monkeypatch, tmp_path) -> None:
+def test_cli_run_returns_nonzero_for_failed_summary(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    class FakeRuntime:
+        async def run_domains(self, domains, *, max_steps=None, progress=None):
+            del domains, max_steps, progress
+            return SimpleNamespace(
+                model_dump=lambda mode="json": {
+                    "run_id": "run-failed",
+                    "status": "FAILED",
+                    "seeds": [],
+                    "steps": 1,
+                    "outcomes": {"FAILED": 1},
+                    "task_counts": {"FAILED": 1},
+                    "event_count": 1,
+                    "asset_count": 1,
+                    "open_review_cases": 0,
+                    "warnings": [],
+                }
+            )
+
+        async def close(self):
+            return None
+
+    async def fake_build_runtime(**kwargs):
+        del kwargs
+        return FakeRuntime()
+
+    monkeypatch.setattr("recon.cli.build_runtime", fake_build_runtime)
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            "example.com",
+            "--scope",
+            str(tmp_path / "scope.yaml"),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert '"status": "FAILED"' in result.stdout
+
+
+def test_cli_run_can_derive_seeds_from_scope_when_no_positional_targets(
+    monkeypatch, tmp_path
+) -> None:
     from types import SimpleNamespace
 
     calls: dict[str, object] = {}

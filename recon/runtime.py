@@ -164,6 +164,7 @@ from recon.storage.database import (
     SQLiteRateLimitStore,
     SQLiteReviewCaseStore,
     SQLiteTaskStore,
+    TaskAttemptRepository,
 )
 from recon.storage.intelligence import SQLiteIntelligenceStores
 from recon.storage.models import (
@@ -172,6 +173,7 @@ from recon.storage.models import (
     ReconRunRecord,
     ReviewCaseRecord,
     SchedulerDecisionRecord,
+    TaskAttemptRecord,
     TaskRecord,
 )
 from recon.storage.provenance import ProvenanceRepository
@@ -292,7 +294,7 @@ from recon.workers.vhost import (
 )
 
 
-class _UniqueKeyLoader(yaml.SafeLoader):
+class _UniqueKeyLoader(yaml.SafeLoader):  # type: ignore[misc]
     """PyYAML loader that rejects duplicate keys instead of silently overwriting."""
 
 
@@ -483,6 +485,7 @@ class RuntimeRunSummary(BaseModel):
     next_resume_at: datetime | None = None
 
     task_counts: dict[str, int]
+    attempt_counts: dict[str, int]
     event_count: int
     asset_count: int
     open_review_cases: int
@@ -518,6 +521,7 @@ class RuntimeProgramRunSummary(BaseModel):
     next_resume_at: datetime | None = None
 
     task_counts: dict[str, int]
+    attempt_counts: dict[str, int]
     event_count: int
     asset_count: int
     open_review_cases: int
@@ -562,6 +566,7 @@ class RuntimeStatus(BaseModel):
     event_count: int
     asset_count: int
     task_counts: dict[str, int]
+    attempt_counts: dict[str, int]
     open_review_cases: int
     run_counts: dict[str, int]
     warnings: tuple[str, ...] = ()
@@ -616,12 +621,15 @@ class RuntimeEventLog:
     async def append(self, event: Event) -> None:
         if not self.enabled:
             return
-        payload = json.dumps(
-            event.model_dump(mode="json"),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ) + "\n"
+        payload = (
+            json.dumps(
+                event.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
         async with self._lock:
             await asyncio.to_thread(self._append_sync, payload)
 
@@ -727,12 +735,10 @@ class ReviewDecisionAuditRecorder(ReviewDecisionRecorder):
             details={
                 "case_id": evaluation.case_id,
                 "triggering": [
-                    signal.model_dump(mode="json")
-                    for signal in evaluation.triggering_signals
+                    signal.model_dump(mode="json") for signal in evaluation.triggering_signals
                 ],
                 "ignored": [
-                    signal.model_dump(mode="json")
-                    for signal in evaluation.ignored_signals
+                    signal.model_dump(mode="json") for signal in evaluation.ignored_signals
                 ],
             },
         )
@@ -839,6 +845,38 @@ class RuntimeLifecycleReviewCoordinator(LifecycleReviewCoordinator):
         return review_case.case_id
 
 
+class RuntimeLifecycleAttemptObserver:
+    """Bind lifecycle selections to the currently active persistent run."""
+
+    def __init__(self, attempts: TaskAttemptRepository) -> None:
+        self._attempts = attempts
+        self._run_id: str | None = None
+
+    def set_run_id(self, run_id: str | None) -> None:
+        self._run_id = run_id
+
+    async def start(self, task: Task, schedule: ScheduleDecision) -> str | None:
+        del schedule
+        if self._run_id is None:
+            return None
+        return await self._attempts.start(run_id=self._run_id, task=task)
+
+    async def finish(
+        self,
+        attempt_id: str,
+        result: LifecycleResult,
+    ) -> None:
+        await self._attempts.finish(
+            attempt_id,
+            outcome=result.outcome.value,
+            queue_status=(result.queue_status.value if result.queue_status is not None else None),
+            reason=result.reason,
+            reservation_id=result.reservation_id,
+            claimed=result.claimed,
+            execution_attempt=result.execution_attempt,
+        )
+
+
 class RuntimeReviewSignalProvider:
     """Small fail-safe classifier for explicitly tagged sensitive follow-ups."""
 
@@ -936,9 +974,7 @@ class CompositeSchedulingSignalProvider:
 
         confidence_task = asyncio.create_task(self._confidence.assess(event))
         novelty_task = asyncio.create_task(self._novelty.assess(event))
-        yield_task = asyncio.create_task(
-            self._yield.task_estimate(task, input_event=event)
-        )
+        yield_task = asyncio.create_task(self._yield.task_estimate(task, input_event=event))
 
         confidence, novelty, yield_estimate = await asyncio.gather(
             confidence_task,
@@ -1143,7 +1179,9 @@ class RuntimeBudgetPlanner:
             else:
                 candidates = float(config.get("targeted_limit", 250))
             requests = candidates + 8.0
-            runtime_seconds = float(backend.get("process_timeout_seconds", 20)) * max(1.0, candidates)
+            runtime_seconds = float(backend.get("process_timeout_seconds", 20)) * max(
+                1.0, candidates
+            )
         elif task.worker == "nuclei":
             requests = float(config.get("max_requests_per_template", 3))
             candidates = 1.0
@@ -1207,9 +1245,11 @@ class RuntimeEventBus:
             "nightscout_runtime_branch",
             default=None,
         )
-        self._metrics_var: contextvars.ContextVar[PublicationMetrics | None] = contextvars.ContextVar(
-            "nightscout_runtime_metrics",
-            default=None,
+        self._metrics_var: contextvars.ContextVar[PublicationMetrics | None] = (
+            contextvars.ContextVar(
+                "nightscout_runtime_metrics",
+                default=None,
+            )
         )
 
     @property
@@ -1253,9 +1293,7 @@ class RuntimeEventBus:
             try:
                 await self._provenance.capture_primary_parent(normalized.event_id)
             except (KeyError, ValueError) as exc:
-                self._warnings.append(
-                    f"provenance edge skipped for {normalized.event_id}: {exc}"
-                )
+                self._warnings.append(f"provenance edge skipped for {normalized.event_id}: {exc}")
 
         self._capture_metrics(normalized, asset_created=write.asset_created)
         await self._capture_snapshot(normalized, asset_id=write.asset_id)
@@ -1308,16 +1346,8 @@ class RuntimeEventBus:
             await self._branches.ensure(
                 branch_id,
                 run_id=self._run_id,
-                root_event_id=(
-                    root_event.event_id
-                    if root_event is not None
-                    else None
-                ),
-                depth=(
-                    root_event.depth
-                    if root_event is not None
-                    else 0
-                ),
+                root_event_id=(root_event.event_id if root_event is not None else None),
+                depth=(root_event.depth if root_event is not None else 0),
             )
 
         context = RoutingContext(
@@ -1353,10 +1383,7 @@ class RuntimeEventBus:
             metrics.new_patterns += 1
 
     async def _capture_snapshot(self, event: Event, *, asset_id: str) -> None:
-        if (
-            self._run_id is None
-            or not self._configuration.pipeline.runtime.snapshot_capture
-        ):
+        if self._run_id is None or not self._configuration.pipeline.runtime.snapshot_capture:
             return
 
         raw_kind = event.metadata.get("snapshot_kind")
@@ -1368,9 +1395,7 @@ class RuntimeEventBus:
         try:
             kind = SnapshotKind(raw_kind.strip().upper())
         except ValueError:
-            self._warnings.append(
-                f"unknown snapshot kind on event {event.event_id}: {raw_kind!r}"
-            )
+            self._warnings.append(f"unknown snapshot kind on event {event.event_id}: {raw_kind!r}")
             return
 
         state_payload = dict(raw_state)
@@ -1388,23 +1413,18 @@ class RuntimeEventBus:
             if self._configuration.pipeline.runtime.snapshot_diff_on_write:
                 await self._snapshots.diff_and_record(captured.snapshot.snapshot_id)
         except (ValueError, KeyError) as exc:
-            self._warnings.append(
-                f"snapshot skipped for {event.event_id}: {exc}"
-            )
+            self._warnings.append(f"snapshot skipped for {event.event_id}: {exc}")
 
     async def _enrich_vulnerabilities(self, event: Event) -> None:
         assert self._vulnerabilities is not None
         try:
             lookup = await self._vulnerabilities.lookup_event(event)
         except NvdApiError as exc:
-            self._warnings.append(
-                f"NVD enrichment failed for {event.value}: {exc}"
-            )
+            self._warnings.append(f"NVD enrichment failed for {event.value}: {exc}")
             return
         except Exception as exc:
             self._warnings.append(
-                f"NVD enrichment exception for {event.value}: "
-                f"{type(exc).__name__}: {exc}"
+                f"NVD enrichment exception for {event.value}: {type(exc).__name__}: {exc}"
             )
             return
 
@@ -1464,7 +1484,9 @@ class RuntimeWorkerExecutor:
 
         try:
             with self._bus.bind_task(task, metrics):
-                result = await worker.execute(execution_task)
+                result = WorkerExecutionResult.model_validate(
+                    await worker.execute(execution_task)
+                )
         except Exception:
             await self._record_yield(
                 task,
@@ -1506,11 +1528,7 @@ class RuntimeWorkerExecutor:
                     tier = state.tier
 
         limit_resolver = getattr(worker, "candidate_limit_for_tier", None)
-        candidate_limit = (
-            int(limit_resolver(tier.value))
-            if callable(limit_resolver)
-            else None
-        )
+        candidate_limit = int(limit_resolver(tier.value)) if callable(limit_resolver) else None
         return task.model_copy(
             update={
                 "search_tier": tier.value,
@@ -1599,6 +1617,8 @@ class NightScoutRuntime:
         self.queue: TaskQueue
         self.review_store: SQLiteReviewCaseStore
         self.runs: RunRepository
+        self.task_attempts: TaskAttemptRepository
+        self.attempt_observer: RuntimeLifecycleAttemptObserver
         self.decisions: DecisionRepository
         self.router: Router
         self.scheduler: RecordingScheduler
@@ -1663,6 +1683,8 @@ class NightScoutRuntime:
         self.queue = TaskQueue(self.task_store)
         self.review_store = SQLiteReviewCaseStore(self.database)
         self.runs = RunRepository(self.database)
+        self.task_attempts = TaskAttemptRepository(self.database)
+        self.attempt_observer = RuntimeLifecycleAttemptObserver(self.task_attempts)
         self.decisions = DecisionRepository(self.database)
 
         budget_store = SQLiteBudgetStore(self.database)
@@ -1683,9 +1705,7 @@ class NightScoutRuntime:
             ),
         )
 
-        yield_config = YieldModelConfig.model_validate(
-            pipeline.intelligence.get("yield_model", {})
-        )
+        yield_config = YieldModelConfig.model_validate(pipeline.intelligence.get("yield_model", {}))
         self.yield_model = YieldModel(
             self.intelligence.yield_store,
             config=yield_config,
@@ -1699,14 +1719,10 @@ class NightScoutRuntime:
         )
         novelty = NoveltyModel(
             provider=self.intelligence.novelty,
-            config=NoveltyModelConfig.model_validate(
-                pipeline.intelligence.get("novelty", {})
-            ),
+            config=NoveltyModelConfig.model_validate(pipeline.intelligence.get("novelty", {})),
         )
         vocabulary = VocabularyProjector(
-            VocabularyProjectorConfig.model_validate(
-                pipeline.intelligence.get("vocabulary", {})
-            )
+            VocabularyProjectorConfig.model_validate(pipeline.intelligence.get("vocabulary", {}))
         )
 
         wordlists_raw = dict(pipeline.intelligence.get("wordlists", {}))
@@ -1736,9 +1752,7 @@ class NightScoutRuntime:
         patterns = PatternEngine(
             target_events=self.intelligence.events,
             feedback=PatternYieldFeedbackAdapter(self.intelligence.yield_store),
-            config=PatternEngineConfig.model_validate(
-                pipeline.intelligence.get("patterns", {})
-            ),
+            config=PatternEngineConfig.model_validate(pipeline.intelligence.get("patterns", {})),
         )
 
         self.genome_builder = TargetGenomeBuilder(
@@ -1748,9 +1762,7 @@ class NightScoutRuntime:
             confidence=confidence,
             novelty=novelty,
             yield_model=self.yield_model,
-            config=TargetGenomeConfig.model_validate(
-                pipeline.intelligence.get("genome", {})
-            ),
+            config=TargetGenomeConfig.model_validate(pipeline.intelligence.get("genome", {})),
         )
 
         vulnerability_service: NvdVulnerabilityIntelligence | None = None
@@ -1787,8 +1799,7 @@ class NightScoutRuntime:
         unknown_rules = enabled_rule_ids - known_rule_ids
         if unknown_rules:
             raise ValueError(
-                "pipeline enables unknown route rules: "
-                + ", ".join(sorted(unknown_rules))
+                "pipeline enables unknown route rules: " + ", ".join(sorted(unknown_rules))
             )
 
         enabled_workers = {
@@ -1833,9 +1844,7 @@ class NightScoutRuntime:
         self._artifact_root = artifact_root
         self._sensitive_root = sensitive_root
 
-        effective_disabled_workers: set[str] = set(
-            set(pipeline.workers) - enabled_workers
-        )
+        effective_disabled_workers: set[str] = set(set(pipeline.workers) - enabled_workers)
 
         # Nuclei is fail-closed if no explicit audited manifest is available.
         nuclei_catalog: LocalAuditedTemplateCatalog | None = None
@@ -1846,14 +1855,11 @@ class NightScoutRuntime:
                 template_data.get("manifest", "configs/nuclei-templates.yaml")
             )
             if not manifest.is_file():
-                example = manifest.with_name(
-                    manifest.name.replace(".yaml", ".example.yaml")
-                )
+                example = manifest.with_name(manifest.name.replace(".yaml", ".example.yaml"))
                 if example.is_file():
                     manifest = example
                     self.warnings.append(
-                        "Nuclei audited manifest missing; using empty/example manifest: "
-                        f"{manifest}"
+                        f"Nuclei audited manifest missing; using empty/example manifest: {manifest}"
                     )
                 else:
                     effective_disabled_workers.add("nuclei")
@@ -1866,9 +1872,7 @@ class NightScoutRuntime:
                     templates_root=cfg.resolve_resource(
                         template_data.get("root", "nuclei-templates")
                     ),
-                    max_template_bytes=int(
-                        template_data.get("max_template_bytes", 1024 * 1024)
-                    ),
+                    max_template_bytes=int(template_data.get("max_template_bytes", 1024 * 1024)),
                 )
 
         self.event_bus = RuntimeEventBus(
@@ -1912,14 +1916,10 @@ class NightScoutRuntime:
             decisions=self.decisions,
         )
 
-        descriptor_provider = StaticActionDescriptorProvider(
-            list(default_recon_descriptor_rules())
-        )
+        descriptor_provider = StaticActionDescriptorProvider(list(default_recon_descriptor_rules()))
         restrictions = RestrictionsGate(
             engine=RestrictionEngine(
-                list(pipeline.restrictions.rules)
-                if pipeline.restrictions.enabled
-                else []
+                list(pipeline.restrictions.rules) if pipeline.restrictions.enabled else []
             ),
             descriptors=descriptor_provider,
             recorder=RestrictionDecisionAuditRecorder(self.decisions),
@@ -1963,9 +1963,7 @@ class NightScoutRuntime:
             budget_store,
             profile=budget_profile,
         )
-        initial_tier = SearchTier(
-            str(pipeline.exploration.get("initial_tier", "SMALL")).upper()
-        )
+        initial_tier = SearchTier(str(pipeline.exploration.get("initial_tier", "SMALL")).upper())
         maximum_tier = SearchTier(
             str(pipeline.exploration.get("maximum_tier", "EXHAUSTIVE")).upper()
         )
@@ -1976,9 +1974,7 @@ class NightScoutRuntime:
             yield_model=self.yield_model,
             budget_inspector=budget_inspector,
             state_store=self.intelligence.convergence_store,
-            config=ConvergenceConfig.model_validate(
-                pipeline.intelligence.get("convergence", {})
-            ),
+            config=ConvergenceConfig.model_validate(pipeline.intelligence.get("convergence", {})),
             maximum_tier=maximum_tier,
         )
 
@@ -2019,18 +2015,13 @@ class NightScoutRuntime:
             executor=executor,
             budget_planner=budget_planner,
             task_lease_for=timedelta(seconds=runtime_cfg.task_lease_seconds),
-            heartbeat_interval=timedelta(
-                seconds=runtime_cfg.heartbeat_interval_seconds
-            ),
-            review_coordinator=RuntimeLifecycleReviewCoordinator(
-                self.review_store
-            ),
+            heartbeat_interval=timedelta(seconds=runtime_cfg.heartbeat_interval_seconds),
+            review_coordinator=RuntimeLifecycleReviewCoordinator(self.review_store),
+            attempt_observer=self.attempt_observer,
         )
 
         await self.lifecycle.recover_expired(
-            task_retry_delay=timedelta(
-                seconds=runtime_cfg.recover_retry_delay_seconds
-            )
+            task_retry_delay=timedelta(seconds=runtime_cfg.recover_retry_delay_seconds)
         )
         await self.rate_limiter.reap_expired()
         return self
@@ -2052,7 +2043,10 @@ class NightScoutRuntime:
         def section(name: str) -> dict[str, Any]:
             return pipeline.workers.get(name, {})
 
-        if pipeline.workers.get("passive_domains", {}).get("enabled") and "passive_domains" not in disabled:
+        if (
+            pipeline.workers.get("passive_domains", {}).get("enabled")
+            and "passive_domains" not in disabled
+        ):
             raw = section("passive_domains")
             result["passive_domains"] = PassiveDomainsWorker(
                 events=self.events,
@@ -2071,7 +2065,10 @@ class NightScoutRuntime:
                 config=DNSWorkerConfig.model_validate(raw.get("config", {})),
             )
 
-        if pipeline.workers.get("permutations", {}).get("enabled") and "permutations" not in disabled:
+        if (
+            pipeline.workers.get("permutations", {}).get("enabled")
+            and "permutations" not in disabled
+        ):
             raw = section("permutations")
             result["permutations"] = PermutationsWorker(
                 events=self.events,
@@ -2172,13 +2169,15 @@ class NightScoutRuntime:
                 candidates=WordlistVHostCandidateProvider(words=corpus),
                 candidate_scope=ScopeEngineVHostCandidateScopeProvider(self.scope_engine),
                 rate_limiter=self.rate_limiter,
-                backend=HttpxVHostBackend(
-                    HttpxVHostConfig.model_validate(raw.get("backend", {}))
-                ),
+                backend=HttpxVHostBackend(HttpxVHostConfig.model_validate(raw.get("backend", {}))),
                 config=VHostWorkerConfig.model_validate(raw.get("config", {})),
             )
 
-        if pipeline.workers.get("nuclei", {}).get("enabled") and "nuclei" not in disabled and nuclei_catalog is not None:
+        if (
+            pipeline.workers.get("nuclei", {}).get("enabled")
+            and "nuclei" not in disabled
+            and nuclei_catalog is not None
+        ):
             raw = section("nuclei")
             result["nuclei"] = NucleiWorker(
                 events=self.events,
@@ -2186,9 +2185,7 @@ class NightScoutRuntime:
                 rate_limiter=self.rate_limiter,
                 templates=nuclei_catalog,
                 request_scope=ScopeEngineNucleiRequestScopeProvider(self.scope_engine),
-                backend=NucleiBackend(
-                    NucleiBackendConfig.model_validate(raw.get("backend", {}))
-                ),
+                backend=NucleiBackend(NucleiBackendConfig.model_validate(raw.get("backend", {}))),
                 config=NucleiWorkerConfig.model_validate(raw.get("config", {})),
             )
 
@@ -2207,11 +2204,7 @@ class NightScoutRuntime:
                 artifacts=WorkspaceMobileArtifactProvider(artifact_root),
                 config=mobile_config,
                 jadx=(JadxDecompiler() if mobile_config.enable_jadx else None),
-                apktool=(
-                    ApktoolDecompiler()
-                    if mobile_config.enable_apktool_fallback
-                    else None
-                ),
+                apktool=(ApktoolDecompiler() if mobile_config.enable_apktool_fallback else None),
                 secret_scanners=tuple(scanners),
                 sensitive_evidence=(
                     WorkspaceSensitiveEvidenceStore(sensitive_root)
@@ -2220,7 +2213,10 @@ class NightScoutRuntime:
                 ),
             )
 
-        if pipeline.workers.get("fingerprints", {}).get("enabled") and "fingerprints" not in disabled:
+        if (
+            pipeline.workers.get("fingerprints", {}).get("enabled")
+            and "fingerprints" not in disabled
+        ):
             raw = section("fingerprints")
             result["fingerprints"] = FingerprintWorker(
                 events=self.events,
@@ -2251,9 +2247,7 @@ class NightScoutRuntime:
 
         mode = seed_spec.mode.value if seed_spec is not None else "EXPLICIT"
         source_rule_ids = (
-            seed_spec.source_rule_ids
-            if seed_spec is not None
-            else decision.matched_rule_ids
+            seed_spec.source_rule_ids if seed_spec is not None else decision.matched_rule_ids
         )
         event = Event(
             type=EventType.ROOT_DOMAIN,
@@ -2369,6 +2363,7 @@ class NightScoutRuntime:
         )
         self.event_bus.set_run_id(self._run_id)
         self.task_store.set_run_id(self._run_id)
+        self.attempt_observer.set_run_id(self._run_id)
         run_id = self._run_id
         limit = max_steps or self.configuration.pipeline.runtime.max_steps
         steps = 0
@@ -2421,9 +2416,7 @@ class NightScoutRuntime:
                         0.0,
                         (next_ready_at - utc_now()).total_seconds(),
                     )
-                    max_wait = (
-                        self.configuration.pipeline.runtime.max_deferred_wait_seconds
-                    )
+                    max_wait = self.configuration.pipeline.runtime.max_deferred_wait_seconds
                     if wait_seconds > max_wait:
                         paused_deferred = True
                         next_resume_at = next_ready_at
@@ -2436,9 +2429,7 @@ class NightScoutRuntime:
                                 max_steps=limit,
                                 wait_seconds=wait_seconds,
                                 next_resume_at=next_ready_at,
-                                reason=(
-                                    "deferred task exceeds this run's maximum wait"
-                                ),
+                                reason=("deferred task exceeds this run's maximum wait"),
                             ),
                         )
                         break
@@ -2497,11 +2488,13 @@ class NightScoutRuntime:
             max_steps_reached = steps >= limit and not stopped_idle
             if max_steps_reached and next_resume_at is None:
                 next_resume_at = await self.task_store.next_ready_at()
-            run_status = (
-                "PAUSED"
-                if paused_deferred or next_resume_at is not None
-                else "SUCCEEDED"
-            )
+            unfinished_frontier = any(not task.is_terminal for task in await self.task_store.all())
+            if outcomes[LifecycleOutcome.FAILED.value] > 0:
+                run_status = "FAILED"
+            elif paused_deferred or next_resume_at is not None or unfinished_frontier:
+                run_status = "PAUSED"
+            else:
+                run_status = "SUCCEEDED"
             await self.runs.finish(run_id, status=run_status)
             status = await self.status(run_id=run_id)
 
@@ -2528,6 +2521,7 @@ class NightScoutRuntime:
                 paused_deferred=paused_deferred,
                 next_resume_at=next_resume_at,
                 task_counts=status.task_counts,
+                attempt_counts=status.attempt_counts,
                 event_count=status.event_count,
                 asset_count=status.asset_count,
                 open_review_cases=status.open_review_cases,
@@ -2551,6 +2545,7 @@ class NightScoutRuntime:
         finally:
             self.event_bus.set_run_id(None)
             self.task_store.set_run_id(None)
+            self.attempt_observer.set_run_id(None)
             self._run_id = None
 
     async def run_domain(
@@ -2581,6 +2576,7 @@ class NightScoutRuntime:
             paused_deferred=program.paused_deferred,
             next_resume_at=program.next_resume_at,
             task_counts=program.task_counts,
+            attempt_counts=program.attempt_counts,
             event_count=program.event_count,
             asset_count=program.asset_count,
             open_review_cases=program.open_review_cases,
@@ -2598,10 +2594,7 @@ class NightScoutRuntime:
         try:
             callback(item)
         except Exception as exc:
-            self.warnings.append(
-                "progress callback failed: "
-                f"{type(exc).__name__}: {exc}"
-            )
+            self.warnings.append(f"progress callback failed: {type(exc).__name__}: {exc}")
 
     def _emit_lifecycle_progress(
         self,
@@ -2663,6 +2656,9 @@ class NightScoutRuntime:
                 task_run_filter = or_(
                     TaskRecord.run_id == run_id,
                     TaskRecord.execution_run_id == run_id,
+                    TaskRecord.task_id.in_(
+                        select(TaskAttemptRecord.task_id).where(TaskAttemptRecord.run_id == run_id)
+                    ),
                 )
                 task_rows = list(
                     (
@@ -2673,9 +2669,7 @@ class NightScoutRuntime:
                         )
                     ).all()
                 )
-                task_counts = Counter(
-                    {str(status): int(count) for status, count in task_rows}
-                )
+                task_counts = Counter({str(status): int(count) for status, count in task_rows})
                 open_review_count = int(
                     await session.scalar(
                         select(func.count(ReviewCaseRecord.case_id))
@@ -2692,27 +2686,46 @@ class NightScoutRuntime:
                 )
                 event_filter = (EventObservationRecord.run_id == run_id,)
 
+            attempt_conditions = (TaskAttemptRecord.run_id == run_id,) if run_id is not None else ()
+            attempt_rows = list(
+                (
+                    await session.execute(
+                        select(
+                            TaskAttemptRecord.outcome,
+                            func.count(TaskAttemptRecord.attempt_id),
+                        )
+                        .where(
+                            TaskAttemptRecord.outcome.is_not(None),
+                            *attempt_conditions,
+                        )
+                        .group_by(TaskAttemptRecord.outcome)
+                    )
+                ).all()
+            )
+            attempt_counts = {
+                str(outcome): int(count) for outcome, count in attempt_rows if outcome is not None
+            }
+
             event_count = int(
                 await session.scalar(
-                    select(func.count(EventObservationRecord.event_id)).where(
-                        *event_filter
-                    )
+                    select(func.count(EventObservationRecord.event_id)).where(*event_filter)
                 )
                 or 0
             )
             asset_statement = (
                 select(func.count(AssetRecord.asset_id))
                 if run_id is None
-                else select(
-                    func.count(func.distinct(EventObservationRecord.asset_id))
-                ).where(*event_filter)
+                else select(func.count(func.distinct(EventObservationRecord.asset_id))).where(
+                    *event_filter
+                )
             )
             asset_count = int(await session.scalar(asset_statement) or 0)
             run_rows = list(
                 (
                     await session.execute(
-                        select(ReconRunRecord.status, func.count(ReconRunRecord.run_id))
-                        .group_by(ReconRunRecord.status)
+                        select(ReconRunRecord.status, func.count(ReconRunRecord.run_id)).group_by(
+                            ReconRunRecord.status
+                        )
                     )
                 ).all()
             )
@@ -2722,6 +2735,7 @@ class NightScoutRuntime:
             event_count=event_count,
             asset_count=asset_count,
             task_counts=dict(sorted(task_counts.items())),
+            attempt_counts=dict(sorted(attempt_counts.items())),
             open_review_cases=open_review_count,
             run_counts={str(status): int(count) for status, count in run_rows},
             warnings=tuple(dict.fromkeys(self.warnings)),
@@ -2757,9 +2771,7 @@ class NightScoutRuntime:
             TaskStatus.PENDING,
             TaskStatus.DEFERRED,
         }:
-            raise ValueError(
-                f"review task cannot be approved from state {task.status.value}"
-            )
+            raise ValueError(f"review task cannot be approved from state {task.status.value}")
 
         review_case = await self._resolve_review_case(
             case_id,
@@ -2825,9 +2837,7 @@ class NightScoutRuntime:
         if existing.state is state:
             return existing
         if existing.state is not ReviewCaseState.OPEN:
-            raise ValueError(
-                f"review case {normalized} is already {existing.state.value}"
-            )
+            raise ValueError(f"review case {normalized} is already {existing.state.value}")
         return await self.review_store.resolve(
             normalized,
             state=state,
@@ -2961,9 +2971,7 @@ class NightScoutRuntime:
 
         if fmt == "text":
             destination = output or self.configuration.resolve(
-                self.configuration.pipeline.exports.get("text", {}).get(
-                    "directory", "exports/text"
-                )
+                self.configuration.pipeline.exports.get("text", {}).get("directory", "exports/text")
             )
             return await export_text_bundle(
                 events,
@@ -2977,9 +2985,7 @@ class NightScoutRuntime:
 
         if fmt == "csv":
             destination = output or self.configuration.resolve(
-                self.configuration.pipeline.exports.get("csv", {}).get(
-                    "directory", "exports/csv"
-                )
+                self.configuration.pipeline.exports.get("csv", {}).get("directory", "exports/csv")
             )
             return await export_csv_bundle(
                 events,
@@ -3045,9 +3051,7 @@ def load_runtime_configuration(
                 else resolve_project_path(project_root, configured_scope)
             )
     else:
-        raise ValueError(
-            "scope config is required: set pipeline.scope_file or pass --scope"
-        )
+        raise ValueError("scope config is required: set pipeline.scope_file or pass --scope")
 
     if not scope_file.is_file():
         raise FileNotFoundError(f"scope config not found: {scope_file}")
@@ -3265,7 +3269,8 @@ def doctor_from_files(
     )
 
     try:
-        import aiosqlite  # type: ignore[import-not-found]  # noqa: F401
+        import aiosqlite  # noqa: F401
+
         aiosqlite_ok = True
     except Exception:
         aiosqlite_ok = False
@@ -3310,6 +3315,7 @@ def doctor_from_files(
             )
         )
     else:
+        assert tools_manifest is not None
         activate_managed_tool_path(tools_manifest)
         checks.append(
             DoctorCheck(
@@ -3330,9 +3336,8 @@ def doctor_from_files(
                 required = False
             elif enabled_workers:
                 should_check = True
-                required = (
-                    spec.requirement is ToolRequirement.REQUIRED
-                    or any(worker != "mobile" for worker in enabled_workers)
+                required = spec.requirement is ToolRequirement.REQUIRED or any(
+                    worker != "mobile" for worker in enabled_workers
                 )
             else:
                 should_check = False
@@ -3363,11 +3368,7 @@ def doctor_from_files(
                     name=f"tool:{spec.tool_id}",
                     ok=ok,
                     required=required,
-                    detail=(
-                        f"{status.path}; {status.detail}"
-                        if status.path
-                        else status.detail
-                    ),
+                    detail=(f"{status.path}; {status.detail}" if status.path else status.detail),
                 )
             )
 

@@ -79,8 +79,8 @@ from recon.core.router import RouteRule, RoutingContext
 from recon.policy.rate_limit import (
     RateLimitContext,
     RateLimitDemand,
-    RateLimitOutcome,
     RateLimiter,
+    RateLimitOutcome,
     tool_integer_rps_hint,
 )
 from recon.policy.scope import (
@@ -97,7 +97,6 @@ from recon.workers.permutations import (
     InMemoryExplorationCursorStore,
     WordCorpusProvider,
 )
-
 
 WORKER_NAME = "vhost"
 ACTION_DISCOVER_TARGETED = "discover_targeted"
@@ -330,7 +329,7 @@ class VHostProbeBackend(Protocol):
     def ensure_available(self) -> None:
         ...
 
-    async def probe(
+    def probe(
         self,
         service: VHostService,
         *,
@@ -1010,7 +1009,7 @@ class VHostWorker:
             # Crucial fail-closed boundary: generated controls are active Host
             # values too. If either one is not explicitly IN_SCOPE, do not use
             # a less reliable known-host baseline and do not test this group.
-            control_decisions = []
+            control_decisions: list[ScopeDecision] = []
 
             for control in controls:
                 decision = await self._candidate_scope.classify(
@@ -1485,6 +1484,8 @@ def service_from_event(
         raise ValueError("HTTP_SERVICE metadata.scheme is required")
 
     try:
+        if not isinstance(raw_port, (int, str)):
+            raise TypeError
         port = int(raw_port)
     except (TypeError, ValueError) as exc:
         raise ValueError(

@@ -119,9 +119,7 @@ class UTCDateTime(TypeDecorator[datetime]):
         parsed = datetime.fromisoformat(value)
 
         if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise ValueError(
-                "database contained a timezone-naive Night Scout timestamp"
-            )
+            raise ValueError("database contained a timezone-naive Night Scout timestamp")
 
         return parsed.astimezone(timezone.utc)
 
@@ -892,10 +890,58 @@ class TaskRecord(Base):
             "uq_tasks_active_dedupe",
             "dedupe_key",
             unique=True,
-            sqlite_where=text(
-                "status IN ('PENDING', 'RUNNING', 'DEFERRED', 'REVIEW')"
-            ),
+            sqlite_where=text("status IN ('PENDING', 'RUNNING', 'DEFERRED', 'REVIEW')"),
         ),
+    )
+
+
+class TaskAttemptRecord(Base):
+    """Append-only attribution of one selected task to one recon run."""
+
+    __tablename__ = "task_attempts"
+
+    attempt_id: Mapped[str] = mapped_column(
+        String(40),
+        primary_key=True,
+        default=lambda: _new_id("att"),
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("recon_runs.run_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    task_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("tasks.task_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    worker: Mapped[str] = mapped_column(String(128), nullable=False)
+    action: Mapped[str] = mapped_column(String(128), nullable=False)
+    selected_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        nullable=False,
+        default=utc_now,
+        index=True,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(),
+        nullable=True,
+    )
+    outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    queue_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reservation_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    claimed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    execution_attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "execution_attempt IS NULL OR execution_attempt >= 1",
+            name="task_attempt_execution_positive",
+        ),
+        Index("ix_task_attempts_run_task", "run_id", "task_id"),
     )
 
 

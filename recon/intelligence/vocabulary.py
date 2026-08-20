@@ -973,6 +973,7 @@ class VocabularyProjector:
                     "issuer_cn",
                     "issuer_org",
                 ):
+                    values: tuple[Any, ...]
                     raw = event.metadata.get(
                         key
                     )
@@ -1042,26 +1043,26 @@ class VocabularyProjector:
                         )
                     ).strip().lower()
 
-                    values = slot.get(
+                    slot_values: Any = slot.get(
                         "values"
                     )
 
                     if isinstance(
-                        values,
+                        slot_values,
                         str,
                     ):
-                        values = (
-                            values,
+                        slot_values = (
+                            slot_values,
                         )
 
                     if not isinstance(
-                        values,
+                        slot_values,
                         (list, tuple, set),
                     ):
                         continue
 
                     for raw in list(
-                        values
+                        slot_values
                     )[
                         : self.config.max_pattern_slot_values
                     ]:
@@ -2606,9 +2607,9 @@ def event_occurrence_count(
         )
 
         try:
-            value = int(
-                raw
-            )
+            if not isinstance(raw, (int, str)):
+                continue
+            value = int(raw)
         except (
             TypeError,
             ValueError,

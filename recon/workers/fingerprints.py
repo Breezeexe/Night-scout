@@ -30,7 +30,6 @@ from recon.core.lifecycle import WorkerExecutionResult, WorkerOutcome
 from recon.core.queue import Task, TaskStatus
 from recon.core.router import RouteRule, RoutingContext
 
-
 WORKER_NAME = "fingerprints"
 ACTION_ANALYZE = "analyze"
 
@@ -999,6 +998,7 @@ def normalize_text_list(
     *,
     limit: int,
 ) -> tuple[str, ...]:
+    values: tuple[Any, ...]
     if isinstance(
         value,
         str,
@@ -1056,6 +1056,7 @@ def normalize_dnsish_list(
     *,
     limit: int,
 ) -> tuple[str, ...]:
+    values: tuple[Any, ...]
     if isinstance(
         value,
         str,

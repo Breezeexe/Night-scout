@@ -69,6 +69,7 @@ import shutil
 import tempfile
 from collections import deque
 from collections.abc import Sequence
+from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
@@ -83,13 +84,12 @@ from recon.core.router import RouteRule
 from recon.policy.rate_limit import (
     RateLimitContext,
     RateLimitDemand,
+    RateLimiter,
     RateLimitOutcome,
     RateLimitPlan,
-    RateLimiter,
 )
 from recon.workers.http import normalize_http_url
 from recon.workers.passive_domains import normalize_dns_name
-
 
 WORKER_NAME = "parameters"
 ACTION_DISCOVER_TARGETED = "discover_targeted"
@@ -1056,10 +1056,11 @@ def parse_arjun_json_file(
 
         raw_params = data.get("params", ())
 
+        raw_values: tuple[Any, ...]
         if isinstance(raw_params, dict):
-            raw_values = raw_params.keys()
+            raw_values = tuple(raw_params)
         elif isinstance(raw_params, (list, tuple, set)):
-            raw_values = raw_params
+            raw_values = tuple(raw_params)
         elif isinstance(raw_params, str):
             raw_values = (raw_params,)
         else:
@@ -1198,9 +1199,7 @@ def _exploration_namespace(target_url: str) -> str:
 
 def _parameter_lease_duration(
     config: ParameterDiscoveryConfig,
-):
-    from datetime import timedelta
-
+) -> timedelta:
     return timedelta(
         seconds=(
             config.process_timeout_seconds

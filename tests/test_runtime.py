@@ -54,9 +54,13 @@ async def test_recursive_local_runtime_survives_migration_bootstrap(tmp_path, pr
     try:
         summary = await runtime.run_domain("example.com", max_steps=10)
         assert summary.event_count >= 1
+        assert summary.attempt_counts.get(LifecycleOutcome.SUCCEEDED.value, 0) >= 1
         tasks = await runtime.task_store.all()
         assert tasks
-        assert all(task.status in {TaskStatus.SUCCEEDED, TaskStatus.BLOCKED, TaskStatus.REVIEW} for task in tasks)
+        assert all(
+            task.status in {TaskStatus.SUCCEEDED, TaskStatus.BLOCKED, TaskStatus.REVIEW}
+            for task in tasks
+        )
         assert any(task.status is TaskStatus.SUCCEEDED for task in tasks)
     finally:
         await runtime.close()
@@ -77,9 +81,7 @@ async def test_program_restriction_review_can_be_listed_approved_and_executed(
         project_root / "configs" / "scope.example.yaml",
         root / "configs" / "scope.yaml",
     )
-    pipeline = yaml.safe_load(
-        (project_root / "configs" / "pipeline.example.yaml").read_text()
-    )
+    pipeline = yaml.safe_load((project_root / "configs" / "pipeline.example.yaml").read_text())
     pipeline["scope_file"] = "configs/scope.yaml"
     pipeline["storage"]["database"]["path"] = "review.sqlite3"
     pipeline["storage"]["event_log"]["enabled"] = False
@@ -117,6 +119,8 @@ async def test_program_restriction_review_can_be_listed_approved_and_executed(
     try:
         summary = await runtime.run_domain("example.com", max_steps=1)
         assert summary.outcomes == {LifecycleOutcome.REVIEW.value: 1}
+        assert summary.attempt_counts == {LifecycleOutcome.REVIEW.value: 1}
+        assert summary.status == "PAUSED"
         cases = await runtime.list_review_cases()
         assert len(cases) == 1
         assert "manual-permutations" in cases[0].summaries[0]
@@ -180,9 +184,7 @@ async def test_scope_review_always_creates_approvable_review_case(
         project_root / "configs" / "scope.example.yaml",
         root / "configs" / "scope.yaml",
     )
-    pipeline = yaml.safe_load(
-        (project_root / "configs" / "pipeline.example.yaml").read_text()
-    )
+    pipeline = yaml.safe_load((project_root / "configs" / "pipeline.example.yaml").read_text())
     pipeline["scope_file"] = "configs/scope.yaml"
     pipeline["storage"]["database"]["path"] = "scope-review.sqlite3"
     pipeline["storage"]["event_log"]["enabled"] = False
@@ -246,16 +248,12 @@ async def test_disabled_exploration_removes_routes_and_blocks_old_frontier(
         project_root / "configs" / "scope.example.yaml",
         root / "configs" / "scope.yaml",
     )
-    pipeline = yaml.safe_load(
-        (project_root / "configs" / "pipeline.example.yaml").read_text()
-    )
+    pipeline = yaml.safe_load((project_root / "configs" / "pipeline.example.yaml").read_text())
     pipeline["scope_file"] = "configs/scope.yaml"
     pipeline["storage"]["database"]["path"] = "disabled.sqlite3"
     pipeline["storage"]["event_log"]["enabled"] = False
     pipeline["exploration"]["enabled"] = False
-    pipeline["routing"]["enabled_rule_ids"] = [
-        "permutations.root.exploration"
-    ]
+    pipeline["routing"]["enabled_rule_ids"] = ["permutations.root.exploration"]
     for worker in pipeline["workers"].values():
         worker["enabled"] = False
     pipeline["workers"]["permutations"]["enabled"] = True
@@ -302,9 +300,7 @@ async def test_runtime_search_tier_controls_worker_candidate_limit(
         root / "configs" / "scope.yaml",
     )
     shutil.copytree(project_root / "wordlists", root / "wordlists")
-    pipeline = yaml.safe_load(
-        (project_root / "configs" / "pipeline.example.yaml").read_text()
-    )
+    pipeline = yaml.safe_load((project_root / "configs" / "pipeline.example.yaml").read_text())
     pipeline["scope_file"] = "configs/scope.yaml"
     pipeline["storage"]["database"]["path"] = "tiered.sqlite3"
     pipeline["storage"]["event_log"]["enabled"] = False
@@ -319,9 +315,7 @@ async def test_runtime_search_tier_controls_worker_candidate_limit(
     pipeline["exploration"].update(
         {"enabled": True, "initial_tier": "MICRO", "maximum_tier": "MICRO"}
     )
-    pipeline["routing"]["enabled_rule_ids"] = [
-        "permutations.root.exploration"
-    ]
+    pipeline["routing"]["enabled_rule_ids"] = ["permutations.root.exploration"]
     for worker in pipeline["workers"].values():
         worker["enabled"] = False
     pipeline["workers"]["permutations"]["enabled"] = True
@@ -343,10 +337,7 @@ async def test_runtime_search_tier_controls_worker_candidate_limit(
             progress=updates.append,
         )
         assert summary.outcomes == {LifecycleOutcome.SUCCEEDED.value: 1}
-        assert any(
-            item.phase == "EXECUTING" and item.worker == "permutations"
-            for item in updates
-        )
+        assert any(item.phase == "EXECUTING" and item.worker == "permutations" for item in updates)
         async with runtime.database.session() as session:
             rows = list(
                 (
@@ -377,9 +368,7 @@ async def test_persistent_frontier_keeps_origin_and_attributes_resume_to_new_run
         root / "configs" / "scope.yaml",
     )
     shutil.copytree(project_root / "wordlists", root / "wordlists")
-    pipeline = yaml.safe_load(
-        (project_root / "configs" / "pipeline.example.yaml").read_text()
-    )
+    pipeline = yaml.safe_load((project_root / "configs" / "pipeline.example.yaml").read_text())
     pipeline["scope_file"] = "configs/scope.yaml"
     pipeline["storage"]["database"]["path"] = "resume.sqlite3"
     pipeline["storage"]["event_log"]["enabled"] = False
@@ -435,9 +424,7 @@ async def test_persistent_frontier_keeps_origin_and_attributes_resume_to_new_run
 
         global_status = await runtime.status()
         assert global_status.event_count > second.event_count
-        assert sum(global_status.task_counts.values()) > sum(
-            second.task_counts.values()
-        )
+        assert sum(global_status.task_counts.values()) > sum(second.task_counts.values())
     finally:
         await runtime.close()
 
@@ -455,9 +442,7 @@ async def test_resume_frontier_false_rejects_hidden_active_frontier(
         root / "configs" / "scope.yaml",
     )
     shutil.copytree(project_root / "wordlists", root / "wordlists")
-    pipeline = yaml.safe_load(
-        (project_root / "configs" / "pipeline.example.yaml").read_text()
-    )
+    pipeline = yaml.safe_load((project_root / "configs" / "pipeline.example.yaml").read_text())
     pipeline["scope_file"] = "configs/scope.yaml"
     pipeline["storage"]["database"]["path"] = "isolated.sqlite3"
     pipeline["storage"]["event_log"]["enabled"] = False
@@ -510,9 +495,7 @@ async def test_runtime_waits_for_short_deferred_frontier(
         root / "configs" / "scope.yaml",
     )
     shutil.copytree(project_root / "wordlists", root / "wordlists")
-    pipeline = yaml.safe_load(
-        (project_root / "configs" / "pipeline.example.yaml").read_text()
-    )
+    pipeline = yaml.safe_load((project_root / "configs" / "pipeline.example.yaml").read_text())
     pipeline["scope_file"] = "configs/scope.yaml"
     pipeline["storage"]["database"]["path"] = "deferred.sqlite3"
     pipeline["storage"]["event_log"]["enabled"] = False
@@ -599,5 +582,23 @@ async def test_runtime_waits_for_short_deferred_frontier(
         assert paused.status == "PAUSED"
         assert paused.paused_deferred is True
         assert paused.next_resume_at is not None
+
+        class FailedLifecycle:
+            def __init__(self) -> None:
+                self.results = iter(
+                    (
+                        LifecycleResult(outcome=LifecycleOutcome.FAILED),
+                        LifecycleResult(outcome=LifecycleOutcome.IDLE),
+                    )
+                )
+
+            async def run_once(self, *, on_claimed=None) -> LifecycleResult:
+                del on_claimed
+                return next(self.results)
+
+        monkeypatch.setattr(runtime, "lifecycle", FailedLifecycle())
+        failed = await runtime.run_domain("example.com", max_steps=3)
+        assert failed.status == "FAILED"
+        assert failed.outcomes[LifecycleOutcome.FAILED.value] == 1
     finally:
         await runtime.close()

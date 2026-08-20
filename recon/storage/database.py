@@ -39,11 +39,11 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import Select, or_, select, text, update
+from sqlalchemy import Select, func, or_, select, text, update
 from sqlalchemy import event as sa_event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
@@ -105,6 +105,7 @@ from recon.storage.models import (
     ReviewCaseRecord,
     ReviewSignalRecord,
     SchedulerDecisionRecord,
+    TaskAttemptRecord,
     TaskRecord,
 )
 
@@ -140,9 +141,7 @@ class Database:
 
         synchronous = config.synchronous.strip().upper()
         if synchronous not in {"OFF", "NORMAL", "FULL", "EXTRA"}:
-            raise ValueError(
-                "synchronous must be OFF, NORMAL, FULL, or EXTRA"
-            )
+            raise ValueError("synchronous must be OFF, NORMAL, FULL, or EXTRA")
 
         path = config.path.expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -296,8 +295,7 @@ class EventRepository:
                     or existing_observation.source != event.source
                 ):
                     raise ValueError(
-                        f"event_id {event.event_id} already refers to a "
-                        "different observation"
+                        f"event_id {event.event_id} already refers to a different observation"
                     )
 
                 asset = await session.get(
@@ -305,9 +303,7 @@ class EventRepository:
                     existing_observation.asset_id,
                 )
                 if asset is None:
-                    raise RuntimeError(
-                        "event observation references missing asset"
-                    )
+                    raise RuntimeError("event observation references missing asset")
 
                 self._merge_asset(asset, event)
                 self._merge_observation(existing_observation, event)
@@ -320,9 +316,7 @@ class EventRepository:
                 )
 
             asset = await session.scalar(
-                select(AssetRecord).where(
-                    AssetRecord.identity_key == event.identity_key
-                )
+                select(AssetRecord).where(AssetRecord.identity_key == event.identity_key)
             )
 
             asset_created = False
@@ -382,10 +376,13 @@ class EventRepository:
     async def asset_id_for_event(self, event_id: str) -> str | None:
         """Return canonical asset id represented by an event observation."""
         async with self._database.session() as session:
-            return await session.scalar(
-                select(EventObservationRecord.asset_id).where(
-                    EventObservationRecord.event_id == event_id
-                )
+            return cast(
+                str | None,
+                await session.scalar(
+                    select(EventObservationRecord.asset_id).where(
+                        EventObservationRecord.event_id == event_id
+                    )
+                ),
             )
 
     async def observations_for_asset(
@@ -398,9 +395,7 @@ class EventRepository:
                 (
                     await session.scalars(
                         select(EventObservationRecord)
-                        .where(
-                            EventObservationRecord.asset_id == asset_id
-                        )
+                        .where(EventObservationRecord.asset_id == asset_id)
                         .order_by(
                             EventObservationRecord.first_seen,
                             EventObservationRecord.event_id,
@@ -423,9 +418,7 @@ class EventRepository:
             event.scope_state,
         ).value
 
-        asset.tags_json = sorted(
-            set(asset.tags_json) | set(event.tags)
-        )
+        asset.tags_json = sorted(set(asset.tags_json) | set(event.tags))
 
         # Canonical metadata is a convenience summary only; exact source data
         # remains intact on every EventObservationRecord.
@@ -458,9 +451,7 @@ class EventRepository:
             ScopeState(observation.scope_state),
             event.scope_state,
         ).value
-        observation.tags_json = sorted(
-            set(observation.tags_json) | set(event.tags)
-        )
+        observation.tags_json = sorted(set(observation.tags_json) | set(event.tags))
 
         merged_metadata = dict(observation.metadata_json)
         merged_metadata.update(event.metadata)
@@ -506,10 +497,7 @@ class SQLiteTaskStore:
                         TaskRecord.dedupe_key == task.dedupe_key,
                         or_(
                             TaskRecord.status.not_in(
-                                tuple(
-                                    status.value
-                                    for status in TERMINAL_TASK_STATUSES
-                                )
+                                tuple(status.value for status in TERMINAL_TASK_STATUSES)
                             ),
                             (
                                 TaskRecord.run_id.is_(None)
@@ -561,14 +549,9 @@ class SQLiteTaskStore:
                 else:
                     conditions.append(TaskRecord.claim_token == expected_claim_token)
                 if expected_lease_expires_at is not None:
-                    conditions.append(
-                        TaskRecord.lease_expires_at == expected_lease_expires_at
-                    )
+                    conditions.append(TaskRecord.lease_expires_at == expected_lease_expires_at)
                 statement = (
-                    update(TaskRecord)
-                    .where(*conditions)
-                    .values(**values)
-                    .returning(TaskRecord)
+                    update(TaskRecord).where(*conditions).values(**values).returning(TaskRecord)
                 )
                 record = (await session.execute(statement)).scalar_one_or_none()
                 if record is not None:
@@ -584,8 +567,7 @@ class SQLiteTaskStore:
             duplicate = await self.active_by_dedupe_key(task.dedupe_key)
             if duplicate is not None and duplicate.task_id != task.task_id:
                 raise ValueError(
-                    "active task already exists for dedupe key: "
-                    f"{task.dedupe_key}"
+                    f"active task already exists for dedupe key: {task.dedupe_key}"
                 ) from exc
             raise
 
@@ -606,9 +588,7 @@ class SQLiteTaskStore:
                 update(TaskRecord)
                 .where(
                     TaskRecord.task_id == task_id,
-                    TaskRecord.status.in_(
-                        (TaskStatus.PENDING.value, TaskStatus.DEFERRED.value)
-                    ),
+                    TaskRecord.status.in_((TaskStatus.PENDING.value, TaskStatus.DEFERRED.value)),
                     TaskRecord.available_at <= now,
                     TaskRecord.attempts < TaskRecord.max_attempts,
                 )
@@ -637,8 +617,7 @@ class SQLiteTaskStore:
                 TaskStatus.DEFERRED.value,
             }:
                 raise ValueError(
-                    f"task {task_id} is not claimable from "
-                    f"{TaskStatus(current.status)}"
+                    f"task {task_id} is not claimable from {TaskStatus(current.status)}"
                 )
             if current.available_at > now:
                 raise ValueError(f"task {task_id} is not available yet")
@@ -654,10 +633,9 @@ class SQLiteTaskStore:
         _require_aware(now, name="now")
 
         ready_conditions: list[Any] = [
-            TaskRecord.status.in_(
-                (TaskStatus.PENDING.value, TaskStatus.DEFERRED.value)
-            ),
+            TaskRecord.status.in_((TaskStatus.PENDING.value, TaskStatus.DEFERRED.value)),
             TaskRecord.available_at <= now,
+            TaskRecord.attempts < TaskRecord.max_attempts,
         ]
         if not self._resume_frontier and self._run_id is not None:
             ready_conditions.append(TaskRecord.run_id == self._run_id)
@@ -667,9 +645,9 @@ class SQLiteTaskStore:
             TaskRecord.created_at,
             TaskRecord.task_id,
         )
-        statement: Select[tuple[TaskRecord]] = select(TaskRecord).where(
-            *ready_conditions
-        ).order_by(*priority_order)
+        statement: Select[tuple[TaskRecord]] = (
+            select(TaskRecord).where(*ready_conditions).order_by(*priority_order)
+        )
 
         if limit is not None:
             statement = statement.limit(limit)
@@ -679,9 +657,7 @@ class SQLiteTaskStore:
                 rows = list((await session.scalars(statement)).all())
                 return [_task_from_record(row) for row in rows]
 
-            top_count, oldest_count, exploration_count, tail_count = (
-                fair_lane_limits(limit)
-            )
+            top_count, oldest_count, exploration_count, tail_count = fair_lane_limits(limit)
             lane_statements = (
                 statement.limit(top_count),
                 select(TaskRecord)
@@ -726,9 +702,8 @@ class SQLiteTaskStore:
 
     async def next_ready_at(self) -> datetime | None:
         conditions: list[Any] = [
-            TaskRecord.status.in_(
-                (TaskStatus.PENDING.value, TaskStatus.DEFERRED.value)
-            )
+            TaskRecord.status.in_((TaskStatus.PENDING.value, TaskStatus.DEFERRED.value)),
+            TaskRecord.attempts < TaskRecord.max_attempts,
         ]
         if not self._resume_frontier and self._run_id is not None:
             conditions.append(TaskRecord.run_id == self._run_id)
@@ -747,9 +722,7 @@ class SQLiteTaskStore:
         dedupe_key: str,
     ) -> Task | None:
         active_statuses = tuple(
-            status.value
-            for status in TaskStatus
-            if status not in TERMINAL_TASK_STATUSES
+            status.value for status in TaskStatus if status not in TERMINAL_TASK_STATUSES
         )
 
         async with self._database.session() as session:
@@ -789,14 +762,14 @@ class SQLiteBudgetStore:
         checks: tuple[BudgetCheck, ...],
     ) -> tuple[bool, tuple[BudgetViolation, ...]]:
         async with self._database.transaction(immediate=True) as session:
-            if await session.get(
-                BudgetReservationRecord,
-                reservation.reservation_id,
-            ) is not None:
-                raise ValueError(
-                    "budget reservation already exists: "
-                    f"{reservation.reservation_id}"
+            if (
+                await session.get(
+                    BudgetReservationRecord,
+                    reservation.reservation_id,
                 )
+                is not None
+            ):
+                raise ValueError(f"budget reservation already exists: {reservation.reservation_id}")
 
             usages: dict[
                 tuple[str, BudgetClass, BudgetMetric],
@@ -819,9 +792,7 @@ class SQLiteBudgetStore:
                 usages[key] = usage
 
                 if (
-                    usage.committed
-                    + usage.reserved
-                    + check.requested
+                    usage.committed + usage.reserved + check.requested
                     > check.effective_limit + 1e-9
                 ):
                     violations.append(
@@ -921,8 +892,7 @@ class SQLiteBudgetStore:
                 (
                     await session.scalars(
                         select(BudgetReservationRecord).where(
-                            BudgetReservationRecord.state
-                            == ReservationState.ACTIVE.value,
+                            BudgetReservationRecord.state == ReservationState.ACTIVE.value,
                             BudgetReservationRecord.expires_at <= now,
                         )
                     )
@@ -941,9 +911,7 @@ class SQLiteBudgetStore:
                     commit_cumulative=False,
                 )
                 record.state = ReservationState.EXPIRED.value
-                expired.append(
-                    _budget_reservation_from_rows(record, items)
-                )
+                expired.append(_budget_reservation_from_rows(record, items))
 
             return expired
 
@@ -1012,9 +980,7 @@ class SQLiteBudgetStore:
     ) -> None:
         for item in items:
             if item.budget_class is None:
-                raise RuntimeError(
-                    "budget reservation item has no budget_class"
-                )
+                raise RuntimeError("budget reservation item has no budget_class")
 
             budget_class = BudgetClass(item.budget_class)
             metric = BudgetMetric(item.metric)
@@ -1024,9 +990,7 @@ class SQLiteBudgetStore:
                 (item.bucket_key, budget_class.value, metric.value),
             )
             if usage is None:
-                raise RuntimeError(
-                    "missing budget usage row for reservation item"
-                )
+                raise RuntimeError("missing budget usage row for reservation item")
 
             usage.reserved -= item.amount
             if usage.reserved < -1e-9:
@@ -1077,13 +1041,9 @@ class SQLiteBudgetStore:
             reservation_id,
         )
         if record is None:
-            raise KeyError(
-                f"unknown budget reservation: {reservation_id}"
-            )
+            raise KeyError(f"unknown budget reservation: {reservation_id}")
         if record.state != ReservationState.ACTIVE.value:
-            raise ValueError(
-                f"budget reservation {reservation_id} is not ACTIVE"
-            )
+            raise ValueError(f"budget reservation {reservation_id} is not ACTIVE")
         return record
 
     @staticmethod
@@ -1095,10 +1055,7 @@ class SQLiteBudgetStore:
             (
                 await session.scalars(
                     select(BudgetReservationItemRecord)
-                    .where(
-                        BudgetReservationItemRecord.reservation_id
-                        == reservation_id
-                    )
+                    .where(BudgetReservationItemRecord.reservation_id == reservation_id)
                     .order_by(
                         BudgetReservationItemRecord.bucket_key,
                         BudgetReservationItemRecord.metric,
@@ -1132,22 +1089,10 @@ class SQLiteReviewCaseStore:
         signals: tuple[ReviewSignal, ...],
     ) -> ReviewCase:
         if not signals:
-            raise ValueError(
-                "cannot open review case without triggering signals"
-            )
+            raise ValueError("cannot open review case without triggering signals")
 
-        unique_signals = tuple(
-            {
-                signal.stable_fingerprint: signal
-                for signal in signals
-            }.values()
-        )
-        fingerprints = tuple(
-            sorted(
-                signal.stable_fingerprint
-                for signal in unique_signals
-            )
-        )
+        unique_signals = tuple({signal.stable_fingerprint: signal for signal in signals}.values())
+        fingerprints = tuple(sorted(signal.stable_fingerprint for signal in unique_signals))
         dedupe_key = _review_dedupe_key(
             task.task_id,
             fingerprints,
@@ -1158,8 +1103,7 @@ class SQLiteReviewCaseStore:
                 existing = await session.scalar(
                     select(ReviewCaseRecord).where(
                         ReviewCaseRecord.dedupe_key == dedupe_key,
-                        ReviewCaseRecord.state
-                        == ReviewCaseState.OPEN.value,
+                        ReviewCaseRecord.state == ReviewCaseState.OPEN.value,
                     )
                 )
                 if existing is not None:
@@ -1180,11 +1124,7 @@ class SQLiteReviewCaseStore:
                             key=lambda category: category.value,
                         )
                     ),
-                    summaries=tuple(
-                        dict.fromkeys(
-                            signal.summary for signal in unique_signals
-                        )
-                    ),
+                    summaries=tuple(dict.fromkeys(signal.summary for signal in unique_signals)),
                 )
 
                 session.add(
@@ -1221,8 +1161,7 @@ class SQLiteReviewCaseStore:
                 existing = await session.scalar(
                     select(ReviewCaseRecord).where(
                         ReviewCaseRecord.dedupe_key == dedupe_key,
-                        ReviewCaseRecord.state
-                        == ReviewCaseState.OPEN.value,
+                        ReviewCaseRecord.state == ReviewCaseState.OPEN.value,
                     )
                 )
                 if existing is None:
@@ -1245,10 +1184,7 @@ class SQLiteReviewCaseStore:
                 (
                     await session.scalars(
                         select(ReviewCaseRecord)
-                        .where(
-                            ReviewCaseRecord.state
-                            == ReviewCaseState.OPEN.value
-                        )
+                        .where(ReviewCaseRecord.state == ReviewCaseState.OPEN.value)
                         .order_by(
                             ReviewCaseRecord.opened_at,
                             ReviewCaseRecord.case_id,
@@ -1256,10 +1192,7 @@ class SQLiteReviewCaseStore:
                     )
                 ).all()
             )
-            return [
-                await self._review_case_from_record(session, record)
-                for record in records
-            ]
+            return [await self._review_case_from_record(session, record) for record in records]
 
     async def approved_for_task(
         self,
@@ -1268,17 +1201,21 @@ class SQLiteReviewCaseStore:
         signal_fingerprints: tuple[str, ...] | None = None,
     ) -> ReviewCase | None:
         async with self._database.session() as session:
-            records = list((await session.scalars(
-                select(ReviewCaseRecord)
-                .where(
-                    ReviewCaseRecord.task_id == task_id,
-                    ReviewCaseRecord.state == ReviewCaseState.APPROVED.value,
-                )
-                .order_by(
-                    ReviewCaseRecord.resolved_at.desc(),
-                    ReviewCaseRecord.case_id.desc(),
-                )
-            )).all())
+            records = list(
+                (
+                    await session.scalars(
+                        select(ReviewCaseRecord)
+                        .where(
+                            ReviewCaseRecord.task_id == task_id,
+                            ReviewCaseRecord.state == ReviewCaseState.APPROVED.value,
+                        )
+                        .order_by(
+                            ReviewCaseRecord.resolved_at.desc(),
+                            ReviewCaseRecord.case_id.desc(),
+                        )
+                    )
+                ).all()
+            )
             for record in records:
                 review_case = await self._review_case_from_record(session, record)
                 if (
@@ -1303,15 +1240,11 @@ class SQLiteReviewCaseStore:
             if record is None:
                 raise KeyError(f"unknown review case: {case_id}")
             if record.state != ReviewCaseState.OPEN.value:
-                raise ValueError(
-                    f"review case {case_id} is already resolved"
-                )
+                raise ValueError(f"review case {case_id} is already resolved")
 
             record.state = state.value
             record.resolved_at = utc_now()
-            record.resolution_reason = (
-                reason.strip() if reason is not None else None
-            ) or None
+            record.resolution_reason = (reason.strip() if reason is not None else None) or None
 
             return await self._review_case_from_record(session, record)
 
@@ -1324,9 +1257,7 @@ class SQLiteReviewCaseStore:
             (
                 await session.scalars(
                     select(ReviewSignalRecord)
-                    .where(
-                        ReviewSignalRecord.case_id == record.case_id
-                    )
+                    .where(ReviewSignalRecord.case_id == record.case_id)
                     .order_by(
                         ReviewSignalRecord.category,
                         ReviewSignalRecord.signal_id,
@@ -1335,21 +1266,14 @@ class SQLiteReviewCaseStore:
             ).all()
         )
 
-        fingerprints = tuple(
-            sorted(signal.evidence_fingerprint for signal in signals)
-        )
+        fingerprints = tuple(sorted(signal.evidence_fingerprint for signal in signals))
         categories = tuple(
             sorted(
-                {
-                    ReviewCategory(signal.category)
-                    for signal in signals
-                },
+                {ReviewCategory(signal.category) for signal in signals},
                 key=lambda category: category.value,
             )
         )
-        summaries = tuple(
-            dict.fromkeys(signal.summary for signal in signals)
-        )
+        summaries = tuple(dict.fromkeys(signal.summary for signal in signals))
 
         return ReviewCase(
             case_id=record.case_id,
@@ -1412,18 +1336,14 @@ class SQLiteRateLimitStore:
                     active = record.active_concurrency
                     last_refill = record.last_refill_at
 
-                    if (
-                        check.requests_per_second is not None
-                        and check.burst is not None
-                    ):
+                    if check.requests_per_second is not None and check.burst is not None:
                         elapsed = max(
                             (now - last_refill).total_seconds(),
                             0.0,
                         )
                         tokens = min(
                             check.burst,
-                            tokens
-                            + elapsed * check.requests_per_second,
+                            tokens + elapsed * check.requests_per_second,
                         )
                         last_refill = now
 
@@ -1441,23 +1361,18 @@ class SQLiteRateLimitStore:
                             "split demand into smaller acquisitions"
                         )
                     if tokens + 1e-9 < check.requests:
-                        token_retry = (
-                            check.requests - tokens
-                        ) / check.requests_per_second
+                        token_retry = (check.requests - tokens) / check.requests_per_second
 
                 if (
                     check.concurrency > 0
                     and check.max_concurrency is not None
-                    and active + check.concurrency
-                    > check.max_concurrency
+                    and active + check.concurrency > check.max_concurrency
                 ):
-                    concurrency_retry = (
-                        await self._earliest_concurrency_release(
-                            session,
-                            rule_id=check.rule_id,
-                            bucket_key=check.bucket_key,
-                            now=now,
-                        )
+                    concurrency_retry = await self._earliest_concurrency_release(
+                        session,
+                        rule_id=check.rule_id,
+                        bucket_key=check.bucket_key,
+                        now=now,
                     )
 
                 retry_after = max(
@@ -1472,31 +1387,21 @@ class SQLiteRateLimitStore:
                             bucket_key=check.bucket_key,
                             kind=(
                                 "TOKENS_AND_CONCURRENCY"
-                                if token_retry > 0.0
-                                and concurrency_retry > 0.0
+                                if token_retry > 0.0 and concurrency_retry > 0.0
                                 else "TOKENS"
                                 if token_retry > 0.0
                                 else "CONCURRENCY"
                             ),
-                            reason=(
-                                "shared rate/concurrency capacity is "
-                                "temporarily unavailable"
-                            ),
+                            reason=("shared rate/concurrency capacity is temporarily unavailable"),
                             retry_after_seconds=retry_after,
                         )
                     )
                     continue
 
-                if (
-                    check.requests > 0.0
-                    and check.requests_per_second is not None
-                ):
+                if check.requests > 0.0 and check.requests_per_second is not None:
                     tokens -= check.requests
 
-                if (
-                    check.concurrency > 0
-                    and check.max_concurrency is not None
-                ):
+                if check.concurrency > 0 and check.max_concurrency is not None:
                     active += check.concurrency
 
                 projected[key] = (
@@ -1511,12 +1416,9 @@ class SQLiteRateLimitStore:
                     task_id=task_id,
                     violations=tuple(violations),
                     checked_buckets=checks,
-                    reason=(
-                        "shared rate-limit capacity is temporarily exhausted"
-                    ),
+                    reason=("shared rate-limit capacity is temporarily exhausted"),
                     retry_after_seconds=max(
-                        violation.retry_after_seconds
-                        for violation in violations
+                        violation.retry_after_seconds for violation in violations
                     ),
                 )
 
@@ -1524,10 +1426,13 @@ class SQLiteRateLimitStore:
                 record.tokens = tokens
                 record.active_concurrency = active
                 record.last_refill_at = now
-                if await session.get(
-                    RateBucketRecord,
-                    (record.rule_id, record.bucket_key),
-                ) is None:
+                if (
+                    await session.get(
+                        RateBucketRecord,
+                        (record.rule_id, record.bucket_key),
+                    )
+                    is None
+                ):
                     session.add(record)
 
             lease_items = tuple(
@@ -1537,10 +1442,7 @@ class SQLiteRateLimitStore:
                     concurrency=check.concurrency,
                 )
                 for check in checks
-                if (
-                    check.max_concurrency is not None
-                    and check.concurrency > 0
-                )
+                if (check.max_concurrency is not None and check.concurrency > 0)
             )
 
             lease: RateLimitLease | None = None
@@ -1617,8 +1519,7 @@ class SQLiteRateLimitStore:
                 (
                     await session.scalars(
                         select(RateLeaseRecord).where(
-                            RateLeaseRecord.state
-                            == RateLeaseState.ACTIVE.value,
+                            RateLeaseRecord.state == RateLeaseState.ACTIVE.value,
                             RateLeaseRecord.expires_at <= now,
                         )
                     )
@@ -1681,8 +1582,7 @@ class SQLiteRateLimitStore:
             select(RateLeaseRecord.expires_at)
             .join(
                 RateLeaseItemRecord,
-                RateLeaseItemRecord.lease_id
-                == RateLeaseRecord.lease_id,
+                RateLeaseItemRecord.lease_id == RateLeaseRecord.lease_id,
             )
             .where(
                 RateLeaseRecord.state == RateLeaseState.ACTIVE.value,
@@ -1711,9 +1611,7 @@ class SQLiteRateLimitStore:
         if record is None:
             raise KeyError(f"unknown rate-limit lease: {lease_id}")
         if record.state != RateLeaseState.ACTIVE.value:
-            raise ValueError(
-                f"rate-limit lease {lease_id} is not ACTIVE"
-            )
+            raise ValueError(f"rate-limit lease {lease_id} is not ACTIVE")
         return record
 
     @staticmethod
@@ -1725,9 +1623,7 @@ class SQLiteRateLimitStore:
             (
                 await session.scalars(
                     select(RateLeaseItemRecord)
-                    .where(
-                        RateLeaseItemRecord.lease_id == lease_id
-                    )
+                    .where(RateLeaseItemRecord.lease_id == lease_id)
                     .order_by(
                         RateLeaseItemRecord.rule_id,
                         RateLeaseItemRecord.bucket_key,
@@ -1749,14 +1645,10 @@ class SQLiteRateLimitStore:
                 (item.rule_id, item.bucket_key),
             )
             if bucket is None:
-                raise RuntimeError(
-                    "missing rate bucket while releasing lease"
-                )
+                raise RuntimeError("missing rate bucket while releasing lease")
             bucket.active_concurrency -= item.concurrency
             if bucket.active_concurrency < 0:
-                raise RuntimeError(
-                    "rate-limit concurrency underflow"
-                )
+                raise RuntimeError("rate-limit concurrency underflow")
 
 
 class DecisionRepository:
@@ -1777,12 +1669,8 @@ class DecisionRepository:
                 evaluated_at=decision.evaluated_at,
                 score=decision.score,
                 selected=selected,
-                breakdown_json=decision.breakdown.model_dump(
-                    mode="json"
-                ),
-                signals_json=decision.signals.model_dump(
-                    mode="json"
-                ),
+                breakdown_json=decision.breakdown.model_dump(mode="json"),
+                signals_json=decision.signals.model_dump(mode="json"),
             )
             session.add(record)
             await session.flush()
@@ -1887,13 +1775,9 @@ class BranchRepository:
 
             if record.root_event_id is None and root_event_id is not None:
                 record.root_event_id = root_event_id
-            elif (
-                root_event_id is not None
-                and record.root_event_id not in {None, root_event_id}
-            ):
+            elif root_event_id is not None and record.root_event_id not in {None, root_event_id}:
                 raise ValueError(
-                    f"branch {normalized} already has root event "
-                    f"{record.root_event_id}"
+                    f"branch {normalized} already has root event {record.root_event_id}"
                 )
 
     async def get(self, branch_id: str) -> BranchRecord | None:
@@ -1931,9 +1815,7 @@ class RunRepository:
     ) -> None:
         normalized = status.strip().upper()
         if not normalized or normalized == "RUNNING":
-            raise ValueError(
-                "finished run status must be non-empty and not RUNNING"
-            )
+            raise ValueError("finished run status must be non-empty and not RUNNING")
 
         async with self._database.transaction(immediate=True) as session:
             record = await session.get(ReconRunRecord, run_id)
@@ -1941,6 +1823,77 @@ class RunRepository:
                 raise KeyError(f"unknown run_id: {run_id}")
             record.status = normalized
             record.finished_at = utc_now()
+
+
+class TaskAttemptRepository:
+    """Persist selected-task outcomes without rewriting earlier run history."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    async def start(
+        self,
+        *,
+        run_id: str,
+        task: Task,
+    ) -> str:
+        async with self._database.transaction() as session:
+            record = TaskAttemptRecord(
+                run_id=run_id,
+                task_id=task.task_id,
+                worker=task.worker,
+                action=task.action,
+                selected_at=utc_now(),
+                claimed=False,
+            )
+            session.add(record)
+            await session.flush()
+            return record.attempt_id
+
+    async def finish(
+        self,
+        attempt_id: str,
+        *,
+        outcome: str,
+        queue_status: str | None,
+        reason: str | None,
+        reservation_id: str | None,
+        claimed: bool,
+        execution_attempt: int | None,
+    ) -> None:
+        async with self._database.transaction(immediate=True) as session:
+            record = await session.get(TaskAttemptRecord, attempt_id)
+            if record is None:
+                raise KeyError(f"unknown task attempt: {attempt_id}")
+            if record.finished_at is not None:
+                raise ValueError(f"task attempt already finished: {attempt_id}")
+            record.finished_at = utc_now()
+            record.outcome = outcome
+            record.queue_status = queue_status
+            record.reason = reason
+            record.reservation_id = reservation_id
+            record.claimed = claimed
+            record.execution_attempt = execution_attempt
+
+    async def counts(self, *, run_id: str | None = None) -> dict[str, int]:
+        conditions = (TaskAttemptRecord.run_id == run_id,) if run_id is not None else ()
+        async with self._database.session() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(
+                            TaskAttemptRecord.outcome,
+                            func.count(TaskAttemptRecord.attempt_id),
+                        )
+                        .where(
+                            TaskAttemptRecord.outcome.is_not(None),
+                            *conditions,
+                        )
+                        .group_by(TaskAttemptRecord.outcome)
+                    )
+                ).all()
+            )
+        return {str(outcome): int(count) for outcome, count in rows if outcome is not None}
 
 
 def _event_from_record(record: EventObservationRecord) -> Event:
@@ -1989,7 +1942,7 @@ def _task_values(task: Task) -> dict[str, Any]:
 def _task_from_record(record: TaskRecord) -> Task:
     prefix = f"{record.worker}:{record.action}:"
     logical_input = (
-        record.dedupe_key[len(prefix):]
+        record.dedupe_key[len(prefix) :]
         if record.dedupe_key.startswith(prefix)
         else record.input_event_id
     )
@@ -1998,9 +1951,7 @@ def _task_from_record(record: TaskRecord) -> Task:
         worker=record.worker,
         action=record.action,
         input_event_id=record.input_event_id,
-        input_identity_key=(
-            logical_input if logical_input != record.input_event_id else None
-        ),
+        input_identity_key=(logical_input if logical_input != record.input_event_id else None),
         branch_id=record.branch_id,
         route_rule_id=record.route_rule_id,
         routing_reason=record.routing_reason,
@@ -2031,11 +1982,7 @@ def _merge_scope_state(
         ScopeState.AMBIGUOUS: 3,
         ScopeState.OUT_OF_SCOPE: 4,
     }
-    return (
-        incoming
-        if precedence[incoming] > precedence[current]
-        else current
-    )
+    return incoming if precedence[incoming] > precedence[current] else current
 
 
 def _budget_reservation_from_rows(

@@ -22,8 +22,9 @@ import re
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
+from http.client import HTTPMessage
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -40,7 +41,6 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from recon.intelligence.wordlists import WordlistManifest
-
 
 DEFAULT_CATALOG = Path("wordlists/sources.yaml")
 DEFAULT_BASE_MANIFEST = Path("wordlists/manifest.yaml")
@@ -228,13 +228,13 @@ class StrictRedirectHandler(HTTPRedirectHandler):
         super().__init__()
         self.allowed_hosts = {host.lower().rstrip(".") for host in allowed_hosts}
 
-    def redirect_request(  # type: ignore[override]
+    def redirect_request(
         self,
         req: Request,
         fp: Any,
         code: int,
         msg: str,
-        headers: Mapping[str, str],
+        headers: HTTPMessage,
         newurl: str,
     ) -> Request | None:
         parts = urlsplit(newurl)

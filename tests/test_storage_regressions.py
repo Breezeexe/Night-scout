@@ -38,7 +38,14 @@ async def test_budget_parent_is_flushed_before_fk_items(tmp_path):
     try:
         event = Event(type=EventType.ROOT_DOMAIN, value="example.com", source="test")
         await EventRepository(database).ingest(event)
-        await SQLiteTaskStore(database).put(Task(worker="fixture", action="budget", input_event_id=event.event_id, task_id="task-budget"))
+        await SQLiteTaskStore(database).put(
+            Task(
+                worker="fixture",
+                action="budget",
+                input_event_id=event.event_id,
+                task_id="task-budget",
+            )
+        )
         store = SQLiteBudgetStore(database)
         created = budget_now()
         reservation = BudgetReservation(
@@ -83,7 +90,11 @@ async def test_rate_lease_parent_is_flushed_before_fk_items(tmp_path):
     try:
         event = Event(type=EventType.ROOT_DOMAIN, value="example.com", source="test")
         await EventRepository(database).ingest(event)
-        await SQLiteTaskStore(database).put(Task(worker="fixture", action="rate", input_event_id=event.event_id, task_id="task-rate"))
+        await SQLiteTaskStore(database).put(
+            Task(
+                worker="fixture", action="rate", input_event_id=event.event_id, task_id="task-rate"
+            )
+        )
         store = SQLiteRateLimitStore(database)
         decision = await store.try_acquire(
             task_id="task-rate",
@@ -187,6 +198,31 @@ async def test_sqlite_task_claim_is_atomic_across_queue_instances(tmp_path):
         persisted = await SQLiteTaskStore(database).get(task.task_id)
         assert persisted is not None
         assert persisted.attempts == 1
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_ready_filters_exhausted_active_task(tmp_path):
+    path = tmp_path / "exhausted-ready.sqlite3"
+    upgrade_database(path)
+    database = Database.from_path(path)
+    try:
+        event = Event(type=EventType.ROOT_DOMAIN, value="example.com", source="test")
+        await EventRepository(database).ingest(event)
+        store = SQLiteTaskStore(database)
+        exhausted = Task(
+            worker="fixture",
+            action="exhausted",
+            input_event_id=event.event_id,
+            status=TaskStatus.DEFERRED,
+            attempts=3,
+            max_attempts=3,
+        )
+        assert await store.put(exhausted) is True
+
+        assert await store.ready(now=exhausted.available_at) == []
+        assert await store.next_ready_at() is None
     finally:
         await database.dispose()
 

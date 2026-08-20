@@ -105,7 +105,6 @@ from recon.intelligence.wordlists import TargetEventProvider, infer_seed_domain
 from recon.workers.passive_domains import normalize_dns_name
 from recon.workers.permutations import LearnedHostnameHypothesis
 
-
 _ENVIRONMENT_TOKENS = frozenset(
     {
         "prod",
@@ -727,7 +726,7 @@ class PatternEngine:
 
             patterns.append(pattern)
 
-        patterns = dedupe_and_rank_patterns(
+        ranked_patterns = dedupe_and_rank_patterns(
             patterns
         )[
             : self._config.max_patterns
@@ -749,14 +748,14 @@ class PatternEngine:
                 groups
             ),
             accepted_patterns=len(
-                patterns
+                ranked_patterns
             ),
             rejected_patterns=rejected,
             generated_hypotheses=0,
         )
 
         return (
-            patterns,
+            ranked_patterns,
             report,
         )
 
@@ -1155,7 +1154,7 @@ def build_pattern_candidate_groups(
             _negative_support,
             index,
             value,
-            members,
+            anchor_members,
         ) in anchor_clusters[
             : config.max_anchor_clusters_per_group
         ]:
@@ -1164,7 +1163,7 @@ def build_pattern_candidate_groups(
                 dedupe_keys,
                 _PatternCandidateGroup(
                     parent_domain=parent_domain,
-                    observations=members,
+                    observations=anchor_members,
                     group_reason="frequent-anchor",
                     anchor_index=index,
                     anchor_value=value,
@@ -2104,11 +2103,11 @@ def generate_pattern_hypotheses(
                     slot.values
                 )
 
-        for values in itertools.product(
+        for combination in itertools.product(
             *value_domains
         ):
             candidate = tuple(
-                values
+                combination
             )
 
             if (

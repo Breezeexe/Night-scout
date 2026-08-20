@@ -58,7 +58,6 @@ import os
 import re
 import sqlite3
 import time
-from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
@@ -71,7 +70,6 @@ from urllib.request import Request, urlopen
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from recon.core.events import Event, EventType
-
 
 NVD_CPE_API_URL = "https://services.nvd.nist.gov/rest/json/cpes/2.0"
 NVD_CVE_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -625,9 +623,8 @@ class InMemoryNvdCache:
                 )
                 return None
 
-            return json.loads(
-                json.dumps(payload)
-            )
+            loaded = json.loads(json.dumps(payload))
+            return dict(loaded) if isinstance(loaded, dict) else None
 
     async def set(
         self,
@@ -1260,7 +1257,7 @@ class NvdVulnerabilityIntelligence:
         )
 
         if cached is not None:
-            cves = tuple(
+            cached_cves = tuple(
                 CveCandidate.model_validate(
                     item
                 )
@@ -1276,7 +1273,7 @@ class NvdVulnerabilityIntelligence:
             )
 
             return (
-                cves,
+                cached_cves,
                 True,
                 0,
                 bool(
@@ -2075,18 +2072,18 @@ def rank_cpe_candidates(
             ),
         )
 
-        reasons = list(
+        candidate_reasons = list(
             family[
                 "reasons"
             ]
         )
 
         if synthetic:
-            reasons.append(
+            candidate_reasons.append(
                 "observed version applied to resolved CPE family"
             )
         else:
-            reasons.append(
+            candidate_reasons.append(
                 "official CPE record version matches observation"
             )
 
@@ -2132,7 +2129,7 @@ def rank_cpe_candidates(
                 score=score,
                 confidence=confidence,
                 reasons=tuple(
-                    reasons
+                    candidate_reasons
                 ),
             )
         )
@@ -3171,7 +3168,7 @@ def retry_delay(
     maximum: float,
     retry_after: float | None,
 ) -> float:
-    exponential = min(
+    exponential = float(min(
         maximum,
         base
         * (
@@ -3180,16 +3177,16 @@ def retry_delay(
                 attempt - 1,
             )
         ),
-    )
+    ))
 
     if retry_after is not None:
-        return min(
+        return float(min(
             maximum,
             max(
                 exponential,
                 retry_after,
             ),
-        )
+        ))
 
     return exponential
 

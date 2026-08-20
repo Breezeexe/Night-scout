@@ -47,7 +47,7 @@ import hashlib
 import json
 import math
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
@@ -65,8 +65,8 @@ from recon.intelligence.confidence import (
 from recon.intelligence.novelty import NoveltyAssessment, NoveltyModel
 from recon.intelligence.patterns import (
     NamingPattern,
-    PatternEngine,
     PatternDiscoveryReport,
+    PatternEngine,
     pattern_learning_root,
 )
 from recon.intelligence.vocabulary import (
@@ -84,7 +84,6 @@ from recon.intelligence.yield_model import (
     YieldQuery,
     target_key_for_event,
 )
-
 
 GENOME_VERSION = 1
 
@@ -716,10 +715,12 @@ class TargetGenomeBuilder:
         categories: list[CorpusCategory | None] = [None] * len(aggregates)
 
         if self._yield_model is not None and query_limit > 0:
+            yield_model = self._yield_model
+
             async def estimate_one(index: int, aggregate: VocabularyAggregate) -> None:
                 category = corpus_category_for_vocabulary(aggregate)
                 categories[index] = category
-                estimates[index] = await self._yield_model.estimate_for_token(
+                estimates[index] = await yield_model.estimate_for_token(
                     target_key=target_key,
                     token=aggregate.token,
                     category=category,
@@ -774,8 +775,10 @@ class TargetGenomeBuilder:
         query_limit = min(len(patterns), self._config.max_pattern_yield_queries)
 
         if self._yield_model is not None and query_limit > 0:
+            yield_model = self._yield_model
+
             async def estimate_one(index: int, pattern: NamingPattern) -> None:
-                estimates[index] = await self._yield_model.estimate_for_pattern(
+                estimates[index] = await yield_model.estimate_for_pattern(
                     target_key=target_key,
                     pattern_id=pattern.pattern_id,
                 )

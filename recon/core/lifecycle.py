@@ -21,9 +21,7 @@ rewriting the lifecycle core.
 
 Critical invariant:
 
-    A soft budget exhaustion must never delete a discovered frontier item.
-
-Therefore BudgetOutcome.DEFER always maps to TaskStatus.DEFERRED.
+    A budget decision must leave an explicit durable task state.
 
 Another critical invariant:
 
@@ -85,6 +83,18 @@ class WorkerOutcome(StrEnum):
     FAILED = "FAILED"
 
 
+class LeaseHeartbeatError(RuntimeError):
+    """A worker can no longer be allowed to execute under its leases."""
+
+
+class TaskLeaseLostError(LeaseHeartbeatError):
+    """The queue claim was lost while the worker was executing."""
+
+
+class BudgetLeaseLostError(LeaseHeartbeatError):
+    """The budget reservation was lost while the worker was executing."""
+
+
 class GateDecision(BaseModel):
     """Decision returned by a scope/policy/review gate."""
 
@@ -99,13 +109,8 @@ class GateDecision(BaseModel):
     @model_validator(mode="after")
     def validate_retry_metadata(self) -> GateDecision:
         """Only DEFER decisions may define a retry delay."""
-        if (
-            self.retry_after_seconds is not None
-            and self.outcome is not GateOutcome.DEFER
-        ):
-            raise ValueError(
-                "retry_after_seconds is only valid for DEFER decisions"
-            )
+        if self.retry_after_seconds is not None and self.outcome is not GateOutcome.DEFER:
+            raise ValueError("retry_after_seconds is only valid for DEFER decisions")
         if self.review_case_id is not None and self.outcome is not GateOutcome.REVIEW:
             raise ValueError("review_case_id is only valid for REVIEW decisions")
         return self
@@ -135,31 +140,17 @@ class WorkerExecutionResult(BaseModel):
         """Validate error/retry metadata against the worker outcome."""
         if self.outcome is WorkerOutcome.SUCCEEDED:
             if self.retry_after_seconds is not None:
-                raise ValueError(
-                    "SUCCEEDED worker results cannot define retry_after_seconds"
-                )
+                raise ValueError("SUCCEEDED worker results cannot define retry_after_seconds")
             return self
 
         if not (self.error or "").strip():
-            raise ValueError(
-                "RETRY and FAILED worker results require an error message"
-            )
+            raise ValueError("RETRY and FAILED worker results require an error message")
 
-        if (
-            self.outcome is WorkerOutcome.FAILED
-            and self.retry_after_seconds is not None
-        ):
-            raise ValueError(
-                "FAILED worker results cannot define retry_after_seconds"
-            )
+        if self.outcome is WorkerOutcome.FAILED and self.retry_after_seconds is not None:
+            raise ValueError("FAILED worker results cannot define retry_after_seconds")
 
-        if (
-            self.outcome is WorkerOutcome.RETRY
-            and self.retry_after_seconds is None
-        ):
-            raise ValueError(
-                "RETRY worker results require retry_after_seconds"
-            )
+        if self.outcome is WorkerOutcome.RETRY and self.retry_after_seconds is None:
+            raise ValueError("RETRY worker results require retry_after_seconds")
 
         return self
 
@@ -199,6 +190,14 @@ class LifecycleResult(BaseModel):
     reservation_id: str | None = None
 
     queue_status: TaskStatus | None = None
+    claimed: bool = False
+    execution_attempt: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_claim_metadata(self) -> LifecycleResult:
+        if self.execution_attempt is not None and not self.claimed:
+            raise ValueError("execution_attempt requires claimed=true")
+        return self
 
 
 class ExecutionGate(Protocol):
@@ -231,8 +230,7 @@ class LifecycleReviewCoordinator(Protocol):
         task: Task,
         gate_name: str,
         reason: str,
-    ) -> bool:
-        ...
+    ) -> bool: ...
 
     async def open_case(
         self,
@@ -240,8 +238,19 @@ class LifecycleReviewCoordinator(Protocol):
         task: Task,
         gate_name: str,
         reason: str,
-    ) -> str:
-        ...
+    ) -> str: ...
+
+
+class LifecycleAttemptObserver(Protocol):
+    """Persist one run-attributed task selection and its eventual outcome."""
+
+    async def start(self, task: Task, schedule: ScheduleDecision) -> str | None: ...
+
+    async def finish(
+        self,
+        attempt_id: str,
+        result: LifecycleResult,
+    ) -> None: ...
 
 
 class BudgetPlanner(Protocol):
@@ -305,15 +314,14 @@ class Lifecycle:
         task_lease_for: timedelta = timedelta(minutes=5),
         heartbeat_interval: timedelta | None = None,
         review_coordinator: LifecycleReviewCoordinator | None = None,
+        attempt_observer: LifecycleAttemptObserver | None = None,
     ) -> None:
         gate_list = tuple(gates)
 
         # Fail closed: active execution cannot exist without at least one
         # explicit scope/policy gate.
         if not gate_list:
-            raise ValueError(
-                "Lifecycle requires at least one ExecutionGate"
-            )
+            raise ValueError("Lifecycle requires at least one ExecutionGate")
 
         if task_lease_for <= timedelta(0):
             raise ValueError("task_lease_for must be positive")
@@ -325,9 +333,7 @@ class Lifecycle:
             raise ValueError("heartbeat_interval must be positive")
 
         if heartbeat_interval >= task_lease_for:
-            raise ValueError(
-                "heartbeat_interval must be shorter than task_lease_for"
-            )
+            raise ValueError("heartbeat_interval must be shorter than task_lease_for")
 
         self._queue = queue
         self._scheduler = scheduler
@@ -339,6 +345,7 @@ class Lifecycle:
         self._task_lease_for = task_lease_for
         self._heartbeat_interval = heartbeat_interval
         self._review_coordinator = review_coordinator
+        self._attempt_observer = attempt_observer
 
     async def recover_expired(
         self,
@@ -355,9 +362,7 @@ class Lifecycle:
             raise ValueError("task_retry_delay cannot be negative")
 
         expired_reservations = await self._budgets.reap_expired()
-        recovered_tasks = await self._queue.recover_expired_leases(
-            retry_delay=task_retry_delay
-        )
+        recovered_tasks = await self._queue.recover_expired_leases(retry_delay=task_retry_delay)
 
         return LifecycleRecoveryResult(
             recovered_tasks=len(recovered_tasks),
@@ -398,9 +403,28 @@ class Lifecycle:
                 queue_status=task.status,
             )
 
+        attempt_id = (
+            await self._attempt_observer.start(task, schedule)
+            if self._attempt_observer is not None
+            else None
+        )
+        running: Task | None = None
+
+        async def complete(result: LifecycleResult) -> LifecycleResult:
+            if running is not None:
+                result = result.model_copy(
+                    update={
+                        "claimed": True,
+                        "execution_attempt": running.attempts,
+                    }
+                )
+            if attempt_id is not None and self._attempt_observer is not None:
+                await self._attempt_observer.finish(attempt_id, result)
+            return result
+
         gate_result = await self._apply_gates(task, schedule)
         if gate_result is not None:
-            return gate_result
+            return await complete(gate_result)
 
         plan = await self._budget_planner.plan(task, schedule)
 
@@ -412,22 +436,22 @@ class Lifecycle:
         )
 
         if budget.outcome is BudgetOutcome.DEFER:
-            delay = timedelta(
-                seconds=budget.retry_after_seconds or 0.0
-            )
+            delay = timedelta(seconds=budget.retry_after_seconds or 0.0)
             deferred = await self._queue.defer(
                 task.task_id,
                 delay=delay,
                 reason=budget.reason or "budget deferred",
             )
-            return LifecycleResult(
-                outcome=LifecycleOutcome.DEFERRED,
-                task_id=task.task_id,
-                worker=task.worker,
-                action=task.action,
-                reason=budget.reason,
-                schedule_score=schedule.score,
-                queue_status=deferred.status,
+            return await complete(
+                LifecycleResult(
+                    outcome=LifecycleOutcome.DEFERRED,
+                    task_id=task.task_id,
+                    worker=task.worker,
+                    action=task.action,
+                    reason=budget.reason,
+                    schedule_score=schedule.score,
+                    queue_status=deferred.status,
+                )
             )
 
         if budget.outcome is BudgetOutcome.DENY:
@@ -435,20 +459,20 @@ class Lifecycle:
                 task.task_id,
                 reason=budget.reason or "hard budget denied execution",
             )
-            return LifecycleResult(
-                outcome=LifecycleOutcome.BLOCKED,
-                task_id=task.task_id,
-                worker=task.worker,
-                action=task.action,
-                reason=budget.reason,
-                schedule_score=schedule.score,
-                queue_status=blocked.status,
+            return await complete(
+                LifecycleResult(
+                    outcome=LifecycleOutcome.BLOCKED,
+                    task_id=task.task_id,
+                    worker=task.worker,
+                    action=task.action,
+                    reason=budget.reason,
+                    schedule_score=schedule.score,
+                    queue_status=blocked.status,
+                )
             )
 
         reservation_id = (
-            budget.reservation.reservation_id
-            if budget.reservation is not None
-            else None
+            budget.reservation.reservation_id if budget.reservation is not None else None
         )
 
         try:
@@ -464,14 +488,16 @@ class Lifecycle:
 
             current = await self._queue.get(task.task_id)
 
-            return LifecycleResult(
-                outcome=LifecycleOutcome.STALE,
-                task_id=task.task_id,
-                worker=task.worker,
-                action=task.action,
-                reason=f"task could not be claimed: {exc}",
-                schedule_score=schedule.score,
-                queue_status=current.status if current is not None else None,
+            return await complete(
+                LifecycleResult(
+                    outcome=LifecycleOutcome.STALE,
+                    task_id=task.task_id,
+                    worker=task.worker,
+                    action=task.action,
+                    reason=f"task could not be claimed: {exc}",
+                    schedule_score=schedule.score,
+                    queue_status=current.status if current is not None else None,
+                )
             )
 
         if on_claimed is not None:
@@ -485,15 +511,58 @@ class Lifecycle:
                 reservation_id=reservation_id,
             )
         )
+        execution_task = asyncio.create_task(self._executor.execute(running))
 
         try:
-            execution = await self._executor.execute(running)
+            execution = await self._supervise_execution(
+                execution_task=execution_task,
+                heartbeat_task=heartbeat,
+            )
+        except LeaseHeartbeatError as exc:
+            # Continuing target traffic without both live leases would permit
+            # duplicate or unbudgeted execution. The supervisor has already
+            # cancelled and awaited the worker before reaching this branch.
+            if reservation_id is not None:
+                with contextlib.suppress(Exception):
+                    await self._budgets.commit(reservation_id)
+
+            try:
+                failed = await self._queue.fail(
+                    running.task_id,
+                    claim_token=self._claim_token(running),
+                    error=f"lease heartbeat failed: {exc}",
+                    retry_delay=timedelta(seconds=0),
+                )
+            except (KeyError, ValueError) as transition_error:
+                return await complete(
+                    await self._stale_completion_result(
+                        running,
+                        schedule,
+                        reservation_id=reservation_id,
+                        error=transition_error,
+                    )
+                )
+
+            return await complete(
+                LifecycleResult(
+                    outcome=(
+                        LifecycleOutcome.RETRY
+                        if failed.status is TaskStatus.DEFERRED
+                        else LifecycleOutcome.FAILED
+                    ),
+                    task_id=running.task_id,
+                    worker=running.worker,
+                    action=running.action,
+                    reason=failed.last_error,
+                    schedule_score=schedule.score,
+                    reservation_id=reservation_id,
+                    queue_status=failed.status,
+                )
+            )
         except Exception as exc:
             # Unexpected executor exceptions are treated conservatively:
             # execution may already have touched the target, so a reservation
             # is committed rather than released.
-            await self._stop_heartbeat(heartbeat)
-
             if reservation_id is not None:
                 await self._budgets.commit(reservation_id)
 
@@ -505,25 +574,27 @@ class Lifecycle:
                     retry_delay=None,
                 )
             except (KeyError, ValueError) as transition_error:
-                return await self._stale_completion_result(
-                    running,
-                    schedule,
-                    reservation_id=reservation_id,
-                    error=transition_error,
+                return await complete(
+                    await self._stale_completion_result(
+                        running,
+                        schedule,
+                        reservation_id=reservation_id,
+                        error=transition_error,
+                    )
                 )
 
-            return LifecycleResult(
-                outcome=LifecycleOutcome.FAILED,
-                task_id=running.task_id,
-                worker=running.worker,
-                action=running.action,
-                reason=failed.last_error,
-                schedule_score=schedule.score,
-                reservation_id=reservation_id,
-                queue_status=failed.status,
+            return await complete(
+                LifecycleResult(
+                    outcome=LifecycleOutcome.FAILED,
+                    task_id=running.task_id,
+                    worker=running.worker,
+                    action=running.action,
+                    reason=failed.last_error,
+                    schedule_score=schedule.score,
+                    reservation_id=reservation_id,
+                    queue_status=failed.status,
+                )
             )
-
-        await self._stop_heartbeat(heartbeat)
 
         # Once the worker was actually executed, conservatively commit the
         # reserved budget for every structured outcome. This prevents failed
@@ -539,26 +610,28 @@ class Lifecycle:
                     claim_token=self._claim_token(running),
                 )
             except (KeyError, ValueError) as exc:
-                return await self._stale_completion_result(
-                    running,
-                    schedule,
-                    reservation_id=reservation_id,
-                    error=exc,
+                return await complete(
+                    await self._stale_completion_result(
+                        running,
+                        schedule,
+                        reservation_id=reservation_id,
+                        error=exc,
+                    )
                 )
-            return LifecycleResult(
-                outcome=LifecycleOutcome.SUCCEEDED,
-                task_id=running.task_id,
-                worker=running.worker,
-                action=running.action,
-                schedule_score=schedule.score,
-                reservation_id=reservation_id,
-                queue_status=succeeded.status,
+            return await complete(
+                LifecycleResult(
+                    outcome=LifecycleOutcome.SUCCEEDED,
+                    task_id=running.task_id,
+                    worker=running.worker,
+                    action=running.action,
+                    schedule_score=schedule.score,
+                    reservation_id=reservation_id,
+                    queue_status=succeeded.status,
+                )
             )
 
         if execution.outcome is WorkerOutcome.RETRY:
-            retry_delay = timedelta(
-                seconds=execution.retry_after_seconds or 0.0
-            )
+            retry_delay = timedelta(seconds=execution.retry_after_seconds or 0.0)
             try:
                 retried = await self._queue.fail(
                     running.task_id,
@@ -567,11 +640,13 @@ class Lifecycle:
                     retry_delay=retry_delay,
                 )
             except (KeyError, ValueError) as exc:
-                return await self._stale_completion_result(
-                    running,
-                    schedule,
-                    reservation_id=reservation_id,
-                    error=exc,
+                return await complete(
+                    await self._stale_completion_result(
+                        running,
+                        schedule,
+                        reservation_id=reservation_id,
+                        error=exc,
+                    )
                 )
 
             lifecycle_outcome = (
@@ -580,15 +655,17 @@ class Lifecycle:
                 else LifecycleOutcome.FAILED
             )
 
-            return LifecycleResult(
-                outcome=lifecycle_outcome,
-                task_id=running.task_id,
-                worker=running.worker,
-                action=running.action,
-                reason=retried.last_error,
-                schedule_score=schedule.score,
-                reservation_id=reservation_id,
-                queue_status=retried.status,
+            return await complete(
+                LifecycleResult(
+                    outcome=lifecycle_outcome,
+                    task_id=running.task_id,
+                    worker=running.worker,
+                    action=running.action,
+                    reason=retried.last_error,
+                    schedule_score=schedule.score,
+                    reservation_id=reservation_id,
+                    queue_status=retried.status,
+                )
             )
 
         try:
@@ -599,22 +676,26 @@ class Lifecycle:
                 retry_delay=None,
             )
         except (KeyError, ValueError) as exc:
-            return await self._stale_completion_result(
-                running,
-                schedule,
-                reservation_id=reservation_id,
-                error=exc,
+            return await complete(
+                await self._stale_completion_result(
+                    running,
+                    schedule,
+                    reservation_id=reservation_id,
+                    error=exc,
+                )
             )
 
-        return LifecycleResult(
-            outcome=LifecycleOutcome.FAILED,
-            task_id=running.task_id,
-            worker=running.worker,
-            action=running.action,
-            reason=failed.last_error,
-            schedule_score=schedule.score,
-            reservation_id=reservation_id,
-            queue_status=failed.status,
+        return await complete(
+            LifecycleResult(
+                outcome=LifecycleOutcome.FAILED,
+                task_id=running.task_id,
+                worker=running.worker,
+                action=running.action,
+                reason=failed.last_error,
+                schedule_score=schedule.score,
+                reservation_id=reservation_id,
+                queue_status=failed.status,
+            )
         )
 
     async def _apply_gates(
@@ -629,9 +710,7 @@ class Lifecycle:
                 continue
 
             if decision.outcome is GateOutcome.DEFER:
-                delay = timedelta(
-                    seconds=decision.retry_after_seconds or 0.0
-                )
+                delay = timedelta(seconds=decision.retry_after_seconds or 0.0)
                 deferred = await self._queue.defer(
                     task.task_id,
                     delay=delay,
@@ -713,28 +792,80 @@ class Lifecycle:
         if claim_token is None:
             return
 
-        try:
-            while True:
-                await asyncio.sleep(interval)
+        while True:
+            await asyncio.sleep(interval)
 
+            try:
                 await self._queue.heartbeat(
                     task_id,
                     claim_token=claim_token,
                     lease_for=self._task_lease_for,
                 )
+            except asyncio.CancelledError:
+                raise
+            except (KeyError, ValueError) as exc:
+                raise TaskLeaseLostError(f"task lease for {task_id} was lost: {exc}") from exc
+            except Exception as exc:
+                raise LeaseHeartbeatError(
+                    f"task heartbeat failed: {type(exc).__name__}: {exc}"
+                ) from exc
 
-                if reservation_id is not None:
+            if reservation_id is not None:
+                try:
                     await self._budgets.renew(
                         reservation_id,
                         lease_for=self._task_lease_for,
                     )
-        except asyncio.CancelledError:
-            raise
-        except (KeyError, ValueError):
-            # The main execution path owns final state transitions. If a lease
-            # disappears because completion/recovery raced with heartbeat, the
-            # loop should stop rather than mutate unrelated state.
-            return
+                except asyncio.CancelledError:
+                    raise
+                except (KeyError, ValueError) as exc:
+                    raise BudgetLeaseLostError(
+                        f"budget reservation {reservation_id} was lost: {exc}"
+                    ) from exc
+                except Exception as exc:
+                    raise LeaseHeartbeatError(
+                        f"budget heartbeat failed: {type(exc).__name__}: {exc}"
+                    ) from exc
+
+    async def _supervise_execution(
+        self,
+        *,
+        execution_task: asyncio.Task[WorkerExecutionResult],
+        heartbeat_task: asyncio.Task[None],
+    ) -> WorkerExecutionResult:
+        """Race worker completion against lease health and fence on failure."""
+        try:
+            done, _ = await asyncio.wait(
+                {execution_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if heartbeat_task in done:
+                # This normally raises the precise heartbeat failure. A clean
+                # return is also unsafe because supervision ended early.
+                await heartbeat_task
+                raise LeaseHeartbeatError("lease heartbeat stopped unexpectedly")
+
+            try:
+                execution = execution_task.result()
+            except Exception:
+                # A heartbeat failure completing in the same event-loop turn
+                # takes precedence because lease ownership is authoritative.
+                if heartbeat_task.done():
+                    await heartbeat_task
+                raise
+
+            await self._stop_heartbeat(heartbeat_task)
+            return execution
+        finally:
+            for task in (execution_task, heartbeat_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                execution_task,
+                heartbeat_task,
+                return_exceptions=True,
+            )
 
     @staticmethod
     async def _stop_heartbeat(task: asyncio.Task[None]) -> None:

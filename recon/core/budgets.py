@@ -1,7 +1,8 @@
 """Soft/hard reconnaissance budgets for Night Scout.
 
-SOFT limits manage exploration effort. Exhaustion returns DEFER: the task stays
-in the persistent frontier.
+SOFT cumulative/depth limits manage exploration effort. Exhaustion returns
+DENY so a task reaches a finite, explicit terminal state instead of being
+deferred forever. The persisted task remains available as audit history.
 
 HARD cumulative limits are non-negotiable and return DENY.
 
@@ -88,11 +89,7 @@ class BudgetCaps(BaseModel):
             BudgetMetric.RUNTIME_SECONDS: self.runtime_seconds,
             BudgetMetric.CONCURRENT_TASKS: self.concurrent_tasks,
         }
-        return {
-            metric: value
-            for metric, value in values.items()
-            if value is not None
-        }
+        return {metric: value for metric, value in values.items() if value is not None}
 
 
 class BudgetProfile(BaseModel):
@@ -140,9 +137,7 @@ class BudgetProfile(BaseModel):
             and self.hard_max_branch_depth is not None
             and self.soft_max_branch_depth > self.hard_max_branch_depth
         ):
-            raise ValueError(
-                "soft_max_branch_depth cannot exceed hard_max_branch_depth"
-            )
+            raise ValueError("soft_max_branch_depth cannot exceed hard_max_branch_depth")
         return self
 
 
@@ -165,11 +160,7 @@ class BudgetDemand(BaseModel):
             BudgetMetric.RUNTIME_SECONDS: self.runtime_seconds,
             BudgetMetric.CONCURRENT_TASKS: self.concurrent_tasks,
         }
-        return {
-            metric: amount
-            for metric, amount in values.items()
-            if amount > 0.0
-        }
+        return {metric: amount for metric, amount in values.items() if amount > 0.0}
 
 
 class BudgetContext(BaseModel):
@@ -186,11 +177,7 @@ class BudgetContext(BaseModel):
         cls,
         value: frozenset[str],
     ) -> frozenset[str]:
-        return frozenset(
-            key.strip().lower()
-            for key in value
-            if key.strip()
-        )
+        return frozenset(key.strip().lower() for key in value if key.strip())
 
 
 class BudgetCheck(BaseModel):
@@ -303,29 +290,24 @@ class BudgetStore(Protocol):
         *,
         reservation: BudgetReservation,
         checks: tuple[BudgetCheck, ...],
-    ) -> tuple[bool, tuple[BudgetViolation, ...]]:
-        ...
+    ) -> tuple[bool, tuple[BudgetViolation, ...]]: ...
 
-    async def commit(self, reservation_id: str) -> BudgetReservation:
-        ...
+    async def commit(self, reservation_id: str) -> BudgetReservation: ...
 
-    async def release(self, reservation_id: str) -> BudgetReservation:
-        ...
+    async def release(self, reservation_id: str) -> BudgetReservation: ...
 
     async def renew(
         self,
         reservation_id: str,
         *,
         expires_at: datetime,
-    ) -> BudgetReservation:
-        ...
+    ) -> BudgetReservation: ...
 
     async def reap_expired(
         self,
         *,
         now: datetime,
-    ) -> list[BudgetReservation]:
-        ...
+    ) -> list[BudgetReservation]: ...
 
     async def usage(
         self,
@@ -333,14 +315,12 @@ class BudgetStore(Protocol):
         bucket_key: str,
         metric: BudgetMetric,
         budget_class: BudgetClass,
-    ) -> BudgetUsage:
-        ...
+    ) -> BudgetUsage: ...
 
     async def get_reservation(
         self,
         reservation_id: str,
-    ) -> BudgetReservation | None:
-        ...
+    ) -> BudgetReservation | None: ...
 
 
 class InMemoryBudgetStore:
@@ -364,9 +344,7 @@ class InMemoryBudgetStore:
     ) -> tuple[bool, tuple[BudgetViolation, ...]]:
         async with self._lock:
             if reservation.reservation_id in self._reservations:
-                raise ValueError(
-                    f"reservation already exists: {reservation.reservation_id}"
-                )
+                raise ValueError(f"reservation already exists: {reservation.reservation_id}")
 
             violations: list[BudgetViolation] = []
 
@@ -379,12 +357,7 @@ class InMemoryBudgetStore:
                 committed = self._committed.get(key, 0.0)
                 reserved = self._reserved.get(key, 0.0)
 
-                if (
-                    committed
-                    + reserved
-                    + check.requested
-                    > check.effective_limit + 1e-9
-                ):
+                if committed + reserved + check.requested > check.effective_limit + 1e-9:
                     violations.append(
                         BudgetViolation(
                             bucket_key=check.bucket_key,
@@ -410,9 +383,7 @@ class InMemoryBudgetStore:
                     item.budget_class,
                     item.metric,
                 )
-                self._reserved[key] = (
-                    self._reserved.get(key, 0.0) + item.amount
-                )
+                self._reserved[key] = self._reserved.get(key, 0.0) + item.amount
 
             return True, ()
 
@@ -432,14 +403,9 @@ class InMemoryBudgetStore:
                 self._subtract_reserved(key, item.amount)
 
                 if not item.metric.is_capacity:
-                    self._committed[key] = (
-                        self._committed.get(key, 0.0)
-                        + item.amount
-                    )
+                    self._committed[key] = self._committed.get(key, 0.0) + item.amount
 
-            updated = reservation.model_copy(
-                update={"state": ReservationState.COMMITTED}
-            )
+            updated = reservation.model_copy(update={"state": ReservationState.COMMITTED})
             self._reservations[reservation_id] = updated
             return updated.model_copy(deep=True)
 
@@ -460,9 +426,7 @@ class InMemoryBudgetStore:
                     item.amount,
                 )
 
-            updated = reservation.model_copy(
-                update={"state": ReservationState.RELEASED}
-            )
+            updated = reservation.model_copy(update={"state": ReservationState.RELEASED})
             self._reservations[reservation_id] = updated
             return updated.model_copy(deep=True)
 
@@ -481,9 +445,7 @@ class InMemoryBudgetStore:
             if expires_at <= utc_now():
                 raise ValueError("expires_at must be in the future")
 
-            updated = reservation.model_copy(
-                update={"expires_at": expires_at}
-            )
+            updated = reservation.model_copy(update={"expires_at": expires_at})
             self._reservations[reservation_id] = updated
             return updated.model_copy(deep=True)
 
@@ -498,13 +460,8 @@ class InMemoryBudgetStore:
         async with self._lock:
             expired: list[BudgetReservation] = []
 
-            for reservation_id, reservation in list(
-                self._reservations.items()
-            ):
-                if (
-                    reservation.state is not ReservationState.ACTIVE
-                    or reservation.expires_at > now
-                ):
+            for reservation_id, reservation in list(self._reservations.items()):
+                if reservation.state is not ReservationState.ACTIVE or reservation.expires_at > now:
                     continue
 
                 for item in reservation.items:
@@ -517,9 +474,7 @@ class InMemoryBudgetStore:
                         item.amount,
                     )
 
-                updated = reservation.model_copy(
-                    update={"state": ReservationState.EXPIRED}
-                )
+                updated = reservation.model_copy(update={"state": ReservationState.EXPIRED})
                 self._reservations[reservation_id] = updated
                 expired.append(updated.model_copy(deep=True))
 
@@ -549,11 +504,7 @@ class InMemoryBudgetStore:
     ) -> BudgetReservation | None:
         async with self._lock:
             value = self._reservations.get(reservation_id)
-            return (
-                value.model_copy(deep=True)
-                if value is not None
-                else None
-            )
+            return value.model_copy(deep=True) if value is not None else None
 
     def _require_active(
         self,
@@ -562,14 +513,10 @@ class InMemoryBudgetStore:
         try:
             reservation = self._reservations[reservation_id]
         except KeyError as exc:
-            raise KeyError(
-                f"unknown budget reservation: {reservation_id}"
-            ) from exc
+            raise KeyError(f"unknown budget reservation: {reservation_id}") from exc
 
         if reservation.state is not ReservationState.ACTIVE:
-            raise ValueError(
-                f"reservation {reservation_id} is not ACTIVE"
-            )
+            raise ValueError(f"reservation {reservation_id} is not ACTIVE")
 
         return reservation
 
@@ -582,9 +529,7 @@ class InMemoryBudgetStore:
         updated = current - amount
 
         if updated < -1e-9:
-            raise RuntimeError(
-                f"reserved budget underflow for {key}"
-            )
+            raise RuntimeError(f"reserved budget underflow for {key}")
 
         if updated <= 1e-9:
             self._reserved.pop(key, None)
@@ -598,18 +543,13 @@ class BudgetManager:
         store: BudgetStore,
         *,
         profile: BudgetProfile | None = None,
-        soft_retry_after: timedelta = timedelta(minutes=15),
         capacity_retry_after: timedelta = timedelta(seconds=1),
     ) -> None:
-        if (
-            soft_retry_after < timedelta(0)
-            or capacity_retry_after < timedelta(0)
-        ):
-            raise ValueError("retry delays cannot be negative")
+        if capacity_retry_after < timedelta(0):
+            raise ValueError("capacity_retry_after cannot be negative")
 
         self._store = store
         self._profile = profile or BudgetProfile()
-        self._soft_retry_after = soft_retry_after
         self._capacity_retry_after = capacity_retry_after
 
     async def reserve(
@@ -628,8 +568,7 @@ class BudgetManager:
 
         if (
             self._profile.hard_max_branch_depth is not None
-            and budget_context.branch_depth
-            > self._profile.hard_max_branch_depth
+            and budget_context.branch_depth > self._profile.hard_max_branch_depth
         ):
             return BudgetDecision(
                 outcome=BudgetOutcome.DENY,
@@ -639,19 +578,12 @@ class BudgetManager:
 
         if (
             self._profile.soft_max_branch_depth is not None
-            and budget_context.branch_depth
-            > self._profile.soft_max_branch_depth
+            and budget_context.branch_depth > self._profile.soft_max_branch_depth
         ):
             return BudgetDecision(
-                outcome=BudgetOutcome.DEFER,
+                outcome=BudgetOutcome.DENY,
                 task_id=task.task_id,
-                reason=(
-                    "soft exploration depth exhausted; "
-                    "preserve task in frontier"
-                ),
-                retry_after_seconds=(
-                    self._soft_retry_after.total_seconds()
-                ),
+                reason="soft exploration depth exhausted; close frontier task",
             )
 
         checks = self._compile_checks(
@@ -698,15 +630,11 @@ class BudgetManager:
             )
 
         hard = tuple(
-            violation
-            for violation in violations
-            if violation.budget_class is BudgetClass.HARD
+            violation for violation in violations if violation.budget_class is BudgetClass.HARD
         )
 
-        if hard and not all(
-            violation.metric.is_capacity
-            for violation in hard
-        ):
+        permanent = tuple(violation for violation in violations if not violation.metric.is_capacity)
+        if permanent:
             return BudgetDecision(
                 outcome=BudgetOutcome.DENY,
                 task_id=task.task_id,
@@ -714,14 +642,10 @@ class BudgetManager:
                 checked_limits=checks,
                 reason=(
                     "hard cumulative budget limit would be exceeded"
+                    if any(violation.budget_class is BudgetClass.HARD for violation in permanent)
+                    else "soft exploration budget exhausted; close frontier task"
                 ),
             )
-
-        retry = (
-            self._capacity_retry_after
-            if hard
-            else self._soft_retry_after
-        )
 
         return BudgetDecision(
             outcome=BudgetOutcome.DEFER,
@@ -731,12 +655,9 @@ class BudgetManager:
             reason=(
                 "hard execution capacity exhausted; preserve task in frontier"
                 if hard
-                else (
-                    "soft exploration budget exhausted; "
-                    "preserve task in frontier"
-                )
+                else ("soft execution capacity exhausted; preserve task until capacity is released")
             ),
-            retry_after_seconds=retry.total_seconds(),
+            retry_after_seconds=self._capacity_retry_after.total_seconds(),
         )
 
     async def commit(
@@ -801,16 +722,12 @@ class BudgetManager:
                 global_caps = self._profile.hard_global_limits
                 branch_caps = self._profile.hard_branch_limits
                 resource_caps = self._profile.hard_resource_limits
-                worker_caps = self._profile.hard_worker_limits.get(
-                    task.worker
-                )
+                worker_caps = self._profile.hard_worker_limits.get(task.worker)
             else:
                 global_caps = self._profile.soft_global_limits
                 branch_caps = self._profile.soft_branch_limits
                 resource_caps = self._profile.soft_resource_limits
-                worker_caps = self._profile.soft_worker_limits.get(
-                    task.worker
-                )
+                worker_caps = self._profile.soft_worker_limits.get(task.worker)
 
             checks.extend(
                 _checks_for_caps(
@@ -819,9 +736,7 @@ class BudgetManager:
                     amounts=amounts,
                     budget_class=budget_class,
                     context=context,
-                    reserve_fraction=(
-                        self._profile.exploration_reserve_fraction
-                    ),
+                    reserve_fraction=(self._profile.exploration_reserve_fraction),
                 )
             )
 
@@ -833,17 +748,13 @@ class BudgetManager:
                         amounts=amounts,
                         budget_class=budget_class,
                         context=context,
-                        reserve_fraction=(
-                            self._profile.exploration_reserve_fraction
-                        ),
+                        reserve_fraction=(self._profile.exploration_reserve_fraction),
                     )
                 )
 
             if task.branch_id is not None:
                 multiplier = (
-                    context.branch_soft_multiplier
-                    if budget_class is BudgetClass.SOFT
-                    else 1.0
+                    context.branch_soft_multiplier if budget_class is BudgetClass.SOFT else 1.0
                 )
 
                 checks.extend(
@@ -853,9 +764,7 @@ class BudgetManager:
                         amounts=amounts,
                         budget_class=budget_class,
                         context=context,
-                        reserve_fraction=(
-                            self._profile.exploration_reserve_fraction
-                        ),
+                        reserve_fraction=(self._profile.exploration_reserve_fraction),
                         multiplier=multiplier,
                     )
                 )
@@ -868,9 +777,7 @@ class BudgetManager:
                         amounts=amounts,
                         budget_class=budget_class,
                         context=context,
-                        reserve_fraction=(
-                            self._profile.exploration_reserve_fraction
-                        ),
+                        reserve_fraction=(self._profile.exploration_reserve_fraction),
                     )
                 )
 
@@ -897,10 +804,7 @@ def _checks_for_caps(
         configured_limit = configured * multiplier
         effective_limit = configured_limit
 
-        if (
-            budget_class is BudgetClass.SOFT
-            and context.lane is BudgetLane.NORMAL
-        ):
+        if budget_class is BudgetClass.SOFT and context.lane is BudgetLane.NORMAL:
             effective_limit *= 1.0 - reserve_fraction
 
         checks.append(
@@ -941,18 +845,9 @@ def _merge_checks(
             existing.configured_limit != check.configured_limit
             or existing.effective_limit != check.effective_limit
         ):
-            raise ValueError(
-                f"conflicting budget limits for {key}"
-            )
+            raise ValueError(f"conflicting budget limits for {key}")
 
-        merged[key] = check.model_copy(
-            update={
-                "requested": (
-                    existing.requested
-                    + check.requested
-                )
-            }
-        )
+        merged[key] = check.model_copy(update={"requested": (existing.requested + check.requested)})
 
     return tuple(
         merged[key]

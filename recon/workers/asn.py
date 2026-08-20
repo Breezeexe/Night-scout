@@ -61,7 +61,6 @@ from recon.core.lifecycle import WorkerExecutionResult, WorkerOutcome
 from recon.core.queue import Task, TaskStatus
 from recon.core.router import RouteRule
 
-
 WORKER_NAME = "asn"
 ACTION_LOOKUP_IP = "lookup_ip"
 
@@ -181,7 +180,7 @@ class ASNLookupBackend(Protocol):
     def ensure_available(self) -> None:
         ...
 
-    async def lookup_ip(
+    def lookup_ip(
         self,
         ip: str,
     ) -> AsyncIterator[ASNLookupResult]:

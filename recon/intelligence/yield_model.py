@@ -2189,30 +2189,30 @@ def aggregate_observations_for_query(
                 category=query.token_category,
             )
 
-            for credit in observation.token_credits:
-                if credit.category is not query.token_category:
+            for token_credit in observation.token_credits:
+                if token_credit.category is not query.token_category:
                     continue
 
                 if canonical_token_key(
-                    credit.token,
-                    category=credit.category,
+                    token_credit.token,
+                    category=token_credit.category,
                 ) != expected_key:
                     continue
 
-                matching_attempts += credit.attempted_hypotheses
-                matching_hits += credit.successful_hits
-                matching_new_assets += credit.new_assets
-                matching_novel_assets += credit.novel_assets
+                matching_attempts += token_credit.attempted_hypotheses
+                matching_hits += token_credit.successful_hits
+                matching_new_assets += token_credit.new_assets
+                matching_novel_assets += token_credit.novel_assets
 
         elif query.pattern_id is not None:
-            for credit in observation.pattern_credits:
-                if credit.pattern_id != query.pattern_id:
+            for pattern_credit in observation.pattern_credits:
+                if pattern_credit.pattern_id != query.pattern_id:
                     continue
 
-                matching_attempts += credit.attempted_hypotheses
-                matching_hits += credit.successful_hits
-                matching_new_assets += credit.new_assets
-                matching_novel_assets += credit.novel_assets
+                matching_attempts += pattern_credit.attempted_hypotheses
+                matching_hits += pattern_credit.successful_hits
+                matching_new_assets += pattern_credit.new_assets
+                matching_novel_assets += pattern_credit.novel_assets
 
         if matching_attempts <= 0 and matching_hits <= 0:
             continue

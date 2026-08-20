@@ -369,9 +369,7 @@ class InMemoryTaskStore:
                 raise KeyError(f"unknown task_id: {task_id}") from exc
 
             if current.status not in {TaskStatus.PENDING, TaskStatus.DEFERRED}:
-                raise ValueError(
-                    f"task {task_id} is not claimable from {current.status}"
-                )
+                raise ValueError(f"task {task_id} is not claimable from {current.status}")
             if current.available_at > now:
                 raise ValueError(f"task {task_id} is not available yet")
             if current.attempts >= current.max_attempts:
@@ -405,6 +403,7 @@ class InMemoryTaskStore:
                 for task in self._tasks.values()
                 if task.status in {TaskStatus.PENDING, TaskStatus.DEFERRED}
                 and task.available_at <= now
+                and task.attempts < task.max_attempts
             ]
 
             def priority_key(task: Task) -> tuple[float, datetime, datetime, str]:
@@ -414,12 +413,11 @@ class InMemoryTaskStore:
                     task.created_at,
                     task.task_id,
                 )
+
             candidates.sort(key=priority_key)
 
             if limit is not None and fair:
-                top_count, oldest_count, exploration_count, tail_count = (
-                    fair_lane_limits(limit)
-                )
+                top_count, oldest_count, exploration_count, tail_count = fair_lane_limits(limit)
                 lanes = (
                     candidates[:top_count],
                     sorted(candidates, key=lambda task: (task.created_at, task.task_id))[
@@ -474,6 +472,7 @@ class InMemoryTaskStore:
                 task.available_at
                 for task in self._tasks.values()
                 if task.status in {TaskStatus.PENDING, TaskStatus.DEFERRED}
+                and task.attempts < task.max_attempts
             )
             return min(values, default=None)
 
@@ -749,9 +748,7 @@ class TaskQueue:
             task.available_at = now + delay
             task.updated_at = now
             task.last_error = None
-            task.status = (
-                TaskStatus.PENDING if delay == timedelta(0) else TaskStatus.DEFERRED
-            )
+            task.status = TaskStatus.PENDING if delay == timedelta(0) else TaskStatus.DEFERRED
             task.started_at = None
 
             return await self._store.save(

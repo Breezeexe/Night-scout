@@ -83,13 +83,12 @@ from recon.core.router import RouteRule, RoutingContext
 from recon.policy.rate_limit import (
     RateLimitContext,
     RateLimitDemand,
-    RateLimitOutcome,
     RateLimiter,
+    RateLimitOutcome,
     tool_integer_rps_hint,
 )
 from recon.workers.http import normalize_http_url
 from recon.workers.passive_domains import normalize_dns_name
-
 
 WORKER_NAME = "content"
 ACTION_FETCH_JAVASCRIPT = "fetch_javascript"
@@ -253,7 +252,7 @@ class ContentFetchBackend(Protocol):
     def ensure_available(self) -> None:
         ...
 
-    async def fetch(
+    def fetch(
         self,
         url: str,
         *,

@@ -44,7 +44,7 @@ import os
 import shutil
 import tempfile
 from collections import deque
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -60,9 +60,9 @@ from recon.core.router import RouteRule, RoutingContext
 from recon.policy.rate_limit import (
     RateLimitContext,
     RateLimitDemand,
+    RateLimiter,
     RateLimitOutcome,
     RateLimitPlan,
-    RateLimiter,
 )
 from recon.policy.scope import (
     ScopeAssetKind,
@@ -71,7 +71,6 @@ from recon.policy.scope import (
     ScopeSubject,
 )
 from recon.workers.passive_domains import normalize_dns_name
-
 
 WORKER_NAME = "nuclei"
 ACTION_VALIDATE_CVE = "validate_cve"
@@ -1982,8 +1981,9 @@ def safe_int(value: Any) -> int | None:
 
 
 def effective_port(parts: Any) -> int:
-    if parts.port is not None:
-        return parts.port
+    explicit = safe_int(parts.port)
+    if explicit is not None:
+        return explicit
     return 443 if parts.scheme.lower() == "https" else 80
 
 

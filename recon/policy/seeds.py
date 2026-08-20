@@ -134,7 +134,7 @@ def plan_domain_seeds(
     anchor_ids = {rule.rule_id for rule in anchors}
 
     if requested_domains:
-        seeds: list[DomainSeedSpec] = []
+        requested_seeds: list[DomainSeedSpec] = []
         for raw in requested_domains:
             subject = ScopeSubject(kind=ScopeAssetKind.DOMAIN, value=raw)
             decision = engine.evaluate(subject)
@@ -148,7 +148,7 @@ def plan_domain_seeds(
                 if decision.matched_rule_id in anchor_ids
                 else DomainSeedMode.EXPLICIT
             )
-            seeds.append(
+            requested_seeds.append(
                 DomainSeedSpec(
                     domain=subject.value,
                     scope_state=decision.state,
@@ -157,7 +157,7 @@ def plan_domain_seeds(
                     source_rule_ids=decision.matched_rule_ids,
                 )
             )
-        return DomainSeedPlan(seeds=_dedupe_seeds(seeds))
+        return DomainSeedPlan(seeds=_dedupe_seeds(requested_seeds))
 
     seeds: list[DomainSeedSpec] = []
     warnings: list[str] = []

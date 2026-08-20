@@ -2911,6 +2911,7 @@ def vocab_event_categories(
 def event_dns_labels(
     event: Event,
 ) -> tuple[str, ...]:
+    values: tuple[str, ...]
     raw = event.metadata.get(
         "dns_labels"
     )
@@ -2978,9 +2979,9 @@ def event_occurrence_count(
         )
 
         try:
-            value = int(
-                raw
-            )
+            if not isinstance(raw, (int, str)):
+                continue
+            value = int(raw)
         except (
             TypeError,
             ValueError,

@@ -94,7 +94,6 @@ from recon.core.queue import Task, TaskStatus
 from recon.core.router import RouteRule, RoutingContext
 from recon.workers.passive_domains import normalize_dns_name
 
-
 WORKER_NAME = "mobile"
 ACTION_ANALYZE = "analyze"
 
@@ -1030,6 +1029,7 @@ class MobileWorker:
             )
         )
 
+        self._sensitive_evidence: SensitiveEvidenceSink | None
         if sensitive_evidence is not None:
             self._sensitive_evidence = sensitive_evidence
         elif self._config.preserve_raw_secret_evidence:

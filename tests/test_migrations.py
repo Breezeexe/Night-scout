@@ -153,6 +153,31 @@ def test_claim_fencing_migration_recovers_preexisting_running_task(tmp_path):
                 "fixture:probe:event_fixture",
             ),
         )
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                task_id, worker, action, input_event_id, status, priority,
+                attempts, max_attempts, created_at, updated_at, available_at,
+                started_at, lease_expires_at, dedupe_key
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "task_exhausted_fixture",
+                "fixture",
+                "exhausted-probe",
+                "event_fixture",
+                "RUNNING",
+                0.0,
+                3,
+                3,
+                timestamp,
+                timestamp,
+                timestamp,
+                timestamp,
+                timestamp,
+                "fixture:exhausted-probe:event_fixture",
+            ),
+        )
         connection.commit()
 
     upgrade_database(path)
@@ -169,5 +194,23 @@ def test_claim_fencing_migration_recovers_preexisting_running_task(tmp_path):
         None,
         None,
         None,
+        "worker claim invalidated by claim fencing migration",
+    )
+
+    with sqlite3.connect(path) as connection:
+        exhausted = connection.execute(
+            """
+            SELECT status, started_at, lease_expires_at, claim_token,
+                   finished_at, last_error
+            FROM tasks WHERE task_id = 'task_exhausted_fixture'
+            """
+        ).fetchone()
+
+    assert exhausted == (
+        "FAILED",
+        None,
+        None,
+        None,
+        timestamp,
         "worker claim invalidated by claim fencing migration",
     )

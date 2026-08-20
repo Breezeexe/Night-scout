@@ -48,7 +48,6 @@ from recon.core.lifecycle import WorkerExecutionResult, WorkerOutcome
 from recon.core.queue import Task
 from recon.core.router import RouteRule
 
-
 WORKER_NAME = "passive_domains"
 ACTION_ENUMERATE = "enumerate"
 
@@ -89,7 +88,7 @@ class PassiveDomainSource(Protocol):
 
     name: str
 
-    async def stream(
+    def stream(
         self,
         domain: str,
     ) -> AsyncIterator[PassiveDomainFinding]:

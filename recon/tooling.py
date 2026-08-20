@@ -42,13 +42,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Callable, Sequence
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from recon.resources import default_tools_manifest_path
-
 
 GITHUB_API = "https://api.github.com"
 DEFAULT_MANAGED_ROOT = Path("~/.local/share/nightscout/tools")
@@ -1050,14 +1049,15 @@ def _install_from_github_release(
                 max_bytes=16 * 1024 * 1024,
                 show_progress=False,
             )
-            expected = _checksum_for_asset(checksum_path, asset.name)
-            if expected is None:
+            checksum_expected = _checksum_for_asset(checksum_path, asset.name)
+            if checksum_expected is None:
                 raise ToolingError(
                     f"{spec.tool_id}: checksum file did not contain {asset.name}"
                 )
-            if digest != expected:
+            if digest != checksum_expected:
                 raise ToolingError(
-                    f"{spec.tool_id}: checksum mismatch: expected {expected}, got {digest}"
+                    f"{spec.tool_id}: checksum mismatch: "
+                    f"expected {checksum_expected}, got {digest}"
                 )
             verified = True
 
@@ -1224,10 +1224,7 @@ def _github_latest_release(repository: str) -> GitHubRelease:
             continue
         if not download_url.startswith("https://github.com/"):
             continue
-        try:
-            size_int = int(size)
-        except (TypeError, ValueError):
-            size_int = 0
+        size_int = int(size) if isinstance(size, (int, str)) else 0
         digest = item.get("digest")
         assets.append(
             GitHubAsset(

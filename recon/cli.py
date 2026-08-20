@@ -28,6 +28,7 @@ from recon.runtime import (
 )
 from recon.tooling import (
     ToolInstallProgress,
+    ToolInstallResult,
     assert_supported_platform,
     install_tools,
     load_tools_manifest,
@@ -90,8 +91,7 @@ def _version_callback(value: bool) -> None:
 
 def _render_tool_progress(item: ToolInstallProgress) -> None:
     typer.echo(
-        f"  [tool {item.index}/{item.total}] {item.tool_id}: "
-        f"{item.phase.value} - {item.detail}"
+        f"  [tool {item.index}/{item.total}] {item.tool_id}: {item.phase.value} - {item.detail}"
     )
 
 
@@ -166,9 +166,7 @@ def setup_command(
     try:
         typer.echo("[setup 1/5] Checking supported platform...")
         platform_info = assert_supported_platform()
-        typer.echo(
-            f"  {platform_info.pretty_name} / {platform_info.architecture}: supported"
-        )
+        typer.echo(f"  {platform_info.pretty_name} / {platform_info.architecture}: supported")
 
         typer.echo("[setup 2/5] Preparing per-user config and workspace...")
         paths = initialize_user_environment()
@@ -191,7 +189,7 @@ def setup_command(
                 raise RuntimeError(f"default wordlist sync failed with exit code {code}")
             typer.echo("  default public corpus synchronized")
 
-        results = ()
+        results: tuple[ToolInstallResult, ...] = ()
         typer.echo("[setup 4/5] Preparing companion tools...")
         if skip_tools:
             typer.echo("  skipped by request")
@@ -200,9 +198,7 @@ def setup_command(
                 "  first setup can take several minutes: Night Scout tries trusted "
                 "Debian/Kali APT packages first, then upstream fallback when needed"
             )
-            typer.echo(
-                "  APT/PDTM/pipx output is shown live, so long downloads are visible below"
-            )
+            typer.echo("  APT/PDTM/pipx output is shown live, so long downloads are visible below")
             results = install_tools(
                 include_optional=include_optional_tools,
                 update=update_tools,
@@ -237,7 +233,9 @@ def setup_command(
         raise typer.Exit(code=2) from exc
 
     typer.echo("")
-    typer.echo(f"Night Scout setup complete: {platform_info.pretty_name} / {platform_info.architecture}")
+    typer.echo(
+        f"Night Scout setup complete: {platform_info.pretty_name} / {platform_info.architecture}"
+    )
     typer.echo(f"config:    {paths.config_root}")
     typer.echo(f"workspace: {paths.data_root}")
     typer.echo(f"cache:     {paths.cache_root}")
@@ -398,15 +396,15 @@ def run_command(
 
     if json_output:
         typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+        if summary.get("status") == "FAILED":
+            raise typer.Exit(code=1)
         return
 
     typer.echo(f"run_id:      {summary['run_id']}")
     typer.echo(f"status:      {summary['status']}")
     typer.echo(f"seeds:       {len(summary['seeds'])}")
     for seed in summary["seeds"]:
-        typer.echo(
-            f"  {seed['target']}  scope={seed['scope_state']}  mode={seed['mode']}"
-        )
+        typer.echo(f"  {seed['target']}  scope={seed['scope_state']}  mode={seed['mode']}")
     typer.echo(f"steps:       {summary['steps']}")
     typer.echo(f"events:      {summary['event_count']}")
     typer.echo(f"assets:      {summary['asset_count']}")
@@ -426,11 +424,20 @@ def run_command(
         for name, count in sorted(task_counts.items()):
             typer.echo(f"  {name}: {count}")
 
+    attempt_counts = summary.get("attempt_counts", {})
+    if attempt_counts:
+        typer.echo("attempts:")
+        for name, count in sorted(attempt_counts.items()):
+            typer.echo(f"  {name}: {count}")
+
     warnings = summary.get("warnings", [])
     if warnings:
         typer.echo("warnings:")
         for warning in warnings:
             typer.echo(f"  - {warning}")
+
+    if summary.get("status") == "FAILED":
+        raise typer.Exit(code=1)
 
 
 @app.command("status")
@@ -474,6 +481,11 @@ def status_command(
     if status.get("task_counts"):
         typer.echo("tasks:")
         for name, count in sorted(status["task_counts"].items()):
+            typer.echo(f"  {name}: {count}")
+
+    if status.get("attempt_counts"):
+        typer.echo("attempts:")
+        for name, count in sorted(status["attempt_counts"].items()):
             typer.echo(f"  {name}: {count}")
 
     for warning in status.get("warnings", []):
@@ -797,7 +809,9 @@ def _prepare_default_scope_for_run(
             subject = ScopeSubject(kind=ScopeAssetKind.DOMAIN, value=target)
             decision = engine.evaluate(subject)
         except Exception as exc:
-            typer.echo(f"scope preflight failed for {target!r}: {type(exc).__name__}: {exc}", err=True)
+            typer.echo(
+                f"scope preflight failed for {target!r}: {type(exc).__name__}: {exc}", err=True
+            )
             raise typer.Exit(code=2) from exc
 
         if decision.state in {ScopeState.IN_SCOPE, ScopeState.PASSIVE_ONLY}:
@@ -941,8 +955,7 @@ def tools_verify_command(
             typer.echo(f"[{marker:4}] {status.tool_id}: {status.detail}")
 
     failed = any(
-        status.required and not (status.installed and status.identity_ok)
-        for status in statuses
+        status.required and not (status.installed and status.identity_ok) for status in statuses
     )
     if failed:
         raise typer.Exit(code=1)
@@ -1002,7 +1015,6 @@ def tools_install_command(
     for result in results:
         marker = "SKIP" if result.skipped else "OK"
         typer.echo(f"[{marker:4}] {result.tool_id}: {result.detail}")
-
 
 
 if __name__ == "__main__":

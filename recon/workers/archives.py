@@ -72,7 +72,6 @@ from recon.core.queue import Task, TaskStatus
 from recon.core.router import RouteRule
 from recon.workers.passive_domains import normalize_dns_name
 
-
 WORKER_NAME = "archives"
 ACTION_DISCOVER_URLS = "discover_urls"
 
@@ -212,7 +211,7 @@ class ArchiveURLSource(Protocol):
     def ensure_available(self) -> None:
         ...
 
-    async def stream(
+    def stream(
         self,
         domain: str,
     ) -> AsyncIterator[ArchiveURLFinding]:
