@@ -1,0 +1,974 @@
+# Night Scout runtime pipeline example.
+#
+# This is the canonical example for HOW authorized reconnaissance runs.
+# Scope/authorization itself lives in configs/scope*.yaml.
+#
+# Design rules:
+#   1. Scheduler ranks tasks; it never authorizes them.
+#   2. Every active task still passes:
+#          scope -> restrictions -> review -> budget -> rate limit -> worker
+#   3. Rate limits are shared above individual CLI tools.
+#   4. Unknown active targets fail closed.
+#   5. TARGETED and EXPLORATION remain separate lanes.
+#   6. High confidence/novelty/yield never overrides policy.
+#   7. Credentials found offline are never automatically used.
+#
+# The nested sections below intentionally reuse the current Pydantic field
+# names from Night Scout. Orchestrator-only sections such as `routing`,
+# `exploration`, `snapshots`, and `exports` will be consumed by the runtime
+# bootstrap/CLI layer.
+
+schema_version: 1
+
+profile_id: example-balanced
+display_name: Example balanced authorized recon pipeline
+
+scope_file: configs/scope.yaml
+
+# -----------------------------------------------------------------------------
+# Runtime loop / bootstrap
+# -----------------------------------------------------------------------------
+
+runtime:
+  max_steps: 10000
+  task_lease_seconds: 300
+  heartbeat_interval_seconds: 60
+  recover_retry_delay_seconds: 0
+
+  project_vocabulary: true
+  vulnerability_enrichment: true
+  snapshot_capture: true
+  snapshot_diff_on_write: true
+  build_genome_on_finish: true
+
+  novel_asset_threshold: 0.70
+
+# -----------------------------------------------------------------------------
+# Persistence / workspace
+# -----------------------------------------------------------------------------
+
+storage:
+  database:
+    # Maps to recon.storage.database.DatabaseConfig.
+    path: .nightscout/nightscout.sqlite3
+    busy_timeout_ms: 5000
+    echo: false
+    wal: true
+    synchronous: NORMAL
+
+  # JSONL is an audit/export surface, not the SQLite source of truth.
+  event_log:
+    enabled: true
+    path: .nightscout/events.jsonl
+
+  # Used by content.py for bounded JavaScript material.
+  content_store:
+    root: .nightscout/content
+
+  # Local APK/IPA artifacts explicitly supplied to Night Scout.
+  artifact_store:
+    root: .nightscout/artifacts
+
+  # Raw credentials are isolated from normal Events/Genome/exports.
+  sensitive_evidence:
+    root: .nightscout/sensitive-evidence
+    directory_mode: "0700"
+    file_mode: "0600"
+
+# -----------------------------------------------------------------------------
+# Scheduler
+# -----------------------------------------------------------------------------
+
+scheduler:
+  # Maps 1:1 to recon.core.scheduler.SchedulerConfig.
+  route_priority_weight: 1.0
+
+  confidence_weight: 3.0
+  novelty_weight: 4.0
+  expected_yield_weight: 3.0
+  information_gain_weight: 3.0
+
+  cost_weight: 2.0
+  retry_penalty_weight: 1.0
+
+  age_boost_per_minute: 0.01
+  max_age_boost: 3.0
+
+  # null = consider all currently ready tasks.
+  candidate_limit: null
+  signal_concurrency: 32
+
+# -----------------------------------------------------------------------------
+# Shared budgets
+# -----------------------------------------------------------------------------
+#
+# Maps 1:1 to recon.core.budgets.BudgetProfile.
+#
+# SOFT exhaustion => DEFER / convergence pressure.
+# HARD cumulative exhaustion => DENY.
+# HARD CONCURRENT_TASKS exhaustion => temporary DEFER.
+#
+# These are EXAMPLE ceilings, not bug-bounty program rules. Tune them for the
+# authorized target and available runtime resources.
+
+budgets:
+  exploration_reserve_fraction: 0.20
+
+  soft_max_branch_depth: 8
+  hard_max_branch_depth: 12
+
+  soft_global_limits:
+    tasks: 25000
+    requests: 100000
+    candidates: 250000
+    runtime_seconds: 21600
+    concurrent_tasks: 32
+
+  soft_branch_limits:
+    tasks: 1500
+    requests: 5000
+    candidates: 25000
+    runtime_seconds: 1800
+    concurrent_tasks: 8
+
+  soft_resource_limits:
+    requests: 1000
+    candidates: 10000
+    runtime_seconds: 900
+    concurrent_tasks: 4
+
+  soft_worker_limits:
+    crawler:
+      tasks: 500
+      requests: 10000
+      runtime_seconds: 7200
+      concurrent_tasks: 4
+
+    parameters:
+      tasks: 750
+      requests: 15000
+      candidates: 50000
+      runtime_seconds: 7200
+      concurrent_tasks: 4
+
+    vhost:
+      tasks: 750
+      requests: 15000
+      candidates: 50000
+      runtime_seconds: 7200
+      concurrent_tasks: 4
+
+    nuclei:
+      tasks: 250
+      requests: 1000
+      runtime_seconds: 3600
+      concurrent_tasks: 2
+
+    permutations:
+      tasks: 2500
+      candidates: 100000
+      runtime_seconds: 3600
+      concurrent_tasks: 8
+
+  hard_global_limits:
+    tasks: 100000
+    requests: 500000
+    candidates: 1000000
+    runtime_seconds: 86400
+    concurrent_tasks: 64
+
+  hard_branch_limits:
+    tasks: 10000
+    requests: 50000
+    candidates: 250000
+    runtime_seconds: 14400
+    concurrent_tasks: 16
+
+  hard_resource_limits:
+    requests: 10000
+    candidates: 100000
+    runtime_seconds: 7200
+    concurrent_tasks: 8
+
+  hard_worker_limits:
+    crawler:
+      requests: 50000
+      runtime_seconds: 21600
+      concurrent_tasks: 8
+
+    parameters:
+      requests: 75000
+      candidates: 250000
+      runtime_seconds: 21600
+      concurrent_tasks: 8
+
+    vhost:
+      requests: 75000
+      candidates: 250000
+      runtime_seconds: 21600
+      concurrent_tasks: 8
+
+    nuclei:
+      requests: 5000
+      runtime_seconds: 10800
+      concurrent_tasks: 4
+
+# -----------------------------------------------------------------------------
+# Shared active request rate limits
+# -----------------------------------------------------------------------------
+#
+# Maps 1:1 to recon.policy.rate_limit.RateLimitProfile.
+#
+# IMPORTANT:
+# - Replace these EXAMPLE values with the current bug-bounty program policy.
+# - A tool's own -rl/-rate-limit flag is an additional local guardrail only.
+# - The central RateLimiter remains authoritative for aggregate traffic.
+#
+# This example deliberately uses 5 req/s per host rather than assuming a
+# program's maximum permitted rate.
+
+rate_limit:
+  require_matching_rule: true
+  default_retry_after_seconds: 2.0
+
+  rules:
+    # Aggregate ceiling across all active target-contact workers.
+    - rule_id: global-active-ceiling
+      scope: GLOBAL
+      resource_pattern: "*"
+      requests_per_second: 20.0
+      burst: 20.0
+      max_concurrency: 16
+      workers:
+        - dns
+        - http
+        - tls
+        - crawler
+        - content
+        - parameters
+        - vhost
+        - nuclei
+      reason: Conservative aggregate active-recon ceiling
+
+    # Separate shared bucket for every concrete hostname.
+    - rule_id: per-host-active
+      scope: PER_RESOURCE
+      resource_pattern: "host:*"
+      requests_per_second: 5.0
+      burst: 5.0
+      max_concurrency: 2
+      workers:
+        - dns
+        - http
+        - tls
+        - crawler
+        - content
+        - parameters
+        - vhost
+        - nuclei
+      reason: Conservative per-host active request envelope
+
+    # Exact IP-based work must also have a matched bucket.
+    - rule_id: per-ip-active
+      scope: PER_RESOURCE
+      resource_pattern: "ip:*"
+      requests_per_second: 5.0
+      burst: 5.0
+      max_concurrency: 2
+      workers:
+        - http
+        - tls
+      reason: Conservative per-IP active request envelope
+
+# -----------------------------------------------------------------------------
+# Routing
+# -----------------------------------------------------------------------------
+#
+# RouteRule factories remain in worker modules. This section tells the future
+# bootstrap which current route rules should be registered.
+#
+# A route only creates a candidate Task. It does not bypass policy/lifecycle.
+
+routing:
+  enabled_rule_ids:
+    - passive_domains.enumerate
+
+    - permutations.root.targeted
+    - permutations.confirmed-dns.targeted
+    - permutations.root.exploration
+    - permutations.confirmed-dns.exploration
+
+    - dns.resolve
+    - http.probe.confirmed-dns
+    - tls.inspect.confirmed-dns
+    - asn.lookup-ip
+
+    - archives.discover-urls
+    - crawler.crawl.confirmed-root-url
+
+    - content.fetch-javascript.live
+    - javascript.analyze.local-content
+
+    - parameters.api.targeted
+    - parameters.api.exploration
+
+    - vhost.discover-targeted.confirmed-http-service
+    - vhost.discover-exploration.confirmed-http-service
+
+    - mobile.analyze.local-artifact
+
+    - fingerprints.http-response
+    - fingerprints.certificate
+    - fingerprints.favicon
+
+    - nuclei.validate-cve.audited
+
+# -----------------------------------------------------------------------------
+# Controlled exploration
+# -----------------------------------------------------------------------------
+
+exploration:
+  enabled: true
+
+  # New branches begin cheap and earn larger tiers through yield/convergence.
+  initial_tier: SMALL
+  maximum_tier: EXHAUSTIVE
+
+  # Keep a protected long-tail lane so Target Genome observations do not starve
+  # unseen public-corpus terms.
+  protected_lane: EXPLORATION
+  reserve_fraction_from_budgets: true
+
+  # A low-yield EXPLORATION branch normally cools down instead of being
+  # permanently closed solely because its recent yield is low.
+  exploration_low_yield_close: false
+
+# -----------------------------------------------------------------------------
+# Workers
+# -----------------------------------------------------------------------------
+#
+# `enabled` and `routes` are bootstrap-level fields.
+# `backend` / `config` names below map to the current worker Pydantic models.
+#
+# Empty extra_args is intentional. Night Scout workers already reject or avoid
+# unsafe flags such as credentials, proxies, redirects, auto form submission,
+# TLS impersonation, raw-response persistence, etc.
+
+workers:
+
+  passive_domains:
+    enabled: true
+    backend:
+      binary: subfinder
+      recursive: false
+      all_sources: false
+      sources: []
+      exclude_sources: []
+      rate_limit: null
+      max_results_per_source: null
+      source_timeout_seconds: 30
+      max_time_minutes: 10
+      process_timeout_seconds: 660
+      config_path: null
+      provider_config_path: null
+      extra_args: []
+      stderr_tail_lines: 80
+      stream_limit_bytes: 1048576
+    config:
+      confidence_single_provider: 0.55
+      confidence_named_provider: 0.60
+      retry_after_seconds: 30
+      fail_if_all_sources_fail: true
+
+  dns:
+    enabled: true
+    backend:
+      binary: dnsx
+      resolvers: []
+      retry: 1
+      query_timeout: 3s
+      process_timeout_seconds: 15
+      capture_nxdomain: true
+      stderr_tail_lines: 80
+      stream_limit_bytes: 1048576
+      extra_args: []
+    config:
+      record_types:
+        - A
+        - AAAA
+        - CNAME
+      rate_lease_seconds: 30
+      confirmation_confidence: 0.95
+      record_confidence: 0.95
+      cname_target_confidence: 0.90
+      negative_confidence: 0.90
+      default_retry_after_seconds: 5
+
+  permutations:
+    enabled: true
+    config:
+      tier: SMALL
+      max_candidates: null
+      exploration_fraction: 0.20
+      minimum_exploration_candidates: 25
+      pairwise_top_words: 24
+      pairwise_enabled: true
+      nested_children: true
+      sibling_mutations: true
+      candidate_confidence_floor: 0.25
+      candidate_confidence_ceiling: 0.75
+
+  http:
+    enabled: true
+    backend:
+      binary: httpx
+      schemes:
+        - https
+        - http
+      timeout_seconds: 10
+      process_timeout_seconds: 20
+      max_response_read_bytes: 2097152
+      user_agent: NightScout/0.1 authorized-security-research
+      detect_technologies: true
+      stderr_tail_lines: 80
+      stream_limit_bytes: 1048576
+      extra_args: []
+    config:
+      rate_lease_seconds: 30
+      service_confidence: 0.97
+      response_confidence: 0.98
+      technology_confidence: 0.80
+      redirect_confidence: 0.85
+      failure_confidence: 0.55
+      default_retry_after_seconds: 5
+
+  tls:
+    enabled: true
+    backend:
+      binary: tlsx
+      timeout_seconds: 5
+      process_timeout_seconds: 12
+      scan_mode: ctls
+      stderr_tail_lines: 80
+      stream_limit_bytes: 1048576
+      extra_args: []
+    config:
+      default_port: 443
+      rate_lease_seconds: 20
+      certificate_confidence: 0.98
+      san_confidence: 0.95
+      derived_target_confidence: 0.85
+      default_retry_after_seconds: 5
+
+  asn:
+    enabled: true
+    backend:
+      binary: asnmap
+      config_path: null
+      process_timeout_seconds: 30
+      stderr_tail_lines: 80
+      stream_limit_bytes: 1048576
+      extra_args: []
+    config:
+      asn_confidence: 0.92
+      containing_range_confidence: 0.92
+      related_range_confidence: 0.75
+      retry_after_seconds: 30
+
+  archives:
+    enabled: true
+    backend:
+      binary: urlfinder
+      sources:
+        - waybackarchive
+        - commoncrawl
+      all_sources: false
+      field_scope: rdn
+      provider_rate_limit: 5
+      config_path: null
+      provider_config_path: null
+      process_timeout_seconds: 300
+      stderr_tail_lines: 100
+      stream_limit_bytes: 2097152
+      extra_args: []
+    config:
+      url_confidence: 0.82
+      hostname_confidence: 0.76
+      derived_confidence: 0.78
+      api_endpoint_confidence: 0.70
+      artifact_confidence: 0.72
+      retry_after_seconds: 30
+      max_url_length: 16384
+      max_parameters_per_url: 64
+      recent_dedupe_capacity: 250000
+      fail_if_all_sources_fail: true
+
+  crawler:
+    enabled: true
+    backend:
+      binary: katana
+      depth: 3
+      crawl_duration_seconds: 60
+      max_domain_pages: 250
+      timeout_seconds: 10
+      max_response_size_bytes: 2097152
+      process_timeout_seconds: 90
+      js_crawl: true
+      form_extraction: true
+      ignore_query_param_values: true
+      filter_similar_urls: true
+      known_files:
+        - robotstxt
+        - sitemapxml
+      user_agent: NightScout/0.1 authorized-security-research
+      stderr_tail_lines: 120
+      stream_limit_bytes: 2097152
+      extra_args: []
+    config:
+      url_confidence: 0.98
+      path_confidence: 0.96
+      api_confidence: 0.85
+      javascript_confidence: 0.96
+      parameter_confidence: 0.92
+      response_confidence: 0.97
+      retry_after_seconds: 5
+      lease_margin_seconds: 30
+      max_parameters_per_url: 64
+      max_form_fields_per_result: 128
+
+  content:
+    enabled: true
+    backend:
+      binary: httpx
+      timeout_seconds: 10
+      process_timeout_seconds: 20
+      max_response_bytes: 8388608
+      user_agent: NightScout/0.1 authorized-security-research
+      stderr_tail_lines: 100
+      stream_limit_bytes: 67108864
+      extra_args: []
+    config:
+      rate_lease_seconds: 30
+      response_confidence: 0.98
+      content_confidence: 0.99
+      default_retry_after_seconds: 5
+      retryable_status_codes:
+        - 408
+        - 425
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+      accepted_content_types:
+        - application/javascript
+        - application/x-javascript
+        - text/javascript
+      allow_missing_content_type: true
+      reject_html_prefix_bytes: 2048
+
+  javascript:
+    enabled: true
+    config:
+      max_content_bytes: 33554432
+      max_strings: 200000
+      max_string_length: 16384
+      max_urls: 20000
+      max_api_endpoints: 20000
+      max_parameters: 10000
+      max_vocabulary_tokens: 30000
+      max_source_maps: 1024
+      min_vocab_length: 2
+      max_vocab_length: 64
+      url_confidence: 0.90
+      dns_confidence: 0.84
+      path_confidence: 0.88
+      api_confidence: 0.82
+      parameter_confidence: 0.86
+      vocabulary_confidence: 0.72
+      source_map_confidence: 0.90
+
+  parameters:
+    enabled: true
+    config:
+      targeted_candidates: 300
+      exploration_candidates: 150
+      chunk_size: 50
+      request_timeout_seconds: 15
+      process_timeout_seconds: 300
+      lease_margin_seconds: 30
+      confirmed_confidence: 0.98
+      heuristic_confidence: 0.90
+      retry_after_seconds: 15
+    backend:
+      binary: arjun
+      stderr_tail_lines: 100
+      stdout_tail_lines: 100
+      stream_limit_bytes: 1048576
+      extra_args: []
+
+  vhost:
+    enabled: true
+    config:
+      targeted_limit: 250
+      exploration_limit: 100
+      rate_lease_seconds: 30
+      default_retry_after_seconds: 5
+      min_differential_score: 2.0
+      min_stable_dimensions: 1
+      vhost_confidence_base: 0.72
+      vhost_confidence_ceiling: 0.96
+    backend:
+      binary: httpx
+      timeout_seconds: 10
+      process_timeout_seconds: 20
+      max_response_read_bytes: 2097152
+      user_agent: NightScout/0.1 authorized-security-research
+      stderr_tail_lines: 100
+      stream_limit_bytes: 4194304
+      extra_args: []
+
+  nuclei:
+    enabled: true
+
+    # Bootstrap-level audited template catalog. Copy the example manifest to
+    # configs/nuclei-templates.yaml and pin only templates reviewed for the
+    # target program's allowed read-only validation behavior.
+    templates:
+      manifest: configs/nuclei-templates.yaml
+      root: nuclei-templates
+      max_template_bytes: 1048576
+
+    config:
+      max_requests_per_template: 3
+      lease_margin_seconds: 30
+      default_retry_after_seconds: 10
+      minimum_cpe_score: 0.60
+      finding_confidence_floor: 0.72
+      finding_confidence_ceiling: 0.95
+      require_signed_templates: true
+
+    backend:
+      binary: nuclei
+      timeout_seconds: 10
+      process_timeout_seconds: 60
+      max_response_read_bytes: 1048576
+      max_response_save_bytes: 1024
+      stderr_tail_lines: 100
+      stream_limit_bytes: 2097152
+      extra_args: []
+
+  mobile:
+    enabled: true
+    config:
+      max_artifact_bytes: 536870912
+      max_archive_entries: 100000
+      max_archive_member_bytes: 67108864
+      max_archive_total_uncompressed_bytes: 1073741824
+      max_files_scanned: 100000
+      max_file_scan_bytes: 8388608
+      max_total_scan_bytes: 536870912
+      min_printable_string_length: 6
+      max_urls: 20000
+      max_dns_names: 20000
+      max_api_endpoints: 20000
+      max_parameters: 20000
+      max_vocabulary_tokens: 50000
+      max_projects: 2048
+      max_technologies: 2048
+      max_deep_links: 4096
+      max_secret_findings: 4096
+
+      enable_jadx: true
+      enable_apktool_fallback: true
+      enable_builtin_secret_scan: true
+      enable_gitleaks: true
+      enable_trufflehog: true
+
+      decompiler_timeout_seconds: 180
+      secret_scanner_timeout_seconds: 120
+
+      external_scan_max_file_bytes: 16777216
+      external_scan_max_total_bytes: 268435456
+
+      include_masked_secret_preview: false
+
+      # Preserve exact evidence only in the protected evidence store.
+      preserve_raw_secret_evidence: true
+      sensitive_evidence_root: .nightscout/sensitive-evidence
+
+  fingerprints:
+    enabled: true
+    config:
+      emit_http_content: true
+      emit_http_structure: true
+      emit_http_stack: true
+      emit_tls_certificate: true
+      emit_tls_identity: true
+      emit_favicon_sha256: true
+      emit_favicon_mmh3: true
+      normalize_title_max_chars: 256
+      max_technologies: 64
+
+# -----------------------------------------------------------------------------
+# Wordlist / Target Genome intelligence
+# -----------------------------------------------------------------------------
+
+intelligence:
+
+  wordlists:
+    # Maps to WordlistCorpusConfig. The bundled manifest is deliberately small.
+    # After an explicit `python scripts/wordlists_sync.py sync`, point this at:
+    #   wordlists/generated/manifest.local.yaml
+    # to enable the synchronized external corpus. Runtime never downloads lists.
+    manifest: wordlists/manifest.yaml
+    corpus_root: wordlists
+
+    dns_tier: medium
+    parameter_tier: medium
+
+    max_target_dns_entries: 50000
+    max_target_parameter_entries: 50000
+
+    include_general_in_dns: true
+    include_general_in_parameters: true
+
+    max_target_events: 250000
+    max_projected_evidence: 500000
+
+    target_frequency_log_scale: 0.12
+    target_diversity_scale: 0.08
+
+  vocabulary:
+    # Only overrides are shown; built-in environment/service/region vocabularies
+    # remain in VocabularyProjectorConfig.
+    min_token_length: 2
+    max_token_length: 64
+    max_tokens_per_event: 512
+    max_query_parameters: 256
+    max_certificate_sans: 512
+    max_pattern_slot_values: 1024
+
+    include_http_title: true
+    include_http_server: true
+    include_certificate_subject: true
+    include_url_hostname_labels: true
+
+  patterns:
+    min_support: 3
+    max_target_events: 250000
+    max_confirmed_hostnames: 100000
+
+    max_components_per_label: 8
+    max_variable_slots: 5
+
+    max_patterns: 256
+    max_anchor_clusters_per_group: 32
+
+    max_combination_space: 4096
+    max_hypotheses_per_pattern: 128
+    max_hypotheses_total: 1000
+
+    min_pattern_confidence: 0.52
+    candidate_confidence_floor: 0.35
+    candidate_confidence_ceiling: 0.92
+
+    allow_unanchored_semantic_pattern: true
+
+  confidence:
+    default_prior: 0.10
+
+    same_group_repeat_discount: 0.15
+    same_source_family_discount: 0.55
+    same_upstream_discount: 0.40
+
+    contradiction_impact: 0.92
+    hypothesis_tag_multiplier: 0.55
+    historical_tag_multiplier: 0.90
+
+    # Correlation evidence alone cannot become confirmation.
+    correlation_ceiling: 0.45
+
+  novelty:
+    default_baseline: 0.30
+
+    first_observation_weight: 0.34
+    low_observation_weight: 0.16
+
+    historical_only_weight: 0.24
+    live_after_historical_weight: 0.38
+
+    environment_weight: 0.20
+    api_version_weight: 0.12
+
+    rare_fingerprint_weight: 0.24
+    rare_technology_weight: 0.14
+    rare_naming_weight: 0.18
+
+    repeated_penalty_weight: 0.42
+    common_fingerprint_penalty_weight: 0.28
+    common_technology_penalty_weight: 0.16
+    common_naming_penalty_weight: 0.14
+
+    static_penalty_weight: 0.16
+    cdn_penalty_weight: 0.18
+    marketing_penalty_weight: 0.14
+
+  vulnerabilities:
+    enabled: true
+
+    # Public NVD reference-data cache; disposable and separate from the main
+    # Night Scout event database. Target identifiers are never sent to NVD.
+    nvd_cache_path: .nightscout/cache/nvd.sqlite3
+
+    client:
+      api_key_env: NVD_API_KEY
+      timeout_seconds: 20
+      min_request_interval_seconds: 6
+      max_attempts: 3
+      max_response_bytes: 16777216
+      cpe_results_per_page: 100
+      max_cpe_records: 250
+      cve_results_per_page: 2000
+      max_cves_per_cpe: 500
+      cpe_cache_ttl_seconds: 2592000
+      cve_cache_ttl_seconds: 86400
+      negative_cache_ttl_seconds: 21600
+      min_cpe_score: 0.60
+      max_cpe_candidates: 5
+      max_references_per_cve: 32
+
+  yield_model:
+    hit_prior_alpha: 1.0
+    hit_prior_beta: 1.0
+
+    execution_prior_alpha: 4.0
+    execution_prior_beta: 1.0
+
+    novelty_prior_alpha: 1.0
+    novelty_prior_beta: 1.0
+
+    discovery_saturation_per_attempt: 1.0
+
+    hit_weight: 0.50
+    discovery_weight: 0.25
+    novelty_weight: 0.15
+    reliability_weight: 0.10
+
+    default_cost_units: 1.0
+
+    prior_component_weight: 1.0
+    target_weight: 0.75
+    worker_weight: 1.0
+    worker_action_weight: 2.5
+    route_weight: 1.5
+    branch_weight: 1.5
+    input_source_weight: 1.0
+
+    reliability_half_life: 12.0
+
+    uncertainty_weight: 0.75
+    disagreement_weight: 0.25
+
+    trend_window_executions: 20
+    trend_min_recent_executions: 8
+
+    low_hit_rate_threshold: 0.08
+    low_assets_per_execution_threshold: 0.10
+    low_novel_assets_per_execution_threshold: 0.05
+
+  convergence:
+    minimum_recent_executions: 8
+
+    productive_hit_rate: 0.12
+    productive_novel_assets_per_execution: 0.10
+
+    advance_expected_yield: 0.58
+    advance_productive_streak: 2
+    advance_max_soft_pressure: 0.80
+
+    low_yield_convergence_signal: 0.70
+    low_information_gain: 0.35
+
+    cooldown_low_yield_streak: 2
+    close_low_yield_streak: 4
+
+    cooldown_base_seconds: 900
+    cooldown_max_seconds: 86400
+
+    productive_soft_multiplier_max: 2.0
+    productive_soft_multiplier_threshold: 0.62
+
+    hard_pressure_close_threshold: 1.0
+    soft_pressure_cooldown_threshold: 1.0
+
+  genome:
+    max_events: 250000
+    max_vocabulary_observations: 500000
+
+    max_vocabulary_entries: 512
+    max_vocabulary_yield_queries: 256
+
+    max_patterns: 128
+    max_pattern_yield_queries: 128
+
+    max_assets: 512
+    max_asset_assessment_candidates: 2048
+    assessment_concurrency: 24
+
+    max_learned_signals: 256
+
+    max_url_shapes: 128
+    max_application_titles: 64
+    max_technology_stacks: 64
+    max_certificate_relations: 128
+
+    max_examples_per_shape: 4
+    max_certificate_sans: 256
+
+# -----------------------------------------------------------------------------
+# Snapshots / surface diff
+# -----------------------------------------------------------------------------
+
+snapshots:
+  enabled: true
+
+  kinds:
+    - DNS
+    - HTTP
+    - TLS
+    - JAVASCRIPT
+    - API
+    - ASSET
+
+  diff_on_write: true
+
+  # Explicit absence matters for DISAPPEARED_HOST / resurrection detection.
+  record_present_false: true
+
+# -----------------------------------------------------------------------------
+# Export defaults
+# -----------------------------------------------------------------------------
+#
+# SAFE is always the default.
+# Sensitive evidence export requires an explicit opt-in/confirmation at export
+# time and reads raw credentials only from the protected evidence store.
+
+exports:
+  default_mode: SAFE
+
+  jsonl:
+    enabled: true
+    path: exports/nightscout.jsonl
+
+  text:
+    enabled: true
+    directory: exports/text
+
+  csv:
+    enabled: true
+    directory: exports/csv
+
+  sensitive_evidence:
+    enabled: true
+    require_explicit_confirmation: true

@@ -38,6 +38,9 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
 ]
+release = [
+    "pyinstaller>=6.0",
+]
 
 [project.scripts]
 nightscout = "recon.cli:app"
@@ -47,7 +50,11 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["recon*"]
+include = ["recon*", "migrations*", "scripts*"]
+
+[tool.setuptools.package-data]
+migrations = ["script.py.mako", "versions/*.py"]
+scripts = ["tools_manifest.yaml"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

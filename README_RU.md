@@ -16,7 +16,244 @@ Night Scout — это движок оркестрации разведки, п�
 
 Night Scout не предназначен для автономной эксплуатации уязвимостей. Его задача — картографировать, обогащать, связывать, приоритизировать и объяснять находки поверхности атаки внутри явно разрешённого bug-bounty scope.
 
+
 ---
+
+# Быстрый старт
+
+Night Scout распространяется для **Debian 13+** и актуального **Kali Linux**.
+Обычному пользователю не нужно клонировать репозиторий, создавать Python venv
+или вручную управлять PyInstaller bundle.
+
+## Установка
+
+### Вариант A — готовый пакет из GitHub Release
+
+Скачайте `.deb` для своей архитектуры со страницы **Releases** проекта и
+установите файл из каталога, куда он был сохранён:
+
+```bash
+sudo apt install ./nightscout_<version>_amd64.deb
+```
+
+Для ARM64 используется соответствующий пакет `arm64`, когда он опубликован. APT
+установит полный standalone runtime и создаст глобальную команду `nightscout`.
+
+Проверка установки:
+
+```bash
+nightscout --version
+```
+
+### Вариант B — собрать `.deb` из исходников
+
+Для разработки или локальной сборки:
+
+```bash
+git clone <night-scout-repository-url>
+cd Night-scout-main
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[release]'
+
+python scripts/build_deb.py
+sudo apt install ./release/nightscout_<version>_amd64.deb
+```
+
+`build_deb.py` использует существующий PyInstaller one-folder bundle, если он
+уже собран; иначе сначала собирает standalone distribution. Рядом создаётся
+файл `.deb.sha256`.
+
+## Первый setup
+
+Один раз запустите setup от имени **обычного пользователя, от которого будет
+работать reconnaissance**:
+
+```bash
+nightscout setup
+```
+
+Не запускайте эту команду через `sudo`. Debian-пакет уже установил неизменяемое
+приложение в `/usr`; setup создаёт пользовательские конфиги/state,
+устанавливает или проверяет обязательные companion tools, синхронизирует
+консервативный default-набор публичных словарей и запускает `doctor`. При первом
+setup загрузка companion tools может занять несколько минут; Night Scout теперь
+показывает текущую фазу и конкретный tool, над которым работает.
+
+Пользовательские данные по умолчанию находятся здесь:
+
+```text
+~/.config/nightscout/       конфигурация и scope
+~/.local/share/nightscout/  SQLite workspace, tools, wordlists, artifacts
+~/.cache/nightscout/        disposable caches
+```
+
+Полезные варианты setup:
+
+```bash
+# Инициализация без скачивания companion tools и публичных словарей.
+nightscout setup --skip-tools --skip-wordlists
+
+# Также установить optional mobile-analysis tools.
+nightscout setup --optional-tools
+
+# Обновить уже управляемые companion tools во время setup.
+nightscout setup --update-tools
+```
+
+## Первый авторизованный запуск
+
+Для реальной bug-bounty программы лучше один раз перенести правила программы в
+scope YAML и позволить Night Scout самому получить все domain seeds:
+
+```bash
+nightscout run --scope ./program.yaml
+```
+
+Scope и seeds — разные вещи. Exact `IN_SCOPE` DOMAIN rule запускается напрямую.
+Wildcard вроде `*.example.org` создаёт passive discovery anchor `example.org`,
+чтобы Subfinder/архивы могли начать поиск, но сам apex **не становится**
+разрешённым для active probing. Каждый найденный конкретный hostname заново
+проверяется по настоящим scope rules.
+
+Можно явно задать сразу несколько стартовых доменов, сохранив YAML верхней
+границей полномочий:
+
+```bash
+nightscout run api.example.com portal.example.net example.org --scope ./program.yaml
+```
+
+Если explicit seed не является `IN_SCOPE` или допустимым `PASSIVE_ONLY`
+discovery anchor, Night Scout остановится до запуска recursive runtime.
+
+Для простого запуска одного домена остаётся shortcut:
+
+```bash
+nightscout run example.com
+```
+
+Default scope изначально **fail-closed**. Если для `example.com` ещё нет
+локального scope rule, интерактивный первый запуск отдельно просит подтвердить
+exact-domain и отдельно — wildcard-поддомены. Уже существующий `OUT_OF_SCOPE`,
+`PASSIVE_ONLY` или другой явный classification никогда не переопределяется
+молча.
+
+Для automation/non-interactive режима с локальным managed scope:
+
+```bash
+# Только exact domain.
+nightscout run example.com --authorize-exact
+
+# Exact domain плюс *.example.com.
+nightscout run example.com --authorize-subdomains
+```
+
+Минимальный program scope:
+
+```yaml
+schema_version: 1
+target_id: example-program
+display_name: Example Bug Bounty Program
+gate:
+  allow_unknown_passive: false
+rules:
+  - rule_id: api-exact
+    kind: DOMAIN
+    pattern: api.example.com
+    state: IN_SCOPE
+    priority: 100
+    tier: L1
+    reason: Явно указан программой
+
+  - rule_id: wildcard-main
+    kind: DOMAIN
+    pattern: "*.example.org"
+    state: IN_SCOPE
+    priority: 100
+    tier: L2
+    reason: Программа явно разрешает wildcard
+
+  - rule_id: excluded-admin
+    kind: DOMAIN
+    pattern: admin.example.org
+    state: OUT_OF_SCOPE
+    priority: 300
+    reason: Явное исключение программы
+```
+
+Переноси scope буквально: exact assets становятся exact rules, wildcard остаётся
+wildcard, а exclusions получают более высокий priority. Не выводи authorization
+из DNS, сертификатов, ASN, CNAME или общей инфраструктуры.
+
+## Основные команды
+
+```bash
+# Запустить все domain seeds, полученные из scope реальной программы.
+nightscout run --scope ./program.yaml
+
+# Или явно дать несколько seeds под тем же authorization boundary.
+nightscout run api.example.com portal.example.net --scope ./program.yaml
+
+# Shortcut для одного домена остаётся.
+nightscout run example.com
+
+# Ограничить один запуск, сохранив frontier в SQLite.
+nightscout run --scope ./program.yaml --max-steps 100
+
+# Посмотреть persistent runs, tasks, assets и review state.
+nightscout status
+
+# Объяснить сохранённый Event по event ID или точному Event value.
+nightscout explain <event-id-or-value>
+
+# SAFE export сразу в JSONL, TXT и CSV.
+nightscout export
+
+# Экспорт одного формата.
+nightscout export --format jsonl
+nightscout export --format text
+nightscout export --format csv
+
+# Sensitive evidence — отдельная поверхность с двойным opt-in.
+nightscout export --sensitive --confirm-sensitive
+
+# Проверить конфиг, платформу и companion tools без сканирования.
+nightscout doctor
+```
+
+### Companion tools
+
+Обычно обязательные tools устанавливает `nightscout setup`. Для ручного
+управления остаются:
+
+```bash
+nightscout tools list
+nightscout tools verify
+nightscout tools install
+nightscout tools install --optional
+nightscout tools install --update
+```
+
+### Словари
+
+Bundled baseline corpus доступен сразу после setup. Публичные corpora можно
+посмотреть или обновить явно:
+
+```bash
+nightscout wordlists list
+nightscout wordlists verify
+nightscout wordlists sync
+nightscout wordlists sync --all
+```
+
+Большие публичные словари хранятся в пользовательском data-каталоге Night Scout,
+а не коммитятся в основной репозиторий. Сам recon runtime никогда не выполняет
+скрытую загрузку словарей во время reconnaissance.
+
+---
+
 
 # 1. Основная концепция
 
@@ -144,6 +381,8 @@ night-scout/
 ├── recon/
 │   ├── __init__.py
 │   ├── cli.py
+│   ├── runtime.py
+│   ├── userenv.py
 │   │
 │   ├── core/
 │   │   ├── events.py
@@ -155,6 +394,7 @@ night-scout/
 │   │
 │   ├── policy/
 │   │   ├── scope.py
+│   │   ├── seeds.py
 │   │   ├── rate_limit.py
 │   │   ├── restrictions.py
 │   │   └── review_gate.py
@@ -163,7 +403,9 @@ night-scout/
 │   │   ├── database.py
 │   │   ├── models.py
 │   │   ├── provenance.py
-│   │   └── snapshots.py
+│   │   ├── snapshots.py
+│   │   ├── intelligence.py
+│   │   └── schema.py
 │   │
 │   ├── workers/
 │   │   ├── passive_domains.py
@@ -179,16 +421,19 @@ night-scout/
 │   │   ├── content.py
 │   │   ├── parameters.py
 │   │   ├── mobile.py
-│   │   └── fingerprints.py
+│   │   ├── fingerprints.py
+│   │   └── nuclei.py
 │   │
 │   ├── intelligence/
+│   │   ├── wordlists.py
 │   │   ├── vocabulary.py
 │   │   ├── patterns.py
 │   │   ├── confidence.py
 │   │   ├── novelty.py
 │   │   ├── yield_model.py
 │   │   ├── convergence.py
-│   │   └── genome.py
+│   │   ├── genome.py
+│   │   └── vulnerabilities.py
 │   │
 │   └── exporters/
 │       ├── jsonl.py
@@ -197,12 +442,37 @@ night-scout/
 │
 ├── configs/
 │   ├── scope.example.yaml
-│   └── pipeline.example.yaml
+│   ├── pipeline.example.yaml
+│   └── nuclei-templates.example.yaml
 │
 ├── migrations/
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions/
+│       └── 0001_initial_schema_*.py
 ├── tests/
+│   ├── test_migrations.py
+│   ├── test_runtime.py
+│   ├── test_scope_and_policy.py
+│   ├── test_storage_regressions.py
+│   ├── test_wordlists_sync.py
+│   └── ...
+│
+├── wordlists/
+│   ├── manifest.yaml
+│   ├── sources.yaml
+│   ├── builtins/
+│   ├── cache/          # gitignored external corpora
+│   └── generated/      # gitignored lock/local manifest
+│
 ├── docs/
 └── scripts/
+    ├── wordlists_sync.py
+    ├── install_tools.py
+    ├── tools_manifest.yaml
+    ├── build_binary.py
+    ├── build_deb.py
+    └── verify_release.py
 ```
 
 ---
@@ -211,27 +481,37 @@ night-scout/
 
 ## `recon/cli.py`
 
-Точка входа command-line interface.
-
-Отвечает за предоставление высокоуровневых операций, например:
+Тонкая Typer-точка входа. Начальный runtime предоставляет:
 
 ```text
-init target
-load scope
-seed assets
-plan tasks
-run pipeline
-resume pipeline
-show status
-show changes
-review blocked events
-export results
-explain an asset
+nightscout setup
+nightscout run <root-domain>
+nightscout status
+nightscout explain <event-id-or-value>
+nightscout export
+nightscout doctor
+nightscout tools ...
+nightscout wordlists ...
 ```
 
-Сам CLI не должен содержать recon-логику.
+Recon-логика в CLI не живёт: он загружает конфигурацию и делегирует работу
+`recon/runtime.py`.
 
-Он делегирует работу core-сервисам.
+---
+
+## `recon/runtime.py`
+
+Composition root реально запускаемого Night Scout. Он связывает:
+
+```text
+YAML configs -> SQLite -> EventBus -> Router -> Scheduler
+             -> scope/restrictions/review/budgets
+             -> worker registry -> новые Events -> recursive frontier
+```
+
+Здесь же подключаются provenance, snapshots, vocabulary projection, cached NVD
+CVE enrichment, yield/convergence instrumentation, Target Genome persistence и
+SAFE/SENSITIVE exporters. Runtime-сигналы никогда не обходят policy gates.
 
 ---
 
@@ -429,6 +709,16 @@ program-specific scope tiers
 ```
 
 Ни один active worker не должен получить event до появления scope decision.
+
+---
+
+## `recon/policy/seeds.py`
+
+Отделяет authorization boundary от стартовых точек discovery. Модуль выводит
+несколько domain seeds из program scope и создаёт непостоянные
+`PASSIVE_ONLY` apex anchors для wildcard rules вроде `*.example.com`. Такой
+anchor нужен только для запуска passive discovery и никогда не превращает apex
+в active scope.
 
 ---
 
@@ -782,6 +1072,8 @@ more requests
 # 11. Vocabulary Engine
 
 Generic wordlists полезны как стартовые данные, но со временем основным источником словаря должна становиться сама цель.
+
+Публичные corpora синхронизируются только явным запуском `scripts/wordlists_sync.py`; recursive runtime их не скачивает. Большие данные SecLists/Assetnote/Trickest лежат в gitignored `wordlists/cache/`, а `sources.lock.yaml` фиксирует фактические SHA-256 исходных и нормализованных файлов. Встроенный `wordlists/manifest.yaml` остаётся маленьким bootstrap corpus, а синхронизированные источники публикуются через `wordlists/generated/manifest.local.yaml`.
 
 Vocabulary можно извлекать из:
 
@@ -2073,3 +2365,141 @@ higher-value reconnaissance
 > **Следующий шаг разведки должен учитывать всё, что система уже узнала о цели.**
 
 Поэтому Night Scout рассматривает reconnaissance как постоянно улучшаемую модель поверхности атаки, а не как одноразовый scan.
+
+
+---
+
+# 38. Миграции базы и regression tests
+
+Night Scout использует Alembic для обновления схемы постоянного SQLite
+workspace. При старте runtime сначала обновляет БД до текущего migration head и
+только после этого открывает async SQLAlchemy engine.
+
+```text
+пустая БД
+   ↓
+Alembic upgrade head
+   ↓
+актуальная схема
+```
+
+Старые Night Scout БД, созданные до Alembic, принимаются консервативно:
+
+```text
+БД без версии
+   ↓
+точная проверка таблиц/колонок
+   ├─ совпадает    → stamp baseline revision, данные сохраняются
+   └─ не совпадает → fail closed; БД автоматически не переписывается
+```
+
+Проверка миграций при разработке:
+
+```bash
+alembic -c alembic.ini upgrade head
+alembic -c alembic.ini check
+```
+
+Test suite является regression gate перед релизом:
+
+```bash
+pytest
+coverage run -m pytest
+coverage report
+```
+
+Он покрывает прежде всего рискованные архитектурные границы без реального
+трафика к цели и без обязательного наличия recon CLI: precedence scope,
+fail-closed restrictions, redaction/sensitive export секретов, независимость
+confidence evidence, novelty, yield attribution, privacy/cache NVD, аудит Nuclei
+templates, SQLite FK ordering, migrations, CLI и локальный recursive runtime
+smoke через permutations worker.
+
+Внешние binaries тестируются через adapters/fake subprocess fixtures. Обычные
+unit/integration tests не должны обращаться к reconnaissance-целям.
+
+## Направление binary distribution
+
+Внутри Night Scout остаётся Python 3.12+ проектом. Релиз собирается как
+PyInstaller **one-folder** standalone distribution для Debian/Kali.
+Специализированные CLI остаются внешними зависимостями, управляются через
+`nightscout tools` и проверяются через `nightscout doctor`; переписывать
+orchestrator на Go/Rust только ради одного бинарника не планируется.
+
+---
+
+# 39. Supply chain утилит Debian/Kali и standalone release
+
+Night Scout намеренно поддерживает только **Debian GNU/Linux** и **Kali Linux**
+на `x86_64` и `aarch64`. На другой ОС/архитектуре runtime завершается fail
+closed до запуска reconnaissance. Официальный готовый `.deb` собирается на
+Debian 13, поэтому hosted standalone пакет рассчитан на Debian 13+ и актуальный
+Kali. Локальный `.deb` записывает major/minor glibc build-хоста как явную
+зависимость `libc6`, чтобы APT не ставил пакет на ABI-несовместимую старую систему.
+
+Внешние specialist tools хранятся отдельно:
+
+```text
+~/.local/share/nightscout/tools/
+├── bin/
+├── apps/
+├── downloads/
+└── tools.lock.yaml
+```
+
+`bin/` автоматически добавляется в PATH workers.
+
+```bash
+nightscout tools list
+nightscout tools install
+nightscout tools install --optional --install-prerequisites
+nightscout tools verify
+nightscout wordlists list
+nightscout wordlists sync
+nightscout wordlists verify
+nightscout doctor
+```
+
+Канонический manifest — `scripts/tools_manifest.yaml`. ProjectDiscovery tools
+устанавливаются через PDTM, Arjun через pipx, JADX/Apktool/Gitleaks/TruffleHog
+из официальных release assets. Для GitHub binaries требуется upstream SHA-256
+(digest/checksum); обход возможен только явным `--allow-unverified` после ручной
+проверки.
+
+Внутри Night Scout остаётся Python-проектом, а релиз собирается как
+**PyInstaller one-folder distribution**, не one-file. Внешние recon binaries в
+сам executable не зашиваются.
+
+## Устройство пакета и release CI
+
+Пользовательская установка и основные команды описаны в разделе **Быстрый
+старт** в начале README. Ниже остаются только технические детали packaging.
+
+`.deb` кладёт полный PyInstaller one-folder runtime в `/usr/lib/nightscout/` и
+создаёт `/usr/bin/nightscout`. Изменяемые данные никогда не пишутся в `/usr`;
+`nightscout setup` создаёт XDG user state в `~/.config/nightscout/`,
+`~/.local/share/nightscout/` и `~/.cache/nightscout/`.
+
+Локальная сборка пакета использует тот же release path, что и CI:
+
+```bash
+python -m pip install -e '.[release]'
+python scripts/build_deb.py
+```
+
+Если `release/dist/nightscout` уже существует, `build_deb.py` использует его;
+иначе сначала вызывает `build_binary.py`. Рядом с Debian-пакетом создаётся
+`.deb.sha256`. Для низкоуровневой проверки standalone release остаются команды:
+
+```bash
+python scripts/build_binary.py
+python scripts/verify_release.py release/dist/nightscout
+```
+
+Release CI находится в `.github/workflows/release.yml`. Job внутри
+`debian:13-slim` прогоняет regression/schema gates, собирает standalone bundle,
+упаковывает `.deb`, устанавливает пакет для smoke-проверки и сохраняет `.deb`,
+`.deb.sha256`, tarball и его SHA-256. При push version tag (`v*`) те же
+проверенные файлы прикладываются к GitHub Release. Текущий hosted job собирает
+`amd64`; `arm64` использует те же scripts на нативном Debian/Kali ARM64 build
+host.

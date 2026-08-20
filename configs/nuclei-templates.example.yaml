@@ -1,0 +1,33 @@
+# Night Scout audited Nuclei template manifest example.
+#
+# Automatic Nuclei validation is fail-closed. A template runs only when:
+#   - it is explicitly listed here;
+#   - audited: true;
+#   - the local file SHA-256 exactly matches `sha256`;
+#   - the template also passes Night Scout's structural safety audit;
+#   - the CVE candidate is IN_SCOPE and passes all lifecycle policy gates.
+#
+# The automatic lane accepts only bounded model-based HTTP GET/HEAD/OPTIONS
+# templates. Raw requests, request bodies, payloads/bruteforce, fuzzing, race
+# conditions, unsafe HTTP, OAST/interactsh, code, JavaScript, headless, network,
+# DNS, SSL and authenticated behavior are rejected.
+#
+# Keep this file under source control if you want an auditable history of which
+# exact template digests were authorized. Do NOT point automatic execution at
+# an unreviewed rolling templates directory.
+
+schema_version: 1
+
+templates: []
+
+# Example after a human audit (commented out intentionally):
+#
+# templates:
+#   - cve_id: CVE-2025-12345
+#     template_id: CVE-2025-12345
+#     path: http/cves/2025/CVE-2025-12345.yaml
+#     sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+#     audited: true
+#     audit_note: "GET-only version/banner validation; no state change or OAST"
+#     max_requests: 2
+#     require_signed: true

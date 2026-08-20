@@ -1,0 +1,97 @@
+version: 1
+sources:
+  - id: seclists.dns.top5000
+    url: https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt
+    local_path: cache/seclists/subdomains-top1million-5000.txt
+    categories: [dns, vhost, general]
+    transform: dns_labels
+    weight: 1.00
+    max_bytes: 2097152
+    max_entries: 5000
+    default: true
+    license: MIT
+    upstream: https://github.com/danielmiessler/SecLists
+
+  - id: seclists.web.raft-small-words
+    url: https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-small-words.txt
+    local_path: cache/seclists/raft-small-words.txt
+    categories: [path, api]
+    transform: words
+    weight: 0.90
+    max_bytes: 8388608
+    max_entries: 50000
+    default: true
+    license: MIT
+    upstream: https://github.com/danielmiessler/SecLists
+
+  - id: seclists.parameters.burp
+    url: https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/burp-parameter-names.txt
+    local_path: cache/seclists/burp-parameter-names.txt
+    categories: [parameter]
+    transform: parameter_names
+    weight: 1.00
+    max_bytes: 2097152
+    max_entries: 20000
+    default: true
+    license: MIT
+    upstream: https://github.com/danielmiessler/SecLists
+
+  - id: seclists.api.endpoints
+    url: https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api/api-endpoints.txt
+    local_path: cache/seclists/api-endpoints.tokens.txt
+    categories: [api, path]
+    transform: path_tokens
+    weight: 0.90
+    max_bytes: 2097152
+    max_entries: 20000
+    default: true
+    license: MIT
+    upstream: https://github.com/danielmiessler/SecLists
+
+  - id: assetnote.manual.2m-subdomains
+    url: https://wordlists-cdn.assetnote.io/data/manual/2m-subdomains.txt
+    local_path: cache/assetnote/2m-subdomains.txt
+    categories: [dns, vhost, general]
+    transform: dns_labels
+    weight: 1.10
+    max_bytes: 268435456
+    max_entries: 250000
+    default: false
+    license: upstream-defined
+    upstream: https://wordlists.assetnote.io/
+
+  - id: commonspeak2.subdomains
+    url: https://raw.githubusercontent.com/assetnote/commonspeak2-wordlists/master/subdomains/subdomains.txt
+    local_path: cache/assetnote/commonspeak2-subdomains.txt
+    categories: [dns, vhost, general]
+    transform: dns_labels
+    weight: 1.00
+    max_bytes: 67108864
+    max_entries: 250000
+    default: false
+    license: Apache-2.0
+    upstream: https://github.com/assetnote/commonspeak2-wordlists
+
+  - id: trickest.inventory.level2
+    url: https://raw.githubusercontent.com/trickest/wordlists/main/inventory/levels/level2.txt
+    local_path: cache/trickest/inventory-level2.txt
+    categories: [dns, vhost, general]
+    transform: dns_labels
+    weight: 0.95
+    max_bytes: 16777216
+    max_entries: 250000
+    default: false
+    license: MIT
+    upstream: https://github.com/trickest/wordlists
+
+  - id: trickest.technology.laravel
+    url: https://raw.githubusercontent.com/trickest/wordlists/main/technologies/laravel.txt
+    local_path: cache/trickest/laravel.tokens.txt
+    categories: [path, api, technology]
+    transform: path_tokens
+    weight: 0.75
+    max_bytes: 2097152
+    max_entries: 20000
+    default: false
+    license: MIT
+    upstream: https://github.com/trickest/wordlists

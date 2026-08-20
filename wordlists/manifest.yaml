@@ -1,0 +1,31 @@
+version: 1
+sources:
+  - id: nightscout.builtin.core
+    path: builtins/core.txt
+    categories: [general, dns, vhost, path, api]
+    weight: 0.35
+    enabled: true
+    max_entries: 500
+    metadata:
+      bundled: true
+      purpose: small deterministic bootstrap corpus
+
+  - id: nightscout.builtin.parameters
+    path: builtins/parameters.txt
+    categories: [parameter]
+    weight: 0.35
+    enabled: true
+    max_entries: 500
+    metadata:
+      bundled: true
+      purpose: small deterministic parameter bootstrap corpus
+
+  - id: nightscout.builtin.api
+    path: builtins/api.txt
+    categories: [general, path, api]
+    weight: 0.35
+    enabled: true
+    max_entries: 500
+    metadata:
+      bundled: true
+      purpose: small deterministic API bootstrap corpus

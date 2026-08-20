@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local Night Scout state
+.nightscout/
+exports/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Local/public wordlist corpora are synchronized explicitly and stay out of Git.
+wordlists/cache/*
+!wordlists/cache/.gitkeep
+wordlists/generated/*
+!wordlists/generated/.gitkeep
+
+# Local standalone/release build output
+release/
+*.spec

@@ -16,7 +16,244 @@ The system is built around five core ideas:
 
 Night Scout is not intended to be an autonomous exploitation framework. Its purpose is to map, enrich, correlate, prioritize, and explain attack-surface discoveries inside an explicitly authorized bug-bounty scope.
 
+
 ---
+
+# Quick Start
+
+Night Scout is distributed for **Debian 13+** and current **Kali Linux**. The
+normal end-user path does not require cloning the repository, creating a Python
+virtual environment, or managing the PyInstaller bundle manually.
+
+## Installation
+
+### Option A — install a prebuilt GitHub Release
+
+Download the `.deb` matching your architecture from the project's GitHub
+**Releases** page, then install the downloaded file from the directory where it
+was saved:
+
+```bash
+sudo apt install ./nightscout_<version>_amd64.deb
+```
+
+For ARM64 builds use the corresponding `arm64` package when it is published.
+APT installs the complete standalone runtime and exposes the command globally as
+`nightscout`.
+
+Verify the install:
+
+```bash
+nightscout --version
+```
+
+### Option B — build the `.deb` from source
+
+For development or a local build:
+
+```bash
+git clone <night-scout-repository-url>
+cd Night-scout-main
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[release]'
+
+python scripts/build_deb.py
+sudo apt install ./release/nightscout_<version>_amd64.deb
+```
+
+`build_deb.py` reuses an existing PyInstaller one-folder bundle when available;
+otherwise it builds the standalone distribution first. It also writes a
+`.deb.sha256` companion file.
+
+## First Setup
+
+Run setup once as the **normal user who will run reconnaissance**:
+
+```bash
+nightscout setup
+```
+
+Do not run this command with `sudo`. The Debian package owns the immutable
+application under `/usr`; setup creates per-user configuration/state, installs
+or verifies the required companion tools, synchronizes the conservative default
+public wordlists, and runs `doctor`. On the first setup, companion-tool downloads
+can take several minutes; setup prints the current phase and tool while it works.
+
+The default user state is stored under:
+
+```text
+~/.config/nightscout/       configuration and scope
+~/.local/share/nightscout/  SQLite workspace, tools, wordlists, artifacts
+~/.cache/nightscout/        disposable caches
+```
+
+Useful setup variants:
+
+```bash
+# Initialize without downloading companion tools or public wordlists.
+nightscout setup --skip-tools --skip-wordlists
+
+# Also install optional mobile-analysis tools.
+nightscout setup --optional-tools
+
+# Refresh already managed companion tools during setup.
+nightscout setup --update-tools
+```
+
+## First Authorized Run
+
+For a real bug-bounty program, model the program rules in one scope YAML and let
+Night Scout derive all domain discovery seeds from it:
+
+```bash
+nightscout run --scope ./program.yaml
+```
+
+Scope and seeds are different concepts. Exact `IN_SCOPE` DOMAIN rules are
+started directly. A wildcard such as `*.example.org` creates a passive discovery
+anchor at `example.org` so passive enumeration can start, but the apex itself is
+**not** promoted to active scope. Every discovered concrete hostname is
+classified again against the real scope rules.
+
+You can also provide several explicit seeds while keeping the YAML as the
+authorization boundary:
+
+```bash
+nightscout run api.example.com portal.example.net example.org --scope ./program.yaml
+```
+
+Any explicit seed that is not `IN_SCOPE` or a valid `PASSIVE_ONLY` discovery
+anchor is rejected before the recursive runtime starts.
+
+For a one-domain quick start, the managed local scope can still be used:
+
+```bash
+nightscout run example.com
+```
+
+The default scope starts **fail-closed**. If `example.com` has no local scope
+rule yet, an interactive first run asks for explicit authorization of the exact
+domain and separately asks whether wildcard subdomains are authorized. Existing
+`OUT_OF_SCOPE`, `PASSIVE_ONLY`, or otherwise explicit classifications are never
+silently overridden.
+
+For automation/non-interactive use with the managed local scope:
+
+```bash
+# Exact domain only.
+nightscout run example.com --authorize-exact
+
+# Exact domain plus *.example.com.
+nightscout run example.com --authorize-subdomains
+```
+
+A minimal program scope looks like:
+
+```yaml
+schema_version: 1
+target_id: example-program
+display_name: Example Bug Bounty Program
+gate:
+  allow_unknown_passive: false
+rules:
+  - rule_id: api-exact
+    kind: DOMAIN
+    pattern: api.example.com
+    state: IN_SCOPE
+    priority: 100
+    tier: L1
+    reason: Explicitly listed by the program
+
+  - rule_id: wildcard-main
+    kind: DOMAIN
+    pattern: "*.example.org"
+    state: IN_SCOPE
+    priority: 100
+    tier: L2
+    reason: Program explicitly authorizes this wildcard
+
+  - rule_id: excluded-admin
+    kind: DOMAIN
+    pattern: admin.example.org
+    state: OUT_OF_SCOPE
+    priority: 300
+    reason: Explicit program exclusion
+```
+
+Copy the program's scope literally: exact assets become exact rules, wildcards
+remain wildcards, and exclusions get a higher priority. Do not infer scope from
+DNS, certificates, ASN ownership, CNAMEs, or shared infrastructure.
+
+## Everyday Usage
+
+```bash
+# Run every domain seed derived from a real program scope.
+nightscout run --scope ./program.yaml
+
+# Or provide several explicit seeds under the same authorization boundary.
+nightscout run api.example.com portal.example.net --scope ./program.yaml
+
+# One-domain quick start remains available.
+nightscout run example.com
+
+# Bound one invocation while keeping the persistent frontier in SQLite.
+nightscout run --scope ./program.yaml --max-steps 100
+
+# Inspect persistent runs, tasks, assets and review state.
+nightscout status
+
+# Explain a persisted Event by event ID or exact Event value.
+nightscout explain <event-id-or-value>
+
+# Export SAFE JSONL, TXT and CSV views.
+nightscout export
+
+# Export one format.
+nightscout export --format jsonl
+nightscout export --format text
+nightscout export --format csv
+
+# Sensitive evidence is a separate double-opt-in export surface.
+nightscout export --sensitive --confirm-sensitive
+
+# Check configuration, platform and companion tools without scanning.
+nightscout doctor
+```
+
+### Companion tools
+
+Normally `nightscout setup` handles required tools. Advanced/manual management
+remains available:
+
+```bash
+nightscout tools list
+nightscout tools verify
+nightscout tools install
+nightscout tools install --optional
+nightscout tools install --update
+```
+
+### Wordlists
+
+The bundled baseline corpus is available immediately after setup. Public corpora
+can be inspected or refreshed explicitly:
+
+```bash
+nightscout wordlists list
+nightscout wordlists verify
+nightscout wordlists sync
+nightscout wordlists sync --all
+```
+
+Large public corpora are stored in the per-user Night Scout data directory, not
+committed into the main repository. The runtime itself never performs an
+implicit wordlist download during reconnaissance.
+
+---
+
 
 # 1. Core Concept
 
@@ -144,6 +381,8 @@ night-scout/
 ├── recon/
 │   ├── __init__.py
 │   ├── cli.py
+│   ├── runtime.py
+│   ├── userenv.py
 │   │
 │   ├── core/
 │   │   ├── events.py
@@ -155,6 +394,7 @@ night-scout/
 │   │
 │   ├── policy/
 │   │   ├── scope.py
+│   │   ├── seeds.py
 │   │   ├── rate_limit.py
 │   │   ├── restrictions.py
 │   │   └── review_gate.py
@@ -163,7 +403,9 @@ night-scout/
 │   │   ├── database.py
 │   │   ├── models.py
 │   │   ├── provenance.py
-│   │   └── snapshots.py
+│   │   ├── snapshots.py
+│   │   ├── intelligence.py
+│   │   └── schema.py
 │   │
 │   ├── workers/
 │   │   ├── passive_domains.py
@@ -179,16 +421,19 @@ night-scout/
 │   │   ├── content.py
 │   │   ├── parameters.py
 │   │   ├── mobile.py
-│   │   └── fingerprints.py
+│   │   ├── fingerprints.py
+│   │   └── nuclei.py
 │   │
 │   ├── intelligence/
+│   │   ├── wordlists.py
 │   │   ├── vocabulary.py
 │   │   ├── patterns.py
 │   │   ├── confidence.py
 │   │   ├── novelty.py
 │   │   ├── yield_model.py
 │   │   ├── convergence.py
-│   │   └── genome.py
+│   │   ├── genome.py
+│   │   └── vulnerabilities.py
 │   │
 │   └── exporters/
 │       ├── jsonl.py
@@ -197,12 +442,37 @@ night-scout/
 │
 ├── configs/
 │   ├── scope.example.yaml
-│   └── pipeline.example.yaml
+│   ├── pipeline.example.yaml
+│   └── nuclei-templates.example.yaml
 │
 ├── migrations/
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions/
+│       └── 0001_initial_schema_*.py
 ├── tests/
+│   ├── test_migrations.py
+│   ├── test_runtime.py
+│   ├── test_scope_and_policy.py
+│   ├── test_storage_regressions.py
+│   ├── test_wordlists_sync.py
+│   └── ...
+│
+├── wordlists/
+│   ├── manifest.yaml
+│   ├── sources.yaml
+│   ├── builtins/
+│   ├── cache/          # gitignored external corpora
+│   └── generated/      # gitignored lock/local manifest
+│
 ├── docs/
 └── scripts/
+    ├── wordlists_sync.py
+    ├── install_tools.py
+    ├── tools_manifest.yaml
+    ├── build_binary.py
+    ├── build_deb.py
+    └── verify_release.py
 ```
 
 ---
@@ -211,27 +481,37 @@ night-scout/
 
 ## `recon/cli.py`
 
-Command-line entry point.
-
-Responsible for exposing high-level operations such as:
+Thin Typer command-line entry point. The initial runtime exposes:
 
 ```text
-init target
-load scope
-seed assets
-plan tasks
-run pipeline
-resume pipeline
-show status
-show changes
-review blocked events
-export results
-explain an asset
+nightscout setup
+nightscout run <root-domain>
+nightscout status
+nightscout explain <event-id-or-value>
+nightscout export
+nightscout doctor
+nightscout tools ...
+nightscout wordlists ...
 ```
 
-The CLI should never contain recon logic itself.
+The CLI contains no recon logic itself; it loads configuration and delegates
+to `recon/runtime.py`.
 
-It delegates work to the core services.
+---
+
+## `recon/runtime.py`
+
+Composition root for the executable Night Scout application. It wires:
+
+```text
+YAML configs -> SQLite -> EventBus -> Router -> Scheduler
+             -> scope/restrictions/review/budgets
+             -> worker registry -> new Events -> recursive frontier
+```
+
+It also connects provenance, snapshots, vocabulary projection, cached NVD CVE
+enrichment, yield/convergence instrumentation, Target Genome persistence, and
+SAFE/SENSITIVE exporters. Runtime decisions never override policy gates.
 
 ---
 
@@ -429,6 +709,16 @@ program-specific scope tiers
 ```
 
 No active worker should receive an event before a scope decision exists.
+
+---
+
+## `recon/policy/seeds.py`
+
+Keeps the authorization boundary separate from discovery start points. It
+derives many domain seeds from a program scope and creates non-persistent
+`PASSIVE_ONLY` apex anchors for leading wildcard rules such as
+`*.example.com`. Those anchors exist only so passive discovery can start; they
+never convert the apex into active scope.
 
 ---
 
@@ -782,6 +1072,8 @@ more requests
 # 11. Vocabulary Engine
 
 Generic wordlists are useful seeds, but the target itself should eventually become the primary vocabulary source.
+
+Public corpora are synchronized explicitly with `scripts/wordlists_sync.py`; the recursive runtime never downloads them. Large SecLists/Assetnote/Trickest data lives under the gitignored `wordlists/cache/`, while `sources.lock.yaml` records the exact raw and normalized SHA-256 values used locally. The bundled `wordlists/manifest.yaml` remains a small always-available bootstrap corpus; synchronized sources are exposed through `wordlists/generated/manifest.local.yaml`.
 
 Vocabulary can be extracted from:
 
@@ -2073,3 +2365,146 @@ The central idea is simple:
 > **The next reconnaissance step should be informed by everything already learned about the target.**
 
 Night Scout therefore treats reconnaissance as a continuously improving model of the attack surface rather than a one-time scan.
+
+
+---
+
+# 38. Database Migrations and Regression Tests
+
+Night Scout uses Alembic for persistent workspace schema upgrades. Runtime
+startup upgrades the configured SQLite workspace to the current migration head
+**before** opening the async SQLAlchemy engine.
+
+```text
+empty DB
+   ↓
+Alembic upgrade head
+   ↓
+current schema
+```
+
+Legacy Night Scout workspaces created before Alembic are adopted conservatively:
+
+```text
+unversioned DB
+   ↓
+exact table/column compatibility check
+   ├─ match    → stamp baseline revision, preserve data
+   └─ mismatch → fail closed; do not rewrite the DB
+```
+
+Development migration checks:
+
+```bash
+alembic -c alembic.ini upgrade head
+alembic -c alembic.ini check
+```
+
+The test suite is the release regression gate:
+
+```bash
+pytest
+coverage run -m pytest
+coverage report
+```
+
+It deliberately covers the highest-risk architectural boundaries rather than
+requiring real target traffic or installed recon CLIs: scope precedence,
+restriction fail-closed behavior, secret redaction/sensitive export, confidence
+independence, novelty, yield attribution, NVD privacy/cache behavior, Nuclei
+template auditing, SQLite FK ordering, migrations, CLI, and a local recursive
+runtime smoke using the permutations worker.
+
+External binaries are tested through adapters/fake subprocess fixtures. Normal
+unit/integration tests must not contact reconnaissance targets.
+
+## Distribution direction
+
+Night Scout remains a Python 3.12+ codebase internally. The release form is a
+PyInstaller **one-folder** standalone distribution for Debian/Kali. Specialist
+CLIs remain external dependencies managed by `nightscout tools` and checked by
+`nightscout doctor`; there is no plan to rewrite the orchestrator in Go/Rust
+merely to obtain one binary.
+
+---
+
+# 39. Debian/Kali Tool Supply Chain and Standalone Release
+
+Night Scout intentionally supports only **Debian GNU/Linux** and **Kali Linux**
+on `x86_64` and `aarch64`. Runtime startup fails closed on other operating
+systems/architectures. The official prebuilt `.deb` is built on Debian 13;
+therefore the hosted standalone package targets Debian 13+ and current Kali.
+Local `.deb` builds record the build host glibc major/minor as an explicit
+`libc6` dependency so APT refuses an ABI-incompatible older system.
+
+Specialist tools are managed separately from the Python orchestrator:
+
+```text
+~/.local/share/nightscout/tools/
+├── bin/
+├── apps/
+├── downloads/
+└── tools.lock.yaml
+```
+
+The managed `bin/` directory is prepended to worker PATH automatically.
+
+Commands:
+
+```bash
+nightscout tools list
+nightscout tools install
+nightscout tools install --optional --install-prerequisites
+nightscout tools verify
+nightscout wordlists list
+nightscout wordlists sync
+nightscout wordlists verify
+nightscout doctor
+```
+
+The tool manifest is `scripts/tools_manifest.yaml`. ProjectDiscovery tools are
+installed through PDTM; Arjun uses pipx; JADX, Apktool, Gitleaks and TruffleHog
+use official release assets. GitHub binary downloads require an upstream
+SHA-256 digest/checksum unless the operator explicitly opts into
+`--allow-unverified` after manual verification.
+
+The standalone build remains Python internally but is shipped as a
+**PyInstaller one-folder distribution**, not a one-file executable. Specialist
+recon binaries are not embedded in Night Scout.
+
+## Package layout and release CI
+
+For end-user installation and day-to-day commands, see **Quick Start** at the
+top of this README. The details below describe how that simple interface is
+packaged.
+
+The `.deb` installs the complete PyInstaller one-folder runtime under
+`/usr/lib/nightscout/` and exposes `/usr/bin/nightscout`. Mutable state is never
+stored under `/usr`; `nightscout setup` creates XDG user state under
+`~/.config/nightscout/`, `~/.local/share/nightscout/`, and
+`~/.cache/nightscout/`.
+
+Local package construction uses the same release path as CI:
+
+```bash
+python -m pip install -e '.[release]'
+python scripts/build_deb.py
+```
+
+`build_deb.py` reuses `release/dist/nightscout` when it already exists;
+otherwise it invokes `build_binary.py` first. It emits the Debian package and a
+`.deb.sha256` companion file. Low-level standalone verification remains
+available for release debugging:
+
+```bash
+python scripts/build_binary.py
+python scripts/verify_release.py release/dist/nightscout
+```
+
+Release CI is defined in `.github/workflows/release.yml`. The GitHub runner
+enters a `debian:13-slim` job container, runs the regression/schema gates, builds
+the standalone bundle, packages it as `.deb`, installs that package for a smoke
+test, and uploads `.deb`, `.deb.sha256`, tarball and tarball SHA-256 artifacts.
+On a pushed version tag (`v*`) the same verified files are attached to the
+GitHub Release. The current hosted job produces native `amd64`; `arm64` uses the
+same scripts on a native Debian/Kali ARM64 build host.
