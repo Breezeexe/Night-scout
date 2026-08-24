@@ -48,17 +48,33 @@ Only run Night Scout against assets you are authorized to test.
 
 ## Installation
 
-The supported release targets are Debian 13+ and current Kali Linux on `amd64`
-or `arm64`.
+Night Scout supports Debian 13+ and current Kali Linux on `amd64` and `arm64`.
+GitHub Releases currently provide prebuilt artifacts for `amd64`; build locally
+on an `arm64` host for that architecture.
 
-Download the matching `.deb` from GitHub Releases and install it with APT:
+Download the `.deb` and its `.sha256` file from the
+[latest GitHub Release](https://github.com/Breezeexe/Night-scout/releases/latest),
+verify the download, and install it with APT:
 
 ```bash
-sudo apt install ./nightscout_<version>_amd64.deb
+version=0.1.0
+sha256sum -c "nightscout_${version}_amd64.deb.sha256"
+sudo apt install "./nightscout_${version}_amd64.deb"
 nightscout --version
 ```
 
-To build locally:
+The release also includes a standalone bundle that can run without installing
+the Python package:
+
+```bash
+version=0.1.0
+bundle="nightscout-${version}-debian-kali-x86_64"
+sha256sum -c "${bundle}.tar.gz.sha256"
+tar -xzf "${bundle}.tar.gz"
+"./${bundle}/nightscout" --version
+```
+
+To build locally, including an `arm64` release on an `arm64` host:
 
 ```bash
 git clone https://github.com/Breezeexe/Night-scout

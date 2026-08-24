@@ -49,17 +49,32 @@ targets блокируются, а экспорт sensitive evidence требу�
 
 ## Установка
 
-Поддерживаемые release-платформы: Debian 13+ и актуальный Kali Linux на `amd64`
-или `arm64`.
+Night Scout поддерживает Debian 13+ и актуальный Kali Linux на `amd64` и
+`arm64`. В GitHub Releases сейчас публикуются готовые артефакты для `amd64`;
+версию для `arm64` нужно собирать локально на `arm64`-хосте.
 
-Скачайте подходящий `.deb` из GitHub Releases и установите его через APT:
+Скачайте `.deb` и соответствующий файл `.sha256` из
+[последнего GitHub Release](https://github.com/Breezeexe/Night-scout/releases/latest),
+проверьте файл и установите пакет через APT:
 
 ```bash
-sudo apt install ./nightscout_<version>_amd64.deb
+version=0.1.0
+sha256sum -c "nightscout_${version}_amd64.deb.sha256"
+sudo apt install "./nightscout_${version}_amd64.deb"
 nightscout --version
 ```
 
-Локальная сборка:
+В релиз также входит автономный bundle, не требующий установки Python-пакета:
+
+```bash
+version=0.1.0
+bundle="nightscout-${version}-debian-kali-x86_64"
+sha256sum -c "${bundle}.tar.gz.sha256"
+tar -xzf "${bundle}.tar.gz"
+"./${bundle}/nightscout" --version
+```
+
+Локальная сборка, включая релиз для `arm64` на `arm64`-хосте:
 
 ```bash
 git clone https://github.com/Breezeexe/Night-scout
