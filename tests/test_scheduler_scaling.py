@@ -49,10 +49,12 @@ class _DecisionSink:
         self,
         decisions: list[object],
         *,
-        selected_task_id: str,
+        selected_task_id: str | None = None,
+        selected_task_ids: list[str] | None = None,
     ) -> tuple[str, ...]:
         self.batches.append(tuple(decisions))
-        self.selected = selected_task_id
+        selected = selected_task_ids or ([selected_task_id] if selected_task_id else [])
+        self.selected = selected[0] if selected else None
         return ()
 
 
@@ -79,6 +81,32 @@ async def test_scheduler_scores_bounded_shortlist_and_records_one_batch():
     assert len(sink.batches) == 1
     assert len(sink.batches[0]) == 256
     assert sink.selected == selected.task_id
+
+
+@pytest.mark.asyncio
+async def test_scheduler_batch_preserves_worker_fairness_and_capacity() -> None:
+    queue = TaskQueue(InMemoryTaskStore())
+    await queue.enqueue_many(
+        [
+            *(
+                Task(worker="crawler", action="crawl", input_event_id=f"slow-{index}")
+                for index in range(8)
+            ),
+            Task(worker="dns", action="resolve", input_event_id="dns-fast"),
+            Task(worker="http", action="probe", input_event_id="http-fast"),
+        ]
+    )
+    scheduler = RecordingScheduler(queue, decisions=_DecisionSink())  # type: ignore[arg-type]
+
+    selected = await scheduler.select_batch(
+        limit=4,
+        worker_capacities={"crawler": 2},
+    )
+
+    workers = [decision.worker for decision in selected]
+    assert workers.count("crawler") == 2
+    assert "dns" in workers
+    assert "http" in workers
 
 
 @pytest.mark.asyncio

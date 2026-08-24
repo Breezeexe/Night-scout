@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
+import time
 from datetime import timedelta
 
 import pytest
@@ -8,12 +10,307 @@ import yaml
 from sqlalchemy import select
 
 from recon.core.events import Event, EventType
-from recon.core.lifecycle import LifecycleOutcome, LifecycleResult
+from recon.core.lifecycle import DispatchTicket, LifecycleOutcome, LifecycleResult
 from recon.core.queue import Task, TaskStatus, utc_now
+from recon.core.scheduler import (
+    ScheduleDecision,
+    SchedulingSignals,
+)
 from recon.policy.review_gate import ReviewCategory, ReviewSignal
 from recon.runtime import RuntimeProgress, build_runtime
 from recon.storage.models import EventObservationRecord, TaskRecord
 from recon.storage.schema import current_revision, head_revision
+
+
+@pytest.mark.asyncio
+async def test_runtime_dispatcher_runs_twenty_independent_tasks_at_four_way_parallelism(
+    tmp_path,
+    project_root,
+) -> None:
+    root = tmp_path / "parallel-project"
+    (root / "configs").mkdir(parents=True)
+    shutil.copy(project_root / "pyproject.toml", root / "pyproject.toml")
+    shutil.copy(
+        project_root / "configs" / "scope.example.yaml",
+        root / "configs" / "scope.yaml",
+    )
+    pipeline = yaml.safe_load((project_root / "configs" / "pipeline.example.yaml").read_text())
+    pipeline["scope_file"] = "configs/scope.yaml"
+    pipeline["storage"]["database"]["path"] = "parallel.sqlite3"
+    pipeline["storage"]["event_log"]["enabled"] = False
+    pipeline["runtime"].update(
+        {
+            "project_vocabulary": False,
+            "vulnerability_enrichment": False,
+            "snapshot_capture": False,
+            "build_genome_on_finish": False,
+        }
+    )
+    pipeline["runtime"]["parallelism"].update(
+        {"execution_concurrency": 4, "worker_limits": {}}
+    )
+    pipeline["routing"]["enabled_rule_ids"] = []
+    for worker in pipeline["workers"].values():
+        worker["enabled"] = False
+    pipeline_path = root / "configs" / "pipeline.yaml"
+    pipeline_path.write_text(yaml.safe_dump(pipeline, sort_keys=False), encoding="utf-8")
+
+    class TimedLifecycle:
+        def __init__(self) -> None:
+            self.remaining = 20
+            self.active = 0
+            self.max_active = 0
+
+        async def admit_batch(self, *, limit, **kwargs):
+            del kwargs
+            count = min(limit, self.remaining)
+            self.remaining -= count
+            if count == 0:
+                return [LifecycleResult(outcome=LifecycleOutcome.IDLE)]
+            tickets = []
+            for index in range(count):
+                now = utc_now()
+                task = Task(
+                    worker="fixture",
+                    action="sleep",
+                    input_event_id=f"evt_{self.remaining}_{index}",
+                    status=TaskStatus.RUNNING,
+                    attempts=1,
+                    started_at=now,
+                    lease_expires_at=now + timedelta(minutes=1),
+                    claim_token=f"claim-{self.remaining}-{index}",
+                )
+                schedule = ScheduleDecision(
+                    task_id=task.task_id,
+                    worker=task.worker,
+                    action=task.action,
+                    input_event_id=task.input_event_id,
+                    score=0.0,
+                    breakdown={
+                        "route_priority": 0.0,
+                        "confidence": 0.0,
+                        "novelty": 0.0,
+                        "expected_yield": 0.0,
+                        "information_gain": 0.0,
+                        "age_boost": 0.0,
+                        "cost_penalty": 0.0,
+                        "retry_penalty": 0.0,
+                        "total": 0.0,
+                    },
+                    signals=SchedulingSignals(),
+                    evaluated_at=now,
+                )
+                tickets.append(DispatchTicket(task=task, schedule=schedule))
+            return tickets
+
+        async def execute_claimed(self, ticket):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0.05)
+            finally:
+                self.active -= 1
+            return LifecycleResult(
+                outcome=LifecycleOutcome.SUCCEEDED,
+                task_id=ticket.task.task_id,
+                worker=ticket.task.worker,
+                action=ticket.task.action,
+                queue_status=TaskStatus.SUCCEEDED,
+                claimed=True,
+                execution_attempt=1,
+            )
+
+    runtime = await build_runtime(pipeline_path=pipeline_path)
+    lifecycle = TimedLifecycle()
+    runtime.lifecycle = lifecycle  # type: ignore[assignment]
+    try:
+        started = time.perf_counter()
+        summary = await runtime.run_domain("example.com", max_steps=20)
+        elapsed = time.perf_counter() - started
+        assert summary.steps == 20
+        assert summary.outcomes == {"SUCCEEDED": 20}
+        assert lifecycle.max_active == 4
+        assert elapsed < 0.65  # Serial fixture time is at least 1.0 second.
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_treats_capacity_deferral_as_silent_backpressure(
+    tmp_path,
+    project_root,
+) -> None:
+    root = tmp_path / "backpressure-project"
+    (root / "configs").mkdir(parents=True)
+    shutil.copy(project_root / "pyproject.toml", root / "pyproject.toml")
+    shutil.copy(
+        project_root / "configs" / "scope.example.yaml",
+        root / "configs" / "scope.yaml",
+    )
+    pipeline = yaml.safe_load((project_root / "configs" / "pipeline.example.yaml").read_text())
+    pipeline["scope_file"] = "configs/scope.yaml"
+    pipeline["storage"]["database"]["path"] = "backpressure.sqlite3"
+    pipeline["storage"]["event_log"]["enabled"] = False
+    pipeline["runtime"].update(
+        {
+            "project_vocabulary": False,
+            "vulnerability_enrichment": False,
+            "snapshot_capture": False,
+            "build_genome_on_finish": False,
+        }
+    )
+    pipeline["runtime"]["parallelism"].update(
+        {"execution_concurrency": 2, "worker_limits": {}}
+    )
+    pipeline["routing"]["enabled_rule_ids"] = []
+    for worker in pipeline["workers"].values():
+        worker["enabled"] = False
+    pipeline_path = root / "configs" / "pipeline.yaml"
+    pipeline_path.write_text(yaml.safe_dump(pipeline, sort_keys=False), encoding="utf-8")
+
+    class BackpressureLifecycle:
+        def __init__(self) -> None:
+            self.admit_calls = 0
+            self.executing = False
+            self.admitted_while_executing = False
+
+        async def admit_batch(self, *, limit, **kwargs):
+            del limit, kwargs
+            self.admit_calls += 1
+            self.admitted_while_executing |= self.executing
+            if self.admit_calls > 1:
+                return [LifecycleResult(outcome=LifecycleOutcome.IDLE)]
+            now = utc_now()
+            task = Task(
+                worker="fixture",
+                action="sleep",
+                input_event_id="evt_backpressure",
+                status=TaskStatus.RUNNING,
+                attempts=1,
+                started_at=now,
+                lease_expires_at=now + timedelta(minutes=1),
+                claim_token="claim-backpressure",
+            )
+            schedule = ScheduleDecision(
+                task_id=task.task_id,
+                worker=task.worker,
+                action=task.action,
+                input_event_id=task.input_event_id,
+                score=0.0,
+                breakdown={
+                    "route_priority": 0.0,
+                    "confidence": 0.0,
+                    "novelty": 0.0,
+                    "expected_yield": 0.0,
+                    "information_gain": 0.0,
+                    "age_boost": 0.0,
+                    "cost_penalty": 0.0,
+                    "retry_penalty": 0.0,
+                    "total": 0.0,
+                },
+                signals=SchedulingSignals(),
+                evaluated_at=now,
+            )
+            return [
+                DispatchTicket(task=task, schedule=schedule),
+                LifecycleResult(
+                    outcome=LifecycleOutcome.DEFERRED,
+                    reason="soft execution capacity exhausted",
+                    backpressure=True,
+                ),
+            ]
+
+        async def execute_claimed(self, ticket):
+            self.executing = True
+            try:
+                await asyncio.sleep(0.02)
+            finally:
+                self.executing = False
+            return LifecycleResult(
+                outcome=LifecycleOutcome.SUCCEEDED,
+                task_id=ticket.task.task_id,
+                worker=ticket.task.worker,
+                action=ticket.task.action,
+                queue_status=TaskStatus.SUCCEEDED,
+                claimed=True,
+                execution_attempt=1,
+            )
+
+    runtime = await build_runtime(pipeline_path=pipeline_path)
+    lifecycle = BackpressureLifecycle()
+    runtime.lifecycle = lifecycle  # type: ignore[assignment]
+    progress: list[RuntimeProgress] = []
+    try:
+        summary = await runtime.run_domain(
+            "example.com",
+            max_steps=2,
+            progress=progress.append,
+        )
+        assert summary.outcomes == {"IDLE": 1, "SUCCEEDED": 1}
+        assert lifecycle.admit_calls == 2
+        assert lifecycle.admitted_while_executing is False
+        assert all(item.outcome is not LifecycleOutcome.DEFERRED for item in progress)
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_event_publish_has_bounded_single_writer_without_loss(
+    tmp_path,
+    project_root,
+) -> None:
+    root = tmp_path / "publish-project"
+    (root / "configs").mkdir(parents=True)
+    shutil.copy(project_root / "pyproject.toml", root / "pyproject.toml")
+    shutil.copy(
+        project_root / "configs" / "scope.example.yaml",
+        root / "configs" / "scope.yaml",
+    )
+    pipeline = yaml.safe_load((project_root / "configs" / "pipeline.example.yaml").read_text())
+    pipeline["scope_file"] = "configs/scope.yaml"
+    pipeline["storage"]["database"]["path"] = "publish.sqlite3"
+    pipeline["storage"]["event_log"]["enabled"] = False
+    pipeline["runtime"].update(
+        {
+            "project_vocabulary": False,
+            "vulnerability_enrichment": False,
+            "snapshot_capture": False,
+            "build_genome_on_finish": False,
+        }
+    )
+    pipeline["runtime"]["parallelism"].update(
+        {"execution_concurrency": 4, "event_queue_capacity": 4}
+    )
+    pipeline["routing"]["enabled_rule_ids"] = []
+    for worker in pipeline["workers"].values():
+        worker["enabled"] = False
+    pipeline_path = root / "configs" / "pipeline.yaml"
+    pipeline_path.write_text(yaml.safe_dump(pipeline, sort_keys=False), encoding="utf-8")
+
+    runtime = await build_runtime(pipeline_path=pipeline_path)
+    try:
+        writes = await asyncio.gather(
+            *(
+                runtime.event_bus.publish(
+                    Event(
+                        type=EventType.ARTIFACT,
+                        value=f"artifact-{index}",
+                        source="parallel-fixture",
+                    )
+                )
+                for index in range(30)
+            )
+        )
+        status = await runtime.status()
+        assert all(writes)
+        assert status.event_count == 30
+        assert status.asset_count == 30
+        assert status.event_queue_capacity == 4
+        assert status.event_queue_high_watermark >= 4
+        assert status.event_queue_depth == 0
+        assert status.sqlite_busy_count == 0
+    finally:
+        await runtime.close()
 
 
 @pytest.mark.asyncio

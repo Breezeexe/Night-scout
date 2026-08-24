@@ -72,6 +72,10 @@ from recon.policy.scope import (
     ScopeSubject,
 )
 from recon.workers.passive_domains import normalize_dns_name
+from recon.workers.subprocess_stream import (
+    completed_process_returncode,
+    stream_process_stdout,
+)
 
 WORKER_NAME = "nuclei"
 ACTION_VALIDATE_CVE = "validate_cve"
@@ -834,28 +838,21 @@ class NucleiBackend:
 
             try:
                 try:
-                    async with asyncio.timeout(
-                        self.config.process_timeout_seconds
+                    async for raw_line in stream_process_stdout(
+                        process,
+                        timeout_seconds=self.config.process_timeout_seconds,
                     ):
-                        while True:
-                            raw_line = await process.stdout.readline()
-                            if not raw_line:
-                                break
+                        line = raw_line.decode(
+                            "utf-8",
+                            errors="replace",
+                        ).strip()
 
-                            line = raw_line.decode(
-                                "utf-8",
-                                errors="replace",
-                            ).strip()
+                        if not line:
+                            continue
 
-                            if not line:
-                                continue
-
-                            result = parse_nuclei_jsonl(line)
-                            if result is not None:
-                                yield result
-
-                        returncode = await process.wait()
-
+                        result = parse_nuclei_jsonl(line)
+                        if result is not None:
+                            yield result
                 except TimeoutError as exc:
                     await terminate_process(process)
                     raise NucleiBackendTimeout(
@@ -863,6 +860,7 @@ class NucleiBackend:
                         f"({self.config.process_timeout_seconds}s)"
                     ) from exc
 
+                returncode = completed_process_returncode(process)
                 if returncode != 0:
                     detail = " | ".join(stderr_tail)
                     raise NucleiBackendError(
@@ -1042,12 +1040,12 @@ class NucleiWorker:
                 error=rate_error,
             )
 
-        assert plan.aggregate_rps_ceiling is not None
+        assert plan.safe_rps_hint is not None
         assert plan.max_concurrency_hint is not None
 
         pacing = nuclei_pacing_from_plan(plan)
 
-        decision = await self._rate_limiter.acquire(
+        decision = await self._rate_limiter.await_acquire(
             task,
             context=context,
             demand=RateLimitDemand(
@@ -1558,7 +1556,7 @@ def validate_opaque_nuclei_plan(plan: RateLimitPlan) -> str | None:
             "opaque multi-request subprocess fails closed"
         )
 
-    if plan.aggregate_rps_ceiling is None or plan.aggregate_rps_ceiling <= 0.0:
+    if plan.safe_rps_hint is None or plan.safe_rps_hint <= 0.0:
         return (
             "nuclei requires an explicit requests_per_second ceiling in its "
             "matching shared rate-limit rule"
@@ -1574,10 +1572,10 @@ def validate_opaque_nuclei_plan(plan: RateLimitPlan) -> str | None:
 
 
 def nuclei_pacing_from_plan(plan: RateLimitPlan) -> NucleiPacing:
-    if plan.aggregate_rps_ceiling is None or plan.aggregate_rps_ceiling <= 0.0:
+    if plan.safe_rps_hint is None or plan.safe_rps_hint <= 0.0:
         raise ValueError("rate plan has no positive aggregate RPS ceiling")
 
-    rps = plan.aggregate_rps_ceiling
+    rps = plan.safe_rps_hint
 
     if rps >= 1.0:
         return NucleiPacing(

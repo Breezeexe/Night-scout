@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from typer.testing import CliRunner
 
 from recon.cli import app
@@ -148,6 +150,11 @@ def test_cli_run_combines_domain_and_mobile_ingress(monkeypatch, tmp_path) -> No
     assert calls["closed"] is True
     assert "com.company.mobile" in result.stdout
     assert "artifact=abc.apk" in result.stdout
+    assert "view results:" in result.stdout
+    assert "--format html" in result.stdout
+    assert "--format graph-json" in result.stdout
+    assert "--format tree-json" in result.stdout
+    assert 'xdg-open "$graph_html"' in result.stdout
 
 
 def test_cli_run_requires_mobile_artifact_and_app_id_together(tmp_path) -> None:
@@ -161,6 +168,40 @@ def test_cli_run_requires_mobile_artifact_and_app_id_together(tmp_path) -> None:
 
     assert result.exit_code == 2
     assert "must be provided together" in result.output
+
+
+def test_cli_run_reports_async_cancellation_without_traceback(monkeypatch, tmp_path) -> None:
+    closed = False
+
+    class FakeRuntime:
+        async def run_domains(self, domains, **kwargs):
+            del domains, kwargs
+            raise asyncio.CancelledError
+
+        async def close(self):
+            nonlocal closed
+            closed = True
+
+    async def fake_build_runtime(**kwargs):
+        del kwargs
+        return FakeRuntime()
+
+    monkeypatch.setattr("recon.cli.build_runtime", fake_build_runtime)
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            "example.com",
+            "--scope",
+            str(tmp_path / "scope.yaml"),
+            "--no-progress",
+        ],
+    )
+
+    assert result.exit_code == 130
+    assert "interrupted" in result.output
+    assert "Traceback" not in result.output
+    assert closed is True
 
 
 def test_cli_rejects_invalid_identity_header_before_building_runtime() -> None:

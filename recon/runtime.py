@@ -38,7 +38,6 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -57,6 +56,7 @@ from recon.core.budgets import (
 from recon.core.events import Event, EventType, ScopeState
 from recon.core.lifecycle import (
     BudgetPlan,
+    DispatchTicket,
     GateDecision,
     GateOutcome,
     Lifecycle,
@@ -82,6 +82,7 @@ from recon.exporters.jsonl import (
     WorkspaceSensitiveEvidenceProvider,
     export_jsonl,
 )
+from recon.exporters.surface import export_graph_json, export_surface_html, export_tree_json
 from recon.exporters.text import TextExportOptions, export_text_bundle
 from recon.intelligence.confidence import ConfidenceModel, ConfidenceModelConfig
 from recon.intelligence.convergence import (
@@ -189,6 +190,10 @@ from recon.storage.workspace import (
     recorded_workspace_target_ids,
     workspace_directory_name,
 )
+from recon.surface.builder import SurfaceGraphBuilder
+from recon.surface.identity import surface_identity
+from recon.surface.models import SurfaceGraphFilter
+from recon.surface.projector import SurfaceRelationshipProjector
 from recon.tooling import (
     ToolRequirement,
     activate_managed_tool_path,
@@ -390,6 +395,30 @@ class ScopeDocument(BaseModel):
         return normalized
 
 
+class RuntimeParallelismConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    execution_concurrency: int = Field(default=1, ge=1, le=64)
+    dispatcher_batch_size: int = Field(default=16, ge=1, le=1024)
+    event_queue_capacity: int = Field(default=1000, ge=1, le=1_000_000)
+    event_writer_concurrency: int = Field(default=1, ge=1, le=1)
+    shutdown_grace_seconds: float = Field(default=30.0, ge=0.1, le=300.0)
+    worker_limits: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("worker_limits")
+    @classmethod
+    def positive_worker_limits(cls, value: dict[str, int]) -> dict[str, int]:
+        normalized: dict[str, int] = {}
+        for worker, limit in value.items():
+            name = worker.strip()
+            if not name:
+                raise ValueError("parallelism worker name must not be blank")
+            if limit < 1:
+                raise ValueError(f"parallelism worker limit must be positive: {name}")
+            normalized[name] = limit
+        return normalized
+
+
 class RuntimeLoopConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -399,12 +428,14 @@ class RuntimeLoopConfig(BaseModel):
     recover_retry_delay_seconds: int = Field(default=0, ge=0)
     resume_frontier: bool = True
     max_deferred_wait_seconds: float = Field(default=60.0, ge=0.0, le=3600.0)
+    parallelism: RuntimeParallelismConfig = Field(default_factory=RuntimeParallelismConfig)
 
     project_vocabulary: bool = True
     vulnerability_enrichment: bool = True
     snapshot_capture: bool = True
     snapshot_diff_on_write: bool = True
     build_genome_on_finish: bool = True
+    project_surface_relationships: bool = True
 
     novel_asset_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
 
@@ -414,6 +445,56 @@ class RestrictionsDocument(BaseModel):
 
     enabled: bool = True
     rules: tuple[RestrictionRule, ...] = ()
+
+
+class ExportFileDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = True
+    path: str
+
+
+class ExportDirectoryDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = True
+    directory: str
+
+
+class SensitiveExportDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = True
+    require_explicit_confirmation: bool = True
+
+
+class ExportsDocument(BaseModel):
+    """Typed destinations for list, canonical graph and presentation exports."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    default_mode: ExportMode = ExportMode.SAFE
+    jsonl: ExportFileDocument = Field(
+        default_factory=lambda: ExportFileDocument(path="exports/nightscout.jsonl")
+    )
+    text: ExportDirectoryDocument = Field(
+        default_factory=lambda: ExportDirectoryDocument(directory="exports/text")
+    )
+    csv: ExportDirectoryDocument = Field(
+        default_factory=lambda: ExportDirectoryDocument(directory="exports/csv")
+    )
+    graph_json: ExportFileDocument = Field(
+        default_factory=lambda: ExportFileDocument(path="exports/surface-graph.json")
+    )
+    tree_json: ExportFileDocument = Field(
+        default_factory=lambda: ExportFileDocument(path="exports/surface-tree.json")
+    )
+    html: ExportFileDocument = Field(
+        default_factory=lambda: ExportFileDocument(path="exports/surface-graph.html")
+    )
+    sensitive_evidence: SensitiveExportDocument = Field(
+        default_factory=SensitiveExportDocument
+    )
 
 
 class PipelineDocument(BaseModel):
@@ -437,7 +518,7 @@ class PipelineDocument(BaseModel):
     workers: dict[str, dict[str, Any]]
     intelligence: dict[str, Any]
     snapshots: dict[str, Any] = Field(default_factory=dict)
-    exports: dict[str, Any] = Field(default_factory=dict)
+    exports: ExportsDocument = Field(default_factory=ExportsDocument)
 
     @field_validator("profile_id")
     @classmethod
@@ -604,6 +685,7 @@ class RuntimeProgress(BaseModel):
         "STEP",
         "WAITING",
         "FINISHED",
+        "CANCELLED",
         "FAILED",
     ]
     step: int = Field(default=0, ge=0)
@@ -614,6 +696,8 @@ class RuntimeProgress(BaseModel):
     action: str | None = None
     reason: str | None = None
     queue_status: TaskStatus | None = None
+    running: int = Field(default=0, ge=0)
+    slot_id: int | None = Field(default=None, ge=1)
     wait_seconds: float | None = Field(default=None, ge=0.0)
     next_resume_at: datetime | None = None
     run_status: str | None = None
@@ -631,6 +715,15 @@ class RuntimeStatus(BaseModel):
     event_count: int
     asset_count: int
     task_counts: dict[str, int]
+    running_by_worker: dict[str, int] = Field(default_factory=dict)
+    waiting_rate: int = Field(default=0, ge=0)
+    rate_waiting_by_worker: dict[str, int] = Field(default_factory=dict)
+    event_queue_depth: int = Field(default=0, ge=0)
+    event_queue_capacity: int = Field(default=0, ge=0)
+    event_queue_high_watermark: int = Field(default=0, ge=0)
+    event_publish_avg_ms: float = Field(default=0.0, ge=0.0)
+    sqlite_busy_count: int = Field(default=0, ge=0)
+    dispatcher_state: str = "IDLE"
     attempt_counts: dict[str, int]
     open_review_cases: int
     run_counts: dict[str, int]
@@ -1063,14 +1156,44 @@ class RecordingScheduler(Scheduler):
         super().__init__(*args, **kwargs)
         self._decisions = decisions
 
-    async def select_next(self) -> ScheduleDecision | None:
+    async def select_next(
+        self,
+        *,
+        excluded_workers: frozenset[str] | None = None,
+    ) -> ScheduleDecision | None:
         ranked = await self.rank_ready()
-        if ranked:
+        excluded = excluded_workers or frozenset()
+        selected = next(
+            (decision for decision in ranked if decision.worker not in excluded),
+            None,
+        )
+        if ranked and selected is not None:
             await self._decisions.record_schedules(
                 ranked,
-                selected_task_id=ranked[0].task_id,
+                selected_task_id=selected.task_id,
             )
-        return ranked[0] if ranked else None
+        return selected
+
+    async def select_batch(
+        self,
+        *,
+        limit: int,
+        excluded_workers: frozenset[str] | None = None,
+        worker_capacities: Mapping[str, int] | None = None,
+    ) -> list[ScheduleDecision]:
+        ranked = await self.rank_ready()
+        selected = self._select_ranked_batch(
+            ranked,
+            limit=limit,
+            excluded_workers=excluded_workers,
+            worker_capacities=worker_capacities,
+        )
+        if selected:
+            await self._decisions.record_schedules(
+                ranked,
+                selected_task_ids=[decision.task_id for decision in selected],
+            )
+        return selected
 
 
 class RuntimeConvergenceGate:
@@ -1272,6 +1395,7 @@ class RuntimeEventBus:
         events: EventRepository,
         branches: BranchRepository,
         provenance: ProvenanceRepository,
+        surface_projector: SurfaceRelationshipProjector,
         snapshots: SnapshotRepository,
         router: Router,
         queue: TaskQueue,
@@ -1288,6 +1412,7 @@ class RuntimeEventBus:
         self._events = events
         self._branches = branches
         self._provenance = provenance
+        self._surface_projector = surface_projector
         self._snapshots = snapshots
         self._router = router
         self._queue = queue
@@ -1300,6 +1425,16 @@ class RuntimeEventBus:
         self._configuration = configuration
         self._disabled_workers = effective_disabled_workers
         self._warnings = warnings
+
+        queue_capacity = configuration.pipeline.runtime.parallelism.event_queue_capacity
+        self._write_lock = asyncio.Lock()
+        self._queue_slots = asyncio.Semaphore(queue_capacity)
+        self._event_queue_capacity = queue_capacity
+        self._event_queue_depth = 0
+        self._event_queue_high_watermark = 0
+        self._publish_write_seconds = 0.0
+        self._publish_count = 0
+        self._sqlite_busy_count = 0
 
         self._run_id: str | None = None
         self._task_var: contextvars.ContextVar[Task | None] = contextvars.ContextVar(
@@ -1316,6 +1451,25 @@ class RuntimeEventBus:
                 default=None,
             )
         )
+        self._publish_depth_var: contextvars.ContextVar[int] = contextvars.ContextVar(
+            "nightscout_runtime_publish_depth",
+            default=0,
+        )
+
+    @property
+    def queue_metrics(self) -> dict[str, int | float]:
+        average_ms = (
+            self._publish_write_seconds / self._publish_count * 1000.0
+            if self._publish_count
+            else 0.0
+        )
+        return {
+            "depth": self._event_queue_depth,
+            "capacity": self._event_queue_capacity,
+            "high_watermark": self._event_queue_high_watermark,
+            "publish_avg_ms": average_ms,
+            "sqlite_busy_count": self._sqlite_busy_count,
+        }
 
     @property
     def run_id(self) -> str | None:
@@ -1346,38 +1500,81 @@ class RuntimeEventBus:
             self._branch_var.reset(token)
 
     async def publish(self, event: Event) -> bool:
-        normalized = await self._prepare_event(event)
-        write = await self._events.ingest(normalized, run_id=self._run_id)
-
-        if not write.observation_created:
-            return False
-
-        await self._event_log.append(normalized)
-
-        if normalized.parent_event_id is not None:
+        depth = self._publish_depth_var.get()
+        owns_slot = depth == 0
+        if owns_slot:
+            self._event_queue_depth += 1
+            self._event_queue_high_watermark = max(
+                self._event_queue_high_watermark,
+                self._event_queue_depth,
+            )
             try:
-                await self._provenance.capture_primary_parent(normalized.event_id)
-            except (KeyError, ValueError) as exc:
-                self._warnings.append(f"provenance edge skipped for {normalized.event_id}: {exc}")
+                await self._queue_slots.acquire()
+            except BaseException:
+                self._event_queue_depth -= 1
+                raise
+        depth_token = self._publish_depth_var.set(depth + 1)
+        try:
+            normalized = await self._prepare_event(event)
+            write_started = time.perf_counter()
+            try:
+                # One local writer makes the durable event/provenance/routing
+                # envelope deterministic under worker concurrency. Producers
+                # wait on the bounded semaphore instead of dropping events.
+                async with self._write_lock:
+                    write = await self._events.ingest(normalized, run_id=self._run_id)
 
-        self._capture_metrics(normalized, asset_created=write.asset_created)
-        await self._capture_snapshot(normalized, asset_id=write.asset_id)
-        await self._route(normalized)
+                    if not write.observation_created:
+                        return False
 
-        runtime_cfg = self._configuration.pipeline.runtime
+                    await self._event_log.append(normalized)
 
-        if runtime_cfg.project_vocabulary and normalized.type is not EventType.VOCAB_TOKEN:
-            for token_event in self._vocabulary.token_events(normalized):
-                await self.publish(token_event)
+                    if normalized.parent_event_id is not None:
+                        try:
+                            await self._provenance.capture_primary_parent(normalized.event_id)
+                        except (KeyError, ValueError) as exc:
+                            self._warnings.append(
+                                f"provenance edge skipped for {normalized.event_id}: {exc}"
+                            )
 
-        if (
-            runtime_cfg.vulnerability_enrichment
-            and self._vulnerabilities is not None
-            and normalized.type is EventType.TECHNOLOGY
-        ):
-            await self._enrich_vulnerabilities(normalized)
+                    if self._configuration.pipeline.runtime.project_surface_relationships:
+                        projection = await self._surface_projector.project(normalized)
+                        self._warnings.extend(
+                            f"surface relationship skipped for {normalized.event_id}: {warning}"
+                            for warning in projection.warnings
+                        )
 
-        return True
+                    self._capture_metrics(normalized, asset_created=write.asset_created)
+                    await self._capture_snapshot(normalized, asset_id=write.asset_id)
+                    await self._route(normalized)
+            except Exception as exc:
+                detail = str(exc).lower()
+                if "sqlite_busy" in detail or "database is locked" in detail:
+                    self._sqlite_busy_count += 1
+                raise
+            finally:
+                self._publish_write_seconds += time.perf_counter() - write_started
+                self._publish_count += 1
+
+            runtime_cfg = self._configuration.pipeline.runtime
+
+            if runtime_cfg.project_vocabulary and normalized.type is not EventType.VOCAB_TOKEN:
+                for token_event in self._vocabulary.token_events(normalized):
+                    await self.publish(token_event)
+
+            if (
+                runtime_cfg.vulnerability_enrichment
+                and self._vulnerabilities is not None
+                and normalized.type is EventType.TECHNOLOGY
+            ):
+                await self._enrich_vulnerabilities(normalized)
+
+            return True
+        finally:
+            self._publish_depth_var.reset(depth_token)
+            if owns_slot:
+                self._queue_slots.release()
+                self._event_queue_depth -= 1
 
     async def _prepare_event(self, event: Event) -> Event:
         event = sanitize_event_for_storage(event)
@@ -1549,9 +1746,7 @@ class RuntimeWorkerExecutor:
 
         try:
             with self._bus.bind_task(task, metrics):
-                result = WorkerExecutionResult.model_validate(
-                    await worker.execute(execution_task)
-                )
+                result = WorkerExecutionResult.model_validate(await worker.execute(execution_task))
         except Exception:
             await self._record_yield(
                 task,
@@ -1677,6 +1872,7 @@ class NightScoutRuntime:
         self.events: EventRepository
         self.branches: BranchRepository
         self.provenance: ProvenanceRepository
+        self.surface_projector: SurfaceRelationshipProjector
         self.snapshots: SnapshotRepository
         self.task_store: SQLiteTaskStore
         self.queue: TaskQueue
@@ -1703,6 +1899,7 @@ class NightScoutRuntime:
         self.workspace: WorkspaceRepository
         self.workspace_binding: WorkspaceBinding
         self.request_identity: RequestIdentityPolicy
+        self.effective_disabled_workers: frozenset[str]
 
     @classmethod
     async def build(
@@ -1756,6 +1953,10 @@ class NightScoutRuntime:
         self.events = EventRepository(self.database)
         self.branches = BranchRepository(self.database)
         self.provenance = ProvenanceRepository(self.database)
+        self.surface_projector = SurfaceRelationshipProjector(
+            events=self.events,
+            provenance=self.provenance,
+        )
         self.snapshots = SnapshotRepository(self.database)
         self.task_store = SQLiteTaskStore(
             self.database,
@@ -1957,10 +2158,12 @@ class NightScoutRuntime:
                     protected_header_names=self.request_identity.header_names,
                 )
 
+        self.effective_disabled_workers = frozenset(effective_disabled_workers)
         self.event_bus = RuntimeEventBus(
             events=self.events,
             branches=self.branches,
             provenance=self.provenance,
+            surface_projector=self.surface_projector,
             snapshots=self.snapshots,
             router=self.router,
             queue=self.queue,
@@ -1971,7 +2174,7 @@ class NightScoutRuntime:
             vulnerabilities=vulnerability_service,
             event_log=event_log,
             configuration=cfg,
-            effective_disabled_workers=frozenset(effective_disabled_workers),
+            effective_disabled_workers=self.effective_disabled_workers,
             warnings=self.warnings,
         )
 
@@ -1982,7 +2185,7 @@ class NightScoutRuntime:
             artifact_root=artifact_root,
             sensitive_root=sensitive_root,
             nuclei_catalog=nuclei_catalog,
-            disabled=frozenset(effective_disabled_workers),
+            disabled=self.effective_disabled_workers,
         )
 
         signal_provider = CompositeSchedulingSignalProvider(
@@ -2422,9 +2625,7 @@ class NightScoutRuntime:
 
         plan = self.plan_domain_seeds(domains)
         prepared_mobile = (
-            self._prepare_mobile_ingress(mobile_artifact)
-            if mobile_artifact is not None
-            else None
+            self._prepare_mobile_ingress(mobile_artifact) if mobile_artifact is not None else None
         )
         if not plan.seeds and prepared_mobile is None:
             raise ValueError(
@@ -2516,9 +2717,7 @@ class NightScoutRuntime:
 
             artifact_event = Event(
                 type=EventType.MOBILE_ARTIFACT,
-                value=(
-                    f"{mobile_artifact.subject.value}@sha256:{imported.sha256}"
-                ),
+                value=(f"{mobile_artifact.subject.value}@sha256:{imported.sha256}"),
                 source="cli:run:mobile-artifact",
                 scope_state=mobile_artifact.decision.state,
                 confidence=1.0,
@@ -2613,8 +2812,7 @@ class NightScoutRuntime:
             return genome.fingerprint
         except Exception as exc:
             self.warnings.append(
-                f"Target Genome build failed for {seed.value}: "
-                f"{type(exc).__name__}: {exc}"
+                f"Target Genome build failed for {seed.value}: {type(exc).__name__}: {exc}"
             )
             return None
 
@@ -2634,11 +2832,13 @@ class NightScoutRuntime:
             raise RuntimeError("runtime already has an active run")
 
         if not self.configuration.pipeline.runtime.resume_frontier:
-            active = [task for task in await self.task_store.all() if not task.is_terminal]
-            if active:
+            unfinished_tasks = [
+                task for task in await self.task_store.all() if not task.is_terminal
+            ]
+            if unfinished_tasks:
                 raise RuntimeError(
                     "resume_frontier=false requires an empty active frontier; "
-                    f"workspace contains {len(active)} unfinished task(s). "
+                    f"workspace contains {len(unfinished_tasks)} unfinished task(s). "
                     "Resume them with resume_frontier=true or use a fresh workspace."
                 )
         else:
@@ -2647,8 +2847,7 @@ class NightScoutRuntime:
         identity_fingerprint = self.request_identity.fingerprint
         effective_config_hash = hashlib.sha256(
             (
-                f"{self.configuration.config_hash}\0"
-                f"{identity_fingerprint or 'no-request-identity'}"
+                f"{self.configuration.config_hash}\0{identity_fingerprint or 'no-request-identity'}"
             ).encode()
         ).hexdigest()
 
@@ -2661,9 +2860,7 @@ class NightScoutRuntime:
                 "run_kind": run_kind,
                 "profile_id": self.configuration.pipeline.profile_id,
                 "scope_target_id": self.configuration.scope.target_id,
-                "request_identity_header_names": list(
-                    self.request_identity.header_names
-                ),
+                "request_identity_header_names": list(self.request_identity.header_names),
                 "request_identity_fingerprint": identity_fingerprint,
             },
         )
@@ -2690,35 +2887,148 @@ class NightScoutRuntime:
                 ),
             )
 
-            while steps < limit:
-                current_step = steps + 1
-                result = await self.lifecycle.run_once(
-                    on_claimed=partial(
-                        self._emit_claimed_progress,
-                        callback=progress,
-                        run_id=run_id,
-                        step=current_step,
-                        max_steps=limit,
-                    ),
-                )
-                if result.outcome is LifecycleOutcome.IDLE:
+            parallelism = self.configuration.pipeline.runtime.parallelism
+            concurrency = parallelism.execution_concurrency
+            worker_limits = parallelism.worker_limits
+            active: dict[
+                asyncio.Task[LifecycleResult],
+                tuple[DispatchTicket, int, int],
+            ] = {}
+            running_by_worker: Counter[str] = Counter()
+            available_slots = list(range(1, concurrency + 1))
+            idle_seen = False
+
+            async with asyncio.TaskGroup() as task_group:
+                while True:
+                    while steps < limit and len(active) < concurrency:
+                        saturated = frozenset(
+                            worker
+                            for worker, worker_limit in worker_limits.items()
+                            if running_by_worker[worker] >= worker_limit
+                        )
+                        free_slots = min(concurrency - len(active), limit - steps)
+                        worker_capacities = {
+                            worker: max(0, worker_limit - running_by_worker[worker])
+                            for worker, worker_limit in worker_limits.items()
+                        }
+                        if hasattr(self.lifecycle, "admit_batch"):
+                            admissions = await self.lifecycle.admit_batch(
+                                limit=min(free_slots, parallelism.dispatcher_batch_size),
+                                excluded_workers=saturated,
+                                worker_capacities=worker_capacities,
+                            )
+                        elif hasattr(self.lifecycle, "admit_next"):
+                            admissions = [
+                                await self.lifecycle.admit_next(
+                                    excluded_workers=saturated,
+                                )
+                            ]
+                        else:  # Compatibility for injected pre-split lifecycle adapters.
+                            legacy_result = await self.lifecycle.run_once()
+                            if (
+                                legacy_result.outcome is LifecycleOutcome.IDLE
+                                or legacy_result.backpressure
+                            ):
+                                admissions = [legacy_result]
+                            else:
+                                outcomes[legacy_result.outcome.value] += 1
+                                steps += 1
+                                self._emit_lifecycle_progress(
+                                    progress,
+                                    run_id=run_id,
+                                    step=steps,
+                                    max_steps=limit,
+                                    result=legacy_result,
+                                )
+                                continue
+                        batch_idle = False
+                        batch_backpressure = False
+                        for admission in admissions:
+                            if isinstance(admission, LifecycleResult):
+                                if admission.outcome is LifecycleOutcome.IDLE:
+                                    idle_seen = True
+                                    batch_idle = True
+                                    continue
+                                if admission.backpressure:
+                                    idle_seen = True
+                                    batch_backpressure = True
+                                    continue
+                                outcomes[admission.outcome.value] += 1
+                                self._emit_lifecycle_progress(
+                                    progress,
+                                    run_id=run_id,
+                                    step=steps,
+                                    max_steps=limit,
+                                    result=admission,
+                                )
+                                continue
+
+                            idle_seen = False
+                            steps += 1
+                            slot_id = available_slots.pop(0)
+                            running_by_worker[admission.task.worker] += 1
+                            execution_task = task_group.create_task(
+                                self._execute_with_shutdown_grace(
+                                    admission,
+                                    grace_seconds=parallelism.shutdown_grace_seconds,
+                                )
+                            )
+                            active[execution_task] = (admission, steps, slot_id)
+                            self._emit_claimed_progress(
+                                admission.task,
+                                callback=progress,
+                                run_id=run_id,
+                                step=steps,
+                                max_steps=limit,
+                                running=len(active),
+                                slot_id=slot_id,
+                            )
+                        if batch_idle or batch_backpressure:
+                            break
+
+                    if active:
+                        done, _ = await asyncio.wait(
+                            active,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for completed in done:
+                            ticket, admitted_step, slot_id = active.pop(completed)
+                            available_slots.append(slot_id)
+                            available_slots.sort()
+                            running_by_worker[ticket.task.worker] -= 1
+                            result = completed.result()
+                            outcomes[result.outcome.value] += 1
+                            self._emit_lifecycle_progress(
+                                progress,
+                                run_id=run_id,
+                                step=admitted_step,
+                                max_steps=limit,
+                                result=result,
+                                running=len(active),
+                                slot_id=slot_id,
+                            )
+                        continue
+
+                    if steps >= limit:
+                        break
+                    if not idle_seen:
+                        continue
+
                     next_ready_at = await self.task_store.next_ready_at()
                     if next_ready_at is None:
-                        outcomes[result.outcome.value] += 1
+                        if steps > 0 or not outcomes:
+                            outcomes[LifecycleOutcome.IDLE.value] += 1
                         stopped_idle = True
                         self._emit_lifecycle_progress(
                             progress,
                             run_id=run_id,
                             step=steps,
                             max_steps=limit,
-                            result=result,
+                            result=LifecycleResult(outcome=LifecycleOutcome.IDLE),
                         )
                         break
 
-                    wait_seconds = max(
-                        0.0,
-                        (next_ready_at - utc_now()).total_seconds(),
-                    )
+                    wait_seconds = max(0.0, (next_ready_at - utc_now()).total_seconds())
                     max_wait = self.configuration.pipeline.runtime.max_deferred_wait_seconds
                     if wait_seconds > max_wait:
                         paused_deferred = True
@@ -2732,7 +3042,7 @@ class NightScoutRuntime:
                                 max_steps=limit,
                                 wait_seconds=wait_seconds,
                                 next_resume_at=next_ready_at,
-                                reason=("deferred task exceeds this run's maximum wait"),
+                                reason="deferred task exceeds this run's maximum wait",
                             ),
                         )
                         break
@@ -2749,18 +3059,8 @@ class NightScoutRuntime:
                             reason="waiting for deferred task",
                         ),
                     )
-                    await asyncio.sleep(wait_seconds)
-                    continue
-
-                outcomes[result.outcome.value] += 1
-                steps += 1
-                self._emit_lifecycle_progress(
-                    progress,
-                    run_id=run_id,
-                    step=steps,
-                    max_steps=limit,
-                    result=result,
-                )
+                    await asyncio.sleep(max(wait_seconds, 0.01))
+                    idle_seen = False
 
             if finalize is not None:
                 await finalize()
@@ -2801,6 +3101,38 @@ class NightScoutRuntime:
                 next_resume_at=next_resume_at,
                 status_snapshot=status,
             )
+        except asyncio.CancelledError as exc:
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling() == 0:
+                reason = "worker lifecycle cancelled unexpectedly"
+                self._emit_progress(
+                    progress,
+                    RuntimeProgress(
+                        run_id=run_id,
+                        phase="FAILED",
+                        step=steps,
+                        max_steps=limit,
+                        reason=reason,
+                        run_status="FAILED",
+                    ),
+                )
+                with contextlib.suppress(Exception):
+                    await self.runs.finish(run_id, status="FAILED")
+                raise RuntimeError(reason) from exc
+            self._emit_progress(
+                progress,
+                RuntimeProgress(
+                    run_id=run_id,
+                    phase="CANCELLED",
+                    step=steps,
+                    max_steps=limit,
+                    reason="run cancelled by operator",
+                    run_status="PAUSED",
+                ),
+            )
+            with contextlib.suppress(Exception):
+                await self.runs.finish(run_id, status="PAUSED")
+            raise
         except BaseException as exc:
             self._emit_progress(
                 progress,
@@ -2821,6 +3153,34 @@ class NightScoutRuntime:
             self.task_store.set_run_id(None)
             self.attempt_observer.set_run_id(None)
             self._run_id = None
+
+    async def _execute_with_shutdown_grace(
+        self,
+        ticket: DispatchTicket,
+        *,
+        grace_seconds: float,
+    ) -> LifecycleResult:
+        """Let a claimed worker finish briefly before cancellation fences it."""
+        execution = asyncio.create_task(self.lifecycle.execute_claimed(ticket))
+        try:
+            return await asyncio.shield(execution)
+        except asyncio.CancelledError:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(execution),
+                    timeout=grace_seconds,
+                )
+            except TimeoutError:
+                execution.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await execution
+                raise asyncio.CancelledError from None
+            except asyncio.CancelledError:
+                # A second cancellation is the hard-stop path.
+                execution.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await execution
+                raise
 
     async def _assert_resumed_frontier_request_identity(self) -> None:
         """Require the same CLI identity for unfinished work that originated with it."""
@@ -2846,11 +3206,11 @@ class NightScoutRuntime:
             if not isinstance(fingerprint, str) or not fingerprint.strip():
                 continue
             raw_names = metadata.get("request_identity_header_names", [])
-            names_from_run = {
-                str(name).strip()
-                for name in raw_names
-                if str(name).strip()
-            } if isinstance(raw_names, list) else set()
+            names_from_run = (
+                {str(name).strip() for name in raw_names if str(name).strip()}
+                if isinstance(raw_names, list)
+                else set()
+            )
             required.setdefault(fingerprint.strip(), set()).update(names_from_run)
 
         if not required:
@@ -2926,6 +3286,8 @@ class NightScoutRuntime:
         step: int,
         max_steps: int,
         result: LifecycleResult,
+        running: int = 0,
+        slot_id: int | None = None,
     ) -> None:
         self._emit_progress(
             callback,
@@ -2940,6 +3302,8 @@ class NightScoutRuntime:
                 action=result.action,
                 reason=result.reason,
                 queue_status=result.queue_status,
+                running=running,
+                slot_id=slot_id,
             ),
         )
 
@@ -2951,6 +3315,8 @@ class NightScoutRuntime:
         run_id: str,
         step: int,
         max_steps: int,
+        running: int = 1,
+        slot_id: int | None = None,
     ) -> None:
         self._emit_progress(
             callback,
@@ -2963,6 +3329,8 @@ class NightScoutRuntime:
                 worker=task.worker,
                 action=task.action,
                 queue_status=task.status,
+                running=running,
+                slot_id=slot_id,
             ),
         )
 
@@ -2974,6 +3342,7 @@ class NightScoutRuntime:
                 task_counts = Counter(task.status.value for task in tasks)
                 open_review_count = len(await self.review_store.open_cases())
                 event_filter: tuple[Any, ...] = ()
+                task_conditions: tuple[Any, ...] = ()
             else:
                 task_run_filter = or_(
                     TaskRecord.run_id == run_id,
@@ -3007,6 +3376,20 @@ class NightScoutRuntime:
                     or 0
                 )
                 event_filter = (EventObservationRecord.run_id == run_id,)
+                task_conditions = (task_run_filter,)
+
+            running_rows = list(
+                (
+                    await session.execute(
+                        select(TaskRecord.worker, func.count(TaskRecord.task_id))
+                        .where(TaskRecord.status == TaskStatus.RUNNING.value, *task_conditions)
+                        .group_by(TaskRecord.worker)
+                    )
+                ).all()
+            )
+            running_by_worker = {
+                str(worker): int(count) for worker, count in running_rows
+            }
 
             attempt_conditions = (TaskAttemptRecord.run_id == run_id,) if run_id is not None else ()
             attempt_rows = list(
@@ -3052,6 +3435,26 @@ class NightScoutRuntime:
                 ).all()
             )
 
+        limiter = getattr(self, "rate_limiter", None)
+        rate_waiting = limiter.waiting_by_worker if limiter is not None else {}
+        event_bus = getattr(self, "event_bus", None)
+        queue_metrics = event_bus.queue_metrics if event_bus is not None else {}
+        if running_by_worker:
+            dispatcher_state = "EXECUTING"
+        elif rate_waiting:
+            dispatcher_state = "WAITING_RATE"
+        elif task_counts.get(TaskStatus.REVIEW.value, 0):
+            dispatcher_state = "WAITING_REVIEW"
+        elif task_counts.get(TaskStatus.DEFERRED.value, 0):
+            dispatcher_state = "WAITING_DEFERRED"
+        elif any(
+            task_counts.get(status.value, 0)
+            for status in (TaskStatus.PENDING,)
+        ):
+            dispatcher_state = "READY"
+        else:
+            dispatcher_state = "IDLE"
+
         return RuntimeStatus(
             target_id=self.configuration.scope.target_id,
             workspace_root=str(self.configuration.workspace_root),
@@ -3059,6 +3462,15 @@ class NightScoutRuntime:
             event_count=event_count,
             asset_count=asset_count,
             task_counts=dict(sorted(task_counts.items())),
+            running_by_worker=dict(sorted(running_by_worker.items())),
+            waiting_rate=sum(rate_waiting.values()),
+            rate_waiting_by_worker=rate_waiting,
+            event_queue_depth=int(queue_metrics.get("depth", 0)),
+            event_queue_capacity=int(queue_metrics.get("capacity", 0)),
+            event_queue_high_watermark=int(queue_metrics.get("high_watermark", 0)),
+            event_publish_avg_ms=float(queue_metrics.get("publish_avg_ms", 0.0)),
+            sqlite_busy_count=int(queue_metrics.get("sqlite_busy_count", 0)),
+            dispatcher_state=dispatcher_state,
             attempt_counts=dict(sorted(attempt_counts.items())),
             open_review_cases=open_review_count,
             run_counts={str(status): int(count) for status, count in run_rows},
@@ -3206,6 +3618,29 @@ class NightScoutRuntime:
 
         event = event_from_storage_record(record)
         trace = await self.provenance.ancestors(event.event_id, max_depth=max_depth)
+        graph = await SurfaceGraphBuilder(
+            self.database,
+            target_id=self.workspace_binding.target_id,
+            disabled_workers=self.effective_disabled_workers,
+        ).build(
+            SurfaceGraphFilter(
+                include_out_of_scope=True,
+                include_intelligence=True,
+                include_provenance=True,
+            )
+        )
+        identity = surface_identity(event.type, event.value, include_intelligence=True)
+        surface_node = (
+            next((node for node in graph.nodes if node.node_id == identity.node_id), None)
+            if identity is not None
+            else None
+        )
+        surface_edges = [
+            edge
+            for edge in graph.edges
+            if surface_node is not None
+            and surface_node.node_id in {edge.source_node_id, edge.target_node_id}
+        ]
 
         async with self.database.session() as session:
             task_rows = list(
@@ -3237,6 +3672,15 @@ class NightScoutRuntime:
         return {
             "event": event.model_dump(mode="json"),
             "provenance": trace.model_dump(mode="json"),
+            "surface": {
+                "node": (
+                    surface_node.model_dump(mode="json")
+                    if surface_node is not None
+                    else None
+                ),
+                "edges": [edge.model_dump(mode="json") for edge in surface_edges],
+                "graph_fingerprint": graph.fingerprint,
+            },
             "tasks": [
                 {
                     "task_id": row.task_id,
@@ -3270,16 +3714,34 @@ class NightScoutRuntime:
         mode: ExportMode,
         confirm_sensitive: bool,
         output: Path | None = None,
+        graph_filter: SurfaceGraphFilter | None = None,
     ) -> tuple[Path, ...]:
+        fmt = format.strip().lower()
+
+        if fmt in {"graph-json", "tree-json", "html"}:
+            snapshot = await SurfaceGraphBuilder(
+                self.database,
+                target_id=self.workspace_binding.target_id,
+                disabled_workers=self.effective_disabled_workers,
+            ).build(graph_filter)
+            section_name = fmt.replace("-", "_")
+            graph_export = getattr(self.configuration.pipeline.exports, section_name)
+            destination = output or self.configuration.resolve(
+                graph_export.path
+            )
+            exporter = {
+                "graph-json": export_graph_json,
+                "tree-json": export_tree_json,
+                "html": export_surface_html,
+            }[fmt]
+            return (await exporter(snapshot, destination),)
+
         events = await self.all_events()
         provider = WorkspaceSensitiveEvidenceProvider(self._sensitive_root)
-        fmt = format.strip().lower()
 
         if fmt == "jsonl":
             destination = output or self.configuration.resolve(
-                self.configuration.pipeline.exports.get("jsonl", {}).get(
-                    "path", "exports/nightscout.jsonl"
-                )
+                self.configuration.pipeline.exports.jsonl.path
             )
             return (
                 await export_jsonl(
@@ -3295,7 +3757,7 @@ class NightScoutRuntime:
 
         if fmt == "text":
             destination = output or self.configuration.resolve(
-                self.configuration.pipeline.exports.get("text", {}).get("directory", "exports/text")
+                self.configuration.pipeline.exports.text.directory
             )
             return await export_text_bundle(
                 events,
@@ -3309,7 +3771,7 @@ class NightScoutRuntime:
 
         if fmt == "csv":
             destination = output or self.configuration.resolve(
-                self.configuration.pipeline.exports.get("csv", {}).get("directory", "exports/csv")
+                self.configuration.pipeline.exports.csv.directory
             )
             return await export_csv_bundle(
                 events,
@@ -3321,7 +3783,7 @@ class NightScoutRuntime:
                 sensitive_provider=provider,
             )
 
-        raise ValueError("format must be jsonl, text, or csv")
+        raise ValueError("format must be jsonl, text, csv, graph-json, tree-json, or html")
 
 
 async def build_runtime(
@@ -3641,11 +4103,7 @@ def doctor_from_files(
 
     identity = request_identity or RequestIdentityPolicy()
     identity_workers = tuple(
-        sorted(
-            worker
-            for worker in TARGET_HTTP_IDENTITY_WORKERS
-            if cfg.worker_enabled(worker)
-        )
+        sorted(worker for worker in TARGET_HTTP_IDENTITY_WORKERS if cfg.worker_enabled(worker))
     )
     if identity.configured:
         checks.append(

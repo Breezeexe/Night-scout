@@ -708,7 +708,7 @@ class ParametersWorker:
 
         pacing = arjun_pacing_from_plan(plan)
 
-        decision = await self._rate_limiter.acquire(
+        decision = await self._rate_limiter.await_acquire(
             task,
             context=context,
             demand=RateLimitDemand(
@@ -992,7 +992,7 @@ def validate_opaque_parameter_plan(plan: RateLimitPlan) -> str | None:
             "multi-request subprocess fails closed"
         )
 
-    if plan.aggregate_rps_ceiling is None or plan.aggregate_rps_ceiling <= 0.0:
+    if plan.safe_rps_hint is None or plan.safe_rps_hint <= 0.0:
         return (
             "parameters requires an explicit requests_per_second ceiling in "
             "its matching shared rate-limit rule"
@@ -1008,10 +1008,10 @@ def validate_opaque_parameter_plan(plan: RateLimitPlan) -> str | None:
 
 
 def arjun_pacing_from_plan(plan: RateLimitPlan) -> ArjunPacing:
-    if plan.aggregate_rps_ceiling is None or plan.aggregate_rps_ceiling <= 0:
+    if plan.safe_rps_hint is None or plan.safe_rps_hint <= 0:
         raise ValueError("rate plan has no positive aggregate RPS ceiling")
 
-    rps = plan.aggregate_rps_ceiling
+    rps = plan.safe_rps_hint
 
     if rps >= 1.0:
         return ArjunPacing(

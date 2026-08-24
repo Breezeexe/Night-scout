@@ -43,6 +43,20 @@ runtime:
   # deferrals leave the durable frontier intact and finish the run as PAUSED.
   max_deferred_wait_seconds: 60
 
+  # Bounded task execution is independent from the stricter shared network
+  # RPS/concurrency policy below. Slow subprocesses therefore do not block
+  # unrelated DNS/HTTP/TLS work, while every request remains rate limited.
+  parallelism:
+    execution_concurrency: 4
+    dispatcher_batch_size: 16
+    event_queue_capacity: 1000
+    event_writer_concurrency: 1
+    shutdown_grace_seconds: 30
+    worker_limits:
+      crawler: 2
+      nuclei: 1
+      vhost: 2
+
   project_vocabulary: true
   vulnerability_enrichment: true
   snapshot_capture: true
@@ -983,6 +997,18 @@ exports:
   csv:
     enabled: true
     directory: exports/csv
+
+  graph_json:
+    enabled: true
+    path: exports/surface-graph.json
+
+  tree_json:
+    enabled: true
+    path: exports/surface-tree.json
+
+  html:
+    enabled: true
+    path: exports/surface-graph.html
 
   sensitive_evidence:
     enabled: true

@@ -67,6 +67,10 @@ from recon.policy.rate_limit import (
 )
 from recon.policy.request_identity import RequestIdentityPolicy
 from recon.workers.passive_domains import normalize_dns_name
+from recon.workers.subprocess_stream import (
+    completed_process_returncode,
+    stream_process_stdout,
+)
 
 WORKER_NAME = "http"
 ACTION_PROBE = "probe"
@@ -561,29 +565,22 @@ class HttpxBackend:
             await process.stdin.wait_closed()
 
             try:
-                async with asyncio.timeout(
-                    self.config.process_timeout_seconds
+                async for raw_line in stream_process_stdout(
+                    process,
+                    timeout_seconds=self.config.process_timeout_seconds,
                 ):
-                    while True:
-                        raw_line = await process.stdout.readline()
-                        if not raw_line:
-                            break
+                    line = raw_line.decode(
+                        "utf-8",
+                        errors="replace",
+                    ).strip()
 
-                        line = raw_line.decode(
-                            "utf-8",
-                            errors="replace",
-                        ).strip()
+                    if not line:
+                        continue
 
-                        if not line:
-                            continue
+                    parsed = parse_httpx_line(line)
 
-                        parsed = parse_httpx_line(line)
-
-                        if parsed is not None:
-                            yield parsed
-
-                    returncode = await process.wait()
-
+                    if parsed is not None:
+                        yield parsed
             except TimeoutError as exc:
                 await _terminate_process(process)
                 raise HTTPBackendTimeout(
@@ -591,6 +588,7 @@ class HttpxBackend:
                     f"({self.config.process_timeout_seconds}s)"
                 ) from exc
 
+            returncode = completed_process_returncode(process)
             if returncode != 0:
                 detail = " | ".join(stderr_tail)
                 raise HTTPBackendError(
@@ -727,7 +725,7 @@ class HTTPWorker:
         cli_rps = tool_integer_rps_hint(plan)
 
         for scheme in self._backend_schemes():
-            decision = await self._rate_limiter.acquire(
+            decision = await self._rate_limiter.await_acquire(
                 task,
                 context=context,
                 demand=RateLimitDemand(

@@ -1680,20 +1680,26 @@ class DecisionRepository:
         self,
         decisions: Sequence[ScheduleDecision],
         *,
-        selected_task_id: str,
+        selected_task_id: str | None = None,
+        selected_task_ids: Sequence[str] | None = None,
     ) -> tuple[str, ...]:
         """Persist one bounded scheduler ranking atomically."""
         if not decisions:
             return ()
-        if selected_task_id not in {item.task_id for item in decisions}:
-            raise ValueError("selected_task_id is not present in decisions")
+        selected = set(selected_task_ids or ())
+        if selected_task_id is not None:
+            selected.add(selected_task_id)
+        if not selected:
+            raise ValueError("at least one selected task is required")
+        if not selected.issubset({item.task_id for item in decisions}):
+            raise ValueError("selected task is not present in decisions")
 
         records = [
             SchedulerDecisionRecord(
                 task_id=decision.task_id,
                 evaluated_at=decision.evaluated_at,
                 score=decision.score,
-                selected=(decision.task_id == selected_task_id),
+                selected=(decision.task_id in selected),
                 breakdown_json=decision.breakdown.model_dump(mode="json"),
                 signals_json=decision.signals.model_dump(mode="json"),
             )

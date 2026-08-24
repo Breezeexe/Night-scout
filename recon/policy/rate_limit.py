@@ -48,7 +48,9 @@ out-of-scope target into an authorized one.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
@@ -806,6 +808,17 @@ class RateLimiter:
     ) -> None:
         self._store = store
         self._profile = profile
+        self._capacity_changed = asyncio.Condition()
+        self._waiting_by_worker: Counter[str] = Counter()
+
+    @property
+    def waiting_by_worker(self) -> dict[str, int]:
+        """Return a point-in-time local view of cancelable permit waits."""
+        return {
+            worker: count
+            for worker, count in sorted(self._waiting_by_worker.items())
+            if count > 0
+        }
 
     def plan(
         self,
@@ -932,9 +945,66 @@ class RateLimiter:
             now=utc_now(),
         )
 
+    async def await_acquire(
+        self,
+        task: Task,
+        *,
+        context: RateLimitContext,
+        demand: RateLimitDemand | None = None,
+        lease_for: timedelta = timedelta(minutes=5),
+        max_wait_seconds: float | None = None,
+    ) -> RateLimitDecision:
+        """Wait cancelably for shared capacity without a hot retry loop.
+
+        Token exhaustion wakes on the store-provided retry time. Concurrency
+        exhaustion can additionally wake as soon as another local worker
+        releases its lease. The durable store remains the source of truth, so
+        spurious or missed notifications are harmless.
+        """
+        if max_wait_seconds is not None and max_wait_seconds < 0.0:
+            raise ValueError("max_wait_seconds cannot be negative")
+        started = asyncio.get_running_loop().time()
+        while True:
+            decision = await self.acquire(
+                task,
+                context=context,
+                demand=demand,
+                lease_for=lease_for,
+            )
+            if decision.outcome is not RateLimitOutcome.DEFER:
+                return decision
+
+            retry_after = max(
+                decision.retry_after_seconds
+                if decision.retry_after_seconds is not None
+                else self._profile.default_retry_after_seconds,
+                0.001,
+            )
+            if max_wait_seconds is not None:
+                remaining = max_wait_seconds - (
+                    asyncio.get_running_loop().time() - started
+                )
+                if remaining <= 0.0:
+                    return decision
+                retry_after = min(retry_after, remaining)
+
+            self._waiting_by_worker[task.worker] += 1
+            try:
+                async with self._capacity_changed:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(
+                            self._capacity_changed.wait(),
+                            timeout=retry_after,
+                        )
+            finally:
+                self._waiting_by_worker[task.worker] -= 1
+
     async def release(self, lease_id: str) -> RateLimitLease:
         """Release active concurrency; consumed request tokens remain spent."""
-        return await self._store.release(lease_id)
+        lease = await self._store.release(lease_id)
+        async with self._capacity_changed:
+            self._capacity_changed.notify_all()
+        return lease
 
     async def renew(
         self,
@@ -953,7 +1023,11 @@ class RateLimiter:
 
     async def reap_expired(self) -> list[RateLimitLease]:
         """Release concurrency from abandoned/crashed workers."""
-        return await self._store.reap_expired(now=utc_now())
+        leases = await self._store.reap_expired(now=utc_now())
+        if leases:
+            async with self._capacity_changed:
+                self._capacity_changed.notify_all()
+        return leases
 
     async def bucket_state(
         self,

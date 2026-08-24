@@ -60,6 +60,10 @@ from recon.core.events import Event, EventType, ScopeState
 from recon.core.lifecycle import WorkerExecutionResult, WorkerOutcome
 from recon.core.queue import Task, TaskStatus
 from recon.core.router import RouteRule
+from recon.workers.subprocess_stream import (
+    completed_process_returncode,
+    stream_process_stdout,
+)
 
 WORKER_NAME = "asn"
 ACTION_LOOKUP_IP = "lookup_ip"
@@ -440,37 +444,25 @@ class AsnmapBackend:
             await process.stdin.wait_closed()
 
             try:
-                async with asyncio.timeout(
-                    self.config.process_timeout_seconds
+                async for raw_line in stream_process_stdout(
+                    process,
+                    timeout_seconds=self.config.process_timeout_seconds,
                 ):
-                    while True:
-                        raw_line = (
-                            await process.stdout.readline()
-                        )
+                    line = raw_line.decode(
+                        "utf-8",
+                        errors="replace",
+                    ).strip()
 
-                        if not raw_line:
-                            break
+                    if not line:
+                        continue
 
-                        line = raw_line.decode(
-                            "utf-8",
-                            errors="replace",
-                        ).strip()
-
-                        if not line:
-                            continue
-
-                        result = parse_asnmap_line(
-                            line,
-                            expected_ip=canonical_ip,
-                        )
-
-                        if result is not None:
-                            yield result
-
-                    returncode = (
-                        await process.wait()
+                    result = parse_asnmap_line(
+                        line,
+                        expected_ip=canonical_ip,
                     )
 
+                    if result is not None:
+                        yield result
             except TimeoutError as exc:
                 await _terminate_process(
                     process
@@ -482,6 +474,7 @@ class AsnmapBackend:
                     f"({self.config.process_timeout_seconds}s)"
                 ) from exc
 
+            returncode = completed_process_returncode(process)
             if returncode != 0:
                 detail = " | ".join(
                     stderr_tail
@@ -642,8 +635,6 @@ class ASNWorker:
                 error=str(exc),
             )
 
-        saw_result = False
-
         try:
             async for result in (
                 self._backend.lookup_ip(
@@ -657,8 +648,6 @@ class ASNWorker:
                     # Do not let malformed provider output
                     # redirect this task to another subject.
                     continue
-
-                saw_result = True
 
                 await self._publish_result(
                     input_event=input_event,

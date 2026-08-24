@@ -45,6 +45,10 @@ from recon.policy.rate_limit import (
     RateLimitOutcome,
 )
 from recon.workers.passive_domains import normalize_dns_name
+from recon.workers.subprocess_stream import (
+    completed_process_returncode,
+    stream_process_stdout,
+)
 
 WORKER_NAME = "tls"
 ACTION_INSPECT = "inspect"
@@ -258,6 +262,10 @@ class TLSBackendTimeout(TLSBackendError):
     pass
 
 
+class TLSBackendInvocationError(TLSBackendError):
+    """The local tlsx command line is invalid and retrying cannot help."""
+
+
 class TlsxBackend:
     name = "tlsx"
 
@@ -281,10 +289,6 @@ class TlsxBackend:
             "-c", "1",
             "-retry", "0",
             "-timeout", str(self.config.timeout_seconds),
-            "-so",
-            "-tv", "-cipher",
-            "-hash", "sha256",
-            "-se", "-tps",
         ]
         args.extend(self.config.extra_args)
         return tuple(args)
@@ -320,18 +324,15 @@ class TlsxBackend:
             await process.stdin.wait_closed()
 
             try:
-                async with asyncio.timeout(self.config.process_timeout_seconds):
-                    while True:
-                        raw = await process.stdout.readline()
-                        if not raw:
-                            break
-                        result = parse_tlsx_line(
-                            raw.decode("utf-8", errors="replace").strip()
-                        )
-                        if result is not None:
-                            yield result
-
-                    returncode = await process.wait()
+                async for raw in stream_process_stdout(
+                    process,
+                    timeout_seconds=self.config.process_timeout_seconds,
+                ):
+                    result = parse_tlsx_line(
+                        raw.decode("utf-8", errors="replace").strip()
+                    )
+                    if result is not None:
+                        yield result
             except TimeoutError as exc:
                 await _terminate_process(process)
                 raise TLSBackendTimeout(
@@ -339,9 +340,16 @@ class TlsxBackend:
                     f"({self.config.process_timeout_seconds}s)"
                 ) from exc
 
+            returncode = completed_process_returncode(process)
             if returncode != 0:
+                await stderr_task
                 tail = " | ".join(stderr_tail)
-                raise TLSBackendError(
+                error_type = (
+                    TLSBackendInvocationError
+                    if _is_tlsx_invocation_failure(returncode, tail)
+                    else TLSBackendError
+                )
+                raise error_type(
                     f"tlsx exited unsuccessfully (returncode={returncode})"
                     + (f"; stderr_tail={tail}" if tail else "")
                 )
@@ -423,7 +431,7 @@ class TLSWorker:
             resource_keys=frozenset({f"host:{target.hostname}"})
         )
 
-        decision = await self._rate_limiter.acquire(
+        decision = await self._rate_limiter.await_acquire(
             task,
             context=context,
             demand=RateLimitDemand(requests=1.0, concurrency=1),
@@ -461,7 +469,12 @@ class TLSWorker:
                     input_event=input_event,
                     result=result,
                 )
-        except (TLSBackendTimeout, TLSBackendError) as exc:
+        except TLSBackendInvocationError as exc:
+            return WorkerExecutionResult(
+                outcome=WorkerOutcome.FAILED,
+                error=str(exc),
+            )
+        except TLSBackendError as exc:
             return WorkerExecutionResult(
                 outcome=WorkerOutcome.RETRY,
                 error=str(exc),
@@ -845,6 +858,21 @@ def _source_component(value: str) -> str:
         "-", value.strip().lower()
     ).strip("-")
     return value or "unknown"
+
+
+def _is_tlsx_invocation_failure(returncode: int, detail: str) -> bool:
+    normalized = detail.lower()
+    return returncode == 2 or any(
+        marker in normalized
+        for marker in (
+            "could not validate options",
+            "could not create runner",
+            "unknown flag",
+            "flag provided but not defined",
+            "invalid value",
+            "cannot be used with other probes",
+        )
+    )
 
 
 def _resolve_executable(binary: str) -> str | None:

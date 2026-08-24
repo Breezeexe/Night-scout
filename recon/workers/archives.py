@@ -71,6 +71,10 @@ from recon.core.lifecycle import WorkerExecutionResult, WorkerOutcome
 from recon.core.queue import Task, TaskStatus
 from recon.core.router import RouteRule
 from recon.workers.passive_domains import normalize_dns_name
+from recon.workers.subprocess_stream import (
+    completed_process_returncode,
+    stream_process_stdout,
+)
 
 WORKER_NAME = "archives"
 ACTION_DISCOVER_URLS = "discover_urls"
@@ -623,36 +627,20 @@ class URLFinderSource:
 
         try:
             try:
-                async with asyncio.timeout(
-                    self.config.process_timeout_seconds
+                async for raw_line in stream_process_stdout(
+                    process,
+                    timeout_seconds=self.config.process_timeout_seconds,
                 ):
-                    while True:
-                        raw_line = (
-                            await process.stdout.readline()
-                        )
+                    line = raw_line.decode(
+                        "utf-8",
+                        errors="replace",
+                    ).strip()
 
-                        if not raw_line:
-                            break
+                    if not line:
+                        continue
 
-                        line = raw_line.decode(
-                            "utf-8",
-                            errors="replace",
-                        ).strip()
-
-                        if not line:
-                            continue
-
-                        for finding in (
-                            parse_urlfinder_line(
-                                line
-                            )
-                        ):
-                            yield finding
-
-                    returncode = (
-                        await process.wait()
-                    )
-
+                    for finding in parse_urlfinder_line(line):
+                        yield finding
             except TimeoutError as exc:
                 await _terminate_process(
                     process
@@ -664,6 +652,7 @@ class URLFinderSource:
                     f"({self.config.process_timeout_seconds}s)"
                 ) from exc
 
+            returncode = completed_process_returncode(process)
             if returncode != 0:
                 detail = " | ".join(
                     stderr_tail

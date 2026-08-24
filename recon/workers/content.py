@@ -90,6 +90,10 @@ from recon.policy.rate_limit import (
 from recon.policy.request_identity import RequestIdentityPolicy
 from recon.workers.http import normalize_http_url
 from recon.workers.passive_domains import normalize_dns_name
+from recon.workers.subprocess_stream import (
+    completed_process_returncode,
+    stream_process_stdout,
+)
 
 WORKER_NAME = "content"
 ACTION_FETCH_JAVASCRIPT = "fetch_javascript"
@@ -754,33 +758,25 @@ class HttpxContentBackend:
             await process.stdin.wait_closed()
 
             try:
-                async with asyncio.timeout(
-                    self.config.process_timeout_seconds
+                async for raw_line in stream_process_stdout(
+                    process,
+                    timeout_seconds=self.config.process_timeout_seconds,
                 ):
-                    while True:
-                        raw_line = await process.stdout.readline()
+                    line = raw_line.decode(
+                        "utf-8",
+                        errors="replace",
+                    ).strip()
 
-                        if not raw_line:
-                            break
+                    if not line:
+                        continue
 
-                        line = raw_line.decode(
-                            "utf-8",
-                            errors="replace",
-                        ).strip()
+                    parsed = parse_httpx_content_line(
+                        line,
+                        expected_url=requested_url,
+                    )
 
-                        if not line:
-                            continue
-
-                        parsed = parse_httpx_content_line(
-                            line,
-                            expected_url=requested_url,
-                        )
-
-                        if parsed is not None:
-                            yield parsed
-
-                    returncode = await process.wait()
-
+                    if parsed is not None:
+                        yield parsed
             except TimeoutError as exc:
                 await _terminate_process(
                     process
@@ -791,6 +787,7 @@ class HttpxContentBackend:
                     f"({self.config.process_timeout_seconds}s)"
                 ) from exc
 
+            returncode = completed_process_returncode(process)
             if returncode != 0:
                 detail = " | ".join(
                     stderr_tail
@@ -951,7 +948,7 @@ class ContentWorker:
             plan
         )
 
-        decision = await self._rate_limiter.acquire(
+        decision = await self._rate_limiter.await_acquire(
             task,
             context=context,
             demand=RateLimitDemand(

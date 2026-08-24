@@ -192,11 +192,31 @@ class LifecycleResult(BaseModel):
     queue_status: TaskStatus | None = None
     claimed: bool = False
     execution_attempt: int | None = Field(default=None, ge=1)
+    backpressure: bool = False
 
     @model_validator(mode="after")
     def validate_claim_metadata(self) -> LifecycleResult:
         if self.execution_attempt is not None and not self.claimed:
             raise ValueError("execution_attempt requires claimed=true")
+        if self.backpressure and self.outcome is not LifecycleOutcome.DEFERRED:
+            raise ValueError("backpressure requires outcome=DEFERRED")
+        return self
+
+
+class DispatchTicket(BaseModel):
+    """A fully admitted, budgeted and fenced task ready for execution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task: Task
+    schedule: ScheduleDecision
+    reservation_id: str | None = None
+    attempt_id: str | None = None
+
+    @model_validator(mode="after")
+    def require_claim(self) -> DispatchTicket:
+        if self.task.status is not TaskStatus.RUNNING or self.task.claim_token is None:
+            raise ValueError("dispatch ticket requires a claimed RUNNING task")
         return self
 
 
@@ -374,11 +394,50 @@ class Lifecycle:
         *,
         on_claimed: Callable[[Task], None] | None = None,
     ) -> LifecycleResult:
-        """Evaluate and, when permitted, execute one ready task."""
-        schedule = await self._scheduler.select_next()
+        """Compatibility wrapper for one admission followed by one execution."""
+        admission = await self.admit_next()
+        if isinstance(admission, LifecycleResult):
+            return admission
+        if on_claimed is not None:
+            with contextlib.suppress(Exception):
+                on_claimed(admission.task)
+        return await self.execute_claimed(admission)
+
+    async def admit_next(
+        self,
+        *,
+        excluded_workers: frozenset[str] | None = None,
+    ) -> DispatchTicket | LifecycleResult:
+        """Select, gate, budget and atomically claim one ready task."""
+        schedule = await self._scheduler.select_next(excluded_workers=excluded_workers)
 
         if schedule is None:
             return LifecycleResult(outcome=LifecycleOutcome.IDLE)
+
+        return await self.admit(schedule)
+
+    async def admit_batch(
+        self,
+        *,
+        limit: int,
+        excluded_workers: frozenset[str] | None = None,
+        worker_capacities: dict[str, int] | None = None,
+    ) -> list[DispatchTicket | LifecycleResult]:
+        """Score once and admit up to ``limit`` independently fenced tasks."""
+        schedules = await self._scheduler.select_batch(
+            limit=limit,
+            excluded_workers=excluded_workers,
+            worker_capacities=worker_capacities,
+        )
+        if not schedules:
+            return [LifecycleResult(outcome=LifecycleOutcome.IDLE)]
+        return [await self.admit(schedule) for schedule in schedules]
+
+    async def admit(
+        self,
+        schedule: ScheduleDecision,
+    ) -> DispatchTicket | LifecycleResult:
+        """Gate, budget and atomically claim one pre-ranked task."""
 
         task = await self._queue.get(schedule.task_id)
 
@@ -403,12 +462,13 @@ class Lifecycle:
                 queue_status=task.status,
             )
 
-        attempt_id = (
-            await self._attempt_observer.start(task, schedule)
-            if self._attempt_observer is not None
-            else None
-        )
+        attempt_id: str | None = None
         running: Task | None = None
+
+        async def start_attempt() -> None:
+            nonlocal attempt_id
+            if attempt_id is None and self._attempt_observer is not None:
+                attempt_id = await self._attempt_observer.start(task, schedule)
 
         async def complete(result: LifecycleResult) -> LifecycleResult:
             if running is not None:
@@ -424,6 +484,7 @@ class Lifecycle:
 
         gate_result = await self._apply_gates(task, schedule)
         if gate_result is not None:
+            await start_attempt()
             return await complete(gate_result)
 
         plan = await self._budget_planner.plan(task, schedule)
@@ -442,19 +503,19 @@ class Lifecycle:
                 delay=delay,
                 reason=budget.reason or "budget deferred",
             )
-            return await complete(
-                LifecycleResult(
-                    outcome=LifecycleOutcome.DEFERRED,
-                    task_id=task.task_id,
-                    worker=task.worker,
-                    action=task.action,
-                    reason=budget.reason,
-                    schedule_score=schedule.score,
-                    queue_status=deferred.status,
-                )
+            return LifecycleResult(
+                outcome=LifecycleOutcome.DEFERRED,
+                task_id=task.task_id,
+                worker=task.worker,
+                action=task.action,
+                reason=budget.reason,
+                schedule_score=schedule.score,
+                queue_status=deferred.status,
+                backpressure=True,
             )
 
         if budget.outcome is BudgetOutcome.DENY:
+            await start_attempt()
             blocked = await self._queue.block(
                 task.task_id,
                 reason=budget.reason or "hard budget denied execution",
@@ -474,6 +535,7 @@ class Lifecycle:
         reservation_id = (
             budget.reservation.reservation_id if budget.reservation is not None else None
         )
+        await start_attempt()
 
         try:
             running = await self._queue.claim(
@@ -500,9 +562,30 @@ class Lifecycle:
                 )
             )
 
-        if on_claimed is not None:
-            with contextlib.suppress(Exception):
-                on_claimed(running)
+        return DispatchTicket(
+            task=running,
+            schedule=schedule,
+            reservation_id=reservation_id,
+            attempt_id=attempt_id,
+        )
+
+    async def execute_claimed(self, ticket: DispatchTicket) -> LifecycleResult:
+        """Execute and durably finalize a previously admitted dispatch ticket."""
+        running = ticket.task
+        schedule = ticket.schedule
+        reservation_id = ticket.reservation_id
+        attempt_id = ticket.attempt_id
+
+        async def complete(result: LifecycleResult) -> LifecycleResult:
+            result = result.model_copy(
+                update={
+                    "claimed": True,
+                    "execution_attempt": running.attempts,
+                }
+            )
+            if attempt_id is not None and self._attempt_observer is not None:
+                await self._attempt_observer.finish(attempt_id, result)
+            return result
 
         heartbeat = asyncio.create_task(
             self._heartbeat_loop(
@@ -518,6 +601,63 @@ class Lifecycle:
                 execution_task=execution_task,
                 heartbeat_task=heartbeat,
             )
+        except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            externally_cancelled = (
+                current_task is None or current_task.cancelling() > 0
+            )
+            cancellation_reason = (
+                "execution cancelled by operator"
+                if externally_cancelled
+                else "worker execution cancelled unexpectedly"
+            )
+            # A direct lifecycle cancellation is an operator/runtime decision;
+            # a child executor can also surface CancelledError without its
+            # lifecycle owner being cancelled. Finalize both ledgers in either
+            # case, but contain the latter as a retryable worker failure so it
+            # cannot cancel unrelated parallel work.
+            if reservation_id is not None:
+                with contextlib.suppress(Exception):
+                    await self._budgets.commit(reservation_id)
+
+            try:
+                cancelled = await self._queue.fail(
+                    running.task_id,
+                    claim_token=self._claim_token(running),
+                    error=cancellation_reason,
+                    retry_delay=timedelta(seconds=0),
+                )
+                result = await complete(
+                    LifecycleResult(
+                        outcome=(
+                            LifecycleOutcome.RETRY
+                            if cancelled.status is TaskStatus.DEFERRED
+                            else LifecycleOutcome.FAILED
+                        ),
+                        task_id=running.task_id,
+                        worker=running.worker,
+                        action=running.action,
+                        reason=cancelled.last_error,
+                        schedule_score=schedule.score,
+                        reservation_id=reservation_id,
+                        queue_status=cancelled.status,
+                    )
+                )
+            except (KeyError, ValueError) as transition_error:
+                # A concurrent lease recovery may already have finalized it.
+                if externally_cancelled:
+                    raise
+                return await complete(
+                    await self._stale_completion_result(
+                        running,
+                        schedule,
+                        reservation_id=reservation_id,
+                        error=transition_error,
+                    )
+                )
+            if externally_cancelled:
+                raise
+            return result
         except LeaseHeartbeatError as exc:
             # Continuing target traffic without both live leases would permit
             # duplicate or unbudgeted execution. The supervisor has already

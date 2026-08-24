@@ -11,6 +11,23 @@ runtime:
   recover_retry_delay_seconds: 0
   resume_frontier: true
   max_deferred_wait_seconds: 60
+  parallelism:
+    execution_concurrency: 8
+    dispatcher_batch_size: 16
+    event_queue_capacity: 2000
+    event_writer_concurrency: 1
+    shutdown_grace_seconds: 30
+    worker_limits:
+      passive_domains: 2
+      dns: 4
+      http: 4
+      tls: 2
+      crawler: 2
+      content: 4
+      parameters: 2
+      vhost: 2
+      nuclei: 1
+      permutations: 1
   project_vocabulary: true
   vulnerability_enrichment: true
   snapshot_capture: true
@@ -59,17 +76,17 @@ budgets:
     tasks: 20000
     requests: 75000
     candidates: 250000
-    concurrent_tasks: 8
+    concurrent_tasks: 10
   soft_branch_limits:
     tasks: 2500
     requests: 10000
     candidates: 20000
-    concurrent_tasks: 4
+    concurrent_tasks: 5
   soft_resource_limits:
     tasks: 50
     requests: 1500
     candidates: 2000
-    concurrent_tasks: 2
+    concurrent_tasks: 3
   soft_worker_limits:
     crawler:
       tasks: 1000
@@ -412,7 +429,7 @@ workers:
   nuclei:
     enabled: true
     templates:
-      manifest: configs/nuclei-templates.yaml
+      manifest: configs/jetinfosystems.nuclei.yaml
       root: nuclei-templates
       max_template_bytes: 1048576
     config:
@@ -436,8 +453,8 @@ workers:
 
 intelligence:
   wordlists:
-    manifest: /home/breeze/.local/share/nightscout/wordlists/generated/manifest.local.yaml
-    corpus_root: /home/breeze/.local/share/nightscout/wordlists
+    manifest: ~/.local/share/nightscout/wordlists/generated/manifest.local.yaml
+    corpus_root: ~/.local/share/nightscout/wordlists
     dns_tier: medium
     parameter_tier: medium
     max_target_events: 250000

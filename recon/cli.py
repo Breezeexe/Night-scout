@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,8 @@ from recon.runtime import (
 from recon.storage.database import Database
 from recon.storage.schema import upgrade_database
 from recon.storage.workspace import WorkspaceRepository
+from recon.surface.models import SurfaceGraphFilter
+from recon.surface.rebuild import SurfaceGraphRebuilder
 from recon.tooling import (
     ToolInstallProgress,
     ToolInstallResult,
@@ -95,9 +98,59 @@ review_app = typer.Typer(
 )
 app.add_typer(review_app, name="review")
 
+graph_app = typer.Typer(
+    name="graph",
+    help="Build and maintain the canonical attack-surface graph.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(graph_app, name="graph")
+
 
 def _resolve_pipeline(value: Path | None) -> Path:
     return value.expanduser().resolve() if value is not None else preferred_pipeline_path()
+
+
+def _graph_export_command(
+    *,
+    pipeline: Path,
+    scope: Path | None,
+    format: str,
+) -> str:
+    args = [
+        "nightscout",
+        "export",
+        "--pipeline",
+        str(pipeline),
+    ]
+    if scope is not None:
+        args.extend(("--scope", str(scope.expanduser().resolve())))
+    args.extend(("--format", format))
+    return shlex.join(args)
+
+
+def _render_result_commands(*, pipeline: Path, scope: Path | None) -> None:
+    html_command = _graph_export_command(
+        pipeline=pipeline,
+        scope=scope,
+        format="html",
+    )
+    graph_json_command = _graph_export_command(
+        pipeline=pipeline,
+        scope=scope,
+        format="graph-json",
+    )
+    tree_json_command = _graph_export_command(
+        pipeline=pipeline,
+        scope=scope,
+        format="tree-json",
+    )
+
+    typer.echo("view results:")
+    typer.echo(f"  graph_html=\"$({html_command})\"")
+    typer.echo('  xdg-open "$graph_html"')
+    typer.echo(f"  {graph_json_command}")
+    typer.echo(f"  {tree_json_command}")
 
 
 def _request_identity_from_cli(
@@ -139,6 +192,10 @@ def _render_run_progress(item: RuntimeProgress) -> None:
         parts.append(f"action={item.action}")
     if item.queue_status is not None:
         parts.append(f"queue={item.queue_status.value}")
+    if item.running:
+        parts.append(f"running={item.running}")
+    if item.slot_id is not None:
+        parts.append(f"slot={item.slot_id}")
     if item.wait_seconds is not None:
         parts.append(f"wait={item.wait_seconds:.1f}s")
     if item.run_status:
@@ -488,6 +545,9 @@ def run_command(
     except KeyboardInterrupt:
         typer.echo("interrupted", err=True)
         raise typer.Exit(code=130) from None
+    except asyncio.CancelledError:
+        typer.echo("interrupted", err=True)
+        raise typer.Exit(code=130) from None
     except Exception as exc:
         typer.echo(f"run failed: {type(exc).__name__}: {exc}", err=True)
         raise typer.Exit(code=2) from exc
@@ -540,6 +600,8 @@ def run_command(
         for warning in warnings:
             typer.echo(f"  - {warning}")
 
+    _render_result_commands(pipeline=pipeline, scope=scope)
+
     if summary.get("status") == "FAILED":
         raise typer.Exit(code=1)
 
@@ -583,6 +645,21 @@ def status_command(
     typer.echo(f"events:       {status['event_count']}")
     typer.echo(f"assets:       {status['asset_count']}")
     typer.echo(f"open reviews: {status['open_review_cases']}")
+    typer.echo(f"dispatcher:   {status['dispatcher_state']}")
+    typer.echo(f"waiting rate: {status['waiting_rate']}")
+    typer.echo(
+        "event queue:  "
+        f"{status['event_queue_depth']}/{status['event_queue_capacity']} "
+        f"(high {status['event_queue_high_watermark']}, "
+        f"avg write {status['event_publish_avg_ms']:.2f} ms)"
+    )
+    if status["sqlite_busy_count"]:
+        typer.echo(f"sqlite busy:  {status['sqlite_busy_count']}")
+
+    if status.get("running_by_worker"):
+        typer.echo("running by worker:")
+        for name, count in sorted(status["running_by_worker"].items()):
+            typer.echo(f"  {name}: {count}")
 
     if status.get("run_counts"):
         typer.echo("runs:")
@@ -830,7 +907,7 @@ def export_command(
         "all",
         "--format",
         "-f",
-        help="jsonl, text, csv, or all.",
+        help="jsonl, text, csv, graph-json, tree-json, html, or all.",
     ),
     pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
     scope: Path | None = typer.Option(None, "--scope", "-s", help=_SCOPE_WORKSPACE_HELP),
@@ -850,13 +927,28 @@ def export_command(
         "--confirm-sensitive",
         help="Required second opt-in for --sensitive.",
     ),
+    confirmed_only: bool = typer.Option(False, "--confirmed-only"),
+    include_hypotheses: bool = typer.Option(True, "--include-hypotheses/--no-hypotheses"),
+    include_historical: bool = typer.Option(True, "--include-historical/--no-historical"),
+    include_out_of_scope: bool = typer.Option(False, "--include-out-of-scope"),
+    include_intelligence: bool = typer.Option(False, "--include-intelligence"),
+    include_provenance: bool = typer.Option(False, "--include-provenance"),
+    root: str | None = typer.Option(None, "--root"),
+    max_depth: int | None = typer.Option(None, "--max-depth", min=0, max=128),
+    min_confidence: float = typer.Option(0.0, "--min-confidence", min=0.0, max=1.0),
+    max_nodes: int = typer.Option(100_000, "--max-nodes", min=1, max=1_000_000),
+    max_edges: int = typer.Option(250_000, "--max-edges", min=1, max=2_000_000),
 ) -> None:
     """Export persisted findings in SAFE or explicitly confirmed sensitive mode."""
 
     pipeline = _resolve_pipeline(pipeline)
     normalized_format = format.strip().lower()
-    if normalized_format not in {"jsonl", "text", "csv", "all"}:
-        raise typer.BadParameter("--format must be jsonl, text, csv, or all")
+    graph_formats = {"graph-json", "tree-json", "html"}
+    supported_formats = {"jsonl", "text", "csv", *graph_formats}
+    if normalized_format not in {*supported_formats, "all"}:
+        raise typer.BadParameter(
+            "--format must be jsonl, text, csv, graph-json, tree-json, html, or all"
+        )
 
     if normalized_format == "all" and output is not None:
         raise typer.BadParameter("--output can only be used with one explicit format")
@@ -869,18 +961,49 @@ def export_command(
         raise typer.Exit(code=2)
 
     mode = ExportMode.SENSITIVE_EVIDENCE if sensitive else ExportMode.SAFE
-    formats = ("jsonl", "text", "csv") if normalized_format == "all" else (normalized_format,)
+    formats = (
+        (
+            "jsonl",
+            "text",
+            "csv",
+            "graph-json",
+            "tree-json",
+            "html",
+        )
+        if normalized_format == "all"
+        else (normalized_format,)
+    )
+    graph_filter = SurfaceGraphFilter(
+        confirmed_only=confirmed_only,
+        include_hypotheses=include_hypotheses,
+        include_historical=include_historical,
+        include_out_of_scope=include_out_of_scope,
+        include_intelligence=include_intelligence,
+        include_provenance=include_provenance,
+        root=root,
+        max_depth=max_depth,
+        min_confidence=min_confidence,
+        max_nodes=max_nodes,
+        max_edges=max_edges,
+    )
 
     async def _export() -> list[str]:
         runtime = await build_runtime(pipeline_path=pipeline, scope_path=scope)
         try:
             paths: list[str] = []
             for item in formats:
+                section = getattr(
+                    runtime.configuration.pipeline.exports,
+                    item.replace("-", "_"),
+                )
+                if normalized_format == "all" and not section.enabled:
+                    continue
                 written = await runtime.export(
                     format=item,
                     mode=mode,
                     confirm_sensitive=confirm_sensitive,
                     output=output if len(formats) == 1 else None,
+                    graph_filter=graph_filter if item in graph_formats else None,
                 )
                 paths.extend(str(path) for path in written)
             return paths
@@ -895,6 +1018,36 @@ def export_command(
 
     for path in paths:
         typer.echo(path)
+
+
+@graph_app.command("rebuild")
+def graph_rebuild_command(
+    pipeline: Path | None = typer.Option(None, "--pipeline", "-p"),
+    scope: Path | None = typer.Option(None, "--scope", "-s", help=_SCOPE_WORKSPACE_HELP),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    batch_size: int = typer.Option(500, "--batch-size", min=1, max=10_000),
+) -> None:
+    """Rebuild semantic relationships offline without target traffic."""
+
+    pipeline = _resolve_pipeline(pipeline)
+
+    async def _rebuild() -> dict[str, Any]:
+        runtime = await build_runtime(pipeline_path=pipeline, scope_path=scope)
+        try:
+            report = await SurfaceGraphRebuilder(runtime.database).rebuild(
+                dry_run=dry_run,
+                batch_size=batch_size,
+            )
+            return report.model_dump(mode="json")
+        finally:
+            await runtime.close()
+
+    try:
+        report = asyncio.run(_rebuild())
+    except Exception as exc:
+        typer.echo(f"graph rebuild failed: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def _wordlists_cli(argv: list[str]) -> None:

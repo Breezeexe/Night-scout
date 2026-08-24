@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections import Counter, defaultdict, deque
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -185,10 +187,81 @@ class Scheduler:
 
         return decisions
 
-    async def select_next(self) -> ScheduleDecision | None:
+    async def select_next(
+        self,
+        *,
+        excluded_workers: frozenset[str] | None = None,
+    ) -> ScheduleDecision | None:
         """Return the highest-ranked ready task without claiming it."""
         ranked = await self.rank_ready()
-        return ranked[0] if ranked else None
+        excluded = excluded_workers or frozenset()
+        return next(
+            (decision for decision in ranked if decision.worker not in excluded),
+            None,
+        )
+
+    async def select_batch(
+        self,
+        *,
+        limit: int,
+        excluded_workers: frozenset[str] | None = None,
+        worker_capacities: Mapping[str, int] | None = None,
+    ) -> list[ScheduleDecision]:
+        """Return a ranked dispatch batch after scoring the frontier once.
+
+        ``worker_capacities`` contains the number of currently free execution
+        slots for workers with an explicit per-worker limit. Workers omitted
+        from the mapping may consume any remaining global slot.
+        """
+        if limit < 1:
+            return []
+
+        ranked = await self.rank_ready()
+        return self._select_ranked_batch(
+            ranked,
+            limit=limit,
+            excluded_workers=excluded_workers,
+            worker_capacities=worker_capacities,
+        )
+
+    @staticmethod
+    def _select_ranked_batch(
+        ranked: list[ScheduleDecision],
+        *,
+        limit: int,
+        excluded_workers: frozenset[str] | None,
+        worker_capacities: Mapping[str, int] | None,
+    ) -> list[ScheduleDecision]:
+        """Take ranked work in fair worker rounds without losing local order."""
+        excluded = excluded_workers or frozenset()
+        capacities = worker_capacities or {}
+        worker_order: list[str] = []
+        queues: dict[str, deque[ScheduleDecision]] = defaultdict(deque)
+        for decision in ranked:
+            if decision.worker in excluded:
+                continue
+            if decision.worker not in queues:
+                worker_order.append(decision.worker)
+            queues[decision.worker].append(decision)
+
+        selected: list[ScheduleDecision] = []
+        selected_by_worker: Counter[str] = Counter()
+        while len(selected) < limit:
+            progressed = False
+            for worker in worker_order:
+                capacity = capacities.get(worker)
+                if capacity is not None and selected_by_worker[worker] >= capacity:
+                    continue
+                if not queues[worker]:
+                    continue
+                selected.append(queues[worker].popleft())
+                selected_by_worker[worker] += 1
+                progressed = True
+                if len(selected) >= limit:
+                    break
+            if not progressed:
+                break
+        return selected
 
     async def explain_task(self, task: Task) -> ScheduleDecision:
         """Score one task without requiring it to be present in the queue.

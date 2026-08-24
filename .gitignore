@@ -23,3 +23,8 @@ wordlists/generated/*
 # Local standalone/release build output
 release/
 *.spec
+
+# Python packaging artifacts
+*.egg-info/
+build/
+dist/

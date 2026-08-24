@@ -93,6 +93,10 @@ from recon.policy.rate_limit import (
 )
 from recon.policy.request_identity import RequestIdentityPolicy
 from recon.workers.passive_domains import normalize_dns_name
+from recon.workers.subprocess_stream import (
+    completed_process_returncode,
+    stream_process_stdout,
+)
 
 WORKER_NAME = "crawler"
 ACTION_CRAWL = "crawl"
@@ -528,6 +532,10 @@ class CrawlBackendTimeout(CrawlBackendError):
     """Katana exceeded the outer process timeout."""
 
 
+class CrawlBackendInvocationError(CrawlBackendError):
+    """The local Katana command line is invalid and cannot succeed on retry."""
+
+
 class KatanaBackend:
     """Exact-FQDN, bounded ProjectDiscovery Katana adapter."""
 
@@ -611,13 +619,12 @@ class KatanaBackend:
             args.append("-fsu")
 
         if self.config.known_files:
-            known_files_value = (
-                "all"
-                if set(self.config.known_files)
-                == {"robotstxt", "sitemapxml"}
-                else self.config.known_files[0]
+            args.extend(
+                (
+                    "-kf",
+                    _katana_known_files_value(self.config.known_files),
+                )
             )
-            args.extend(("-kf", known_files_value))
 
         if pacing.host_rps is not None:
             args.extend(
@@ -670,6 +677,9 @@ class KatanaBackend:
         stderr_tail: deque[str] = deque(
             maxlen=self.config.stderr_tail_lines
         )
+        stdout_tail: deque[str] = deque(
+            maxlen=self.config.stderr_tail_lines
+        )
 
         stderr_task = asyncio.create_task(
             _drain_stderr(
@@ -677,8 +687,6 @@ class KatanaBackend:
                 stderr_tail,
             )
         )
-
-        results: list[CrawlResult] = []
 
         try:
             process.stdin.write(
@@ -689,30 +697,24 @@ class KatanaBackend:
             await process.stdin.wait_closed()
 
             try:
-                async with asyncio.timeout(
-                    self.config.process_timeout_seconds
+                async for raw_line in stream_process_stdout(
+                    process,
+                    timeout_seconds=self.config.process_timeout_seconds,
                 ):
-                    while True:
-                        raw_line = await process.stdout.readline()
+                    line = raw_line.decode(
+                        "utf-8",
+                        errors="replace",
+                    ).strip()
 
-                        if not raw_line:
-                            break
+                    if not line:
+                        continue
 
-                        line = raw_line.decode(
-                            "utf-8",
-                            errors="replace",
-                        ).strip()
+                    result = parse_katana_line(line)
 
-                        if not line:
-                            continue
-
-                        result = parse_katana_line(line)
-
-                        if result is not None:
-                            results.append(result)
-
-                    returncode = await process.wait()
-
+                    if result is not None:
+                        yield result
+                    else:
+                        stdout_tail.append(line)
             except TimeoutError as exc:
                 await _terminate_process(process)
 
@@ -721,14 +723,26 @@ class KatanaBackend:
                     f"({self.config.process_timeout_seconds}s)"
                 ) from exc
 
+            returncode = completed_process_returncode(process)
             if returncode != 0:
-                detail = " | ".join(stderr_tail)
+                await stderr_task
+                details: list[str] = []
+                if stdout_tail:
+                    details.append("stdout=" + " | ".join(stdout_tail))
+                if stderr_tail:
+                    details.append("stderr=" + " | ".join(stderr_tail))
+                detail = "; ".join(details)
+                error_type = (
+                    CrawlBackendInvocationError
+                    if _is_katana_invocation_failure(returncode, detail)
+                    else CrawlBackendError
+                )
 
-                raise CrawlBackendError(
+                raise error_type(
                     "katana exited unsuccessfully "
                     f"(returncode={returncode})"
                     + (
-                        f"; stderr_tail={detail}"
+                        f"; diagnostic_tail={detail}"
                         if detail
                         else ""
                     )
@@ -744,9 +758,6 @@ class KatanaBackend:
                 raise
             except Exception:
                 pass
-
-        for result in results:
-            yield result
 
 
 class CrawlerWorker:
@@ -853,14 +864,14 @@ class CrawlerWorker:
             )
 
         assert plan.max_concurrency_hint is not None
-        assert plan.aggregate_rps_ceiling is not None
+        assert plan.safe_rps_hint is not None
 
         pacing = katana_pacing_from_plan(plan)
 
         # Saturate the strictest matching shared concurrency rule. Other
         # active workers governed by that rule cannot touch this host until the
         # crawl exits and the lease is released.
-        decision = await self._rate_limiter.acquire(
+        decision = await self._rate_limiter.await_acquire(
             task,
             context=context,
             demand=RateLimitDemand(
@@ -920,6 +931,11 @@ class CrawlerWorker:
                     result=result,
                 )
 
+        except CrawlBackendInvocationError as exc:
+            return WorkerExecutionResult(
+                outcome=WorkerOutcome.FAILED,
+                error=str(exc),
+            )
         except CrawlBackendTimeout as exc:
             return WorkerExecutionResult(
                 outcome=WorkerOutcome.RETRY,
@@ -1259,10 +1275,7 @@ def validate_opaque_crawler_plan(
             "opaque multi-request subprocess fails closed"
         )
 
-    if (
-        plan.aggregate_rps_ceiling is None
-        or plan.aggregate_rps_ceiling <= 0.0
-    ):
+    if plan.safe_rps_hint is None or plan.safe_rps_hint <= 0.0:
         return (
             "crawler requires an explicit requests_per_second ceiling "
             "in its matching shared rate-limit rule"
@@ -1283,14 +1296,14 @@ def validate_opaque_crawler_plan(
 def katana_pacing_from_plan(
     plan: RateLimitPlan,
 ) -> KatanaPacing:
-    """Convert full exclusive-host RPS into conservative Katana pacing."""
+    """Convert the per-process safe RPS share into Katana pacing."""
 
-    if plan.aggregate_rps_ceiling is None:
+    if plan.safe_rps_hint is None:
         raise ValueError(
             "rate plan has no aggregate RPS ceiling"
         )
 
-    rps = plan.aggregate_rps_ceiling
+    rps = plan.safe_rps_hint
 
     if rps >= 1.0:
         return KatanaPacing(
@@ -1962,6 +1975,28 @@ def _source_component(
     )
 
     return normalized or "unknown"
+
+
+def _katana_known_files_value(values: tuple[str, ...]) -> str:
+    """Map Night Scout's set semantics to Katana's single enum flag."""
+
+    if not values:
+        raise ValueError("known_files must not be empty")
+    return "all" if len(values) > 1 else values[0]
+
+
+def _is_katana_invocation_failure(returncode: int, detail: str) -> bool:
+    normalized = detail.lower()
+    return returncode == 2 or any(
+        marker in normalized
+        for marker in (
+            "unknown flag",
+            "flag provided but not defined",
+            "invalid value",
+            "usage of ",
+            "could not validate options",
+        )
+    )
 
 
 def _resolve_executable(

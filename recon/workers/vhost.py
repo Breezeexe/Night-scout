@@ -98,6 +98,10 @@ from recon.workers.permutations import (
     InMemoryExplorationCursorStore,
     WordCorpusProvider,
 )
+from recon.workers.subprocess_stream import (
+    completed_process_returncode,
+    stream_process_stdout,
+)
 
 WORKER_NAME = "vhost"
 ACTION_DISCOVER_TARGETED = "discover_targeted"
@@ -789,34 +793,26 @@ class HttpxVHostBackend:
             await process.stdin.wait_closed()
 
             try:
-                async with asyncio.timeout(
-                    self.config.process_timeout_seconds
+                async for raw_line in stream_process_stdout(
+                    process,
+                    timeout_seconds=self.config.process_timeout_seconds,
                 ):
-                    while True:
-                        raw_line = await process.stdout.readline()
+                    line = raw_line.decode(
+                        "utf-8",
+                        errors="replace",
+                    ).strip()
 
-                        if not raw_line:
-                            break
+                    if not line:
+                        continue
 
-                        line = raw_line.decode(
-                            "utf-8",
-                            errors="replace",
-                        ).strip()
+                    result = parse_httpx_vhost_line(
+                        line,
+                        service=service,
+                        host_header=candidate,
+                    )
 
-                        if not line:
-                            continue
-
-                        result = parse_httpx_vhost_line(
-                            line,
-                            service=service,
-                            host_header=candidate,
-                        )
-
-                        if result is not None:
-                            yield result
-
-                    returncode = await process.wait()
-
+                    if result is not None:
+                        yield result
             except TimeoutError as exc:
                 await _terminate_process(process)
                 raise VHostBackendTimeout(
@@ -824,6 +820,7 @@ class HttpxVHostBackend:
                     f"({self.config.process_timeout_seconds}s)"
                 ) from exc
 
+            returncode = completed_process_returncode(process)
             if returncode != 0:
                 detail = " | ".join(stderr_tail)
                 raise VHostBackendError(
@@ -1136,31 +1133,30 @@ class VHostWorker:
 
         cli_rps = tool_integer_rps_hint(plan)
 
-        while True:
-            decision = await self._rate_limiter.acquire(
-                task,
-                context=context,
-                demand=RateLimitDemand(
-                    requests=1.0,
-                    concurrency=1,
-                ),
-                lease_for=timedelta(
-                    seconds=self._config.rate_lease_seconds
-                ),
-            )
+        decision = await self._rate_limiter.await_acquire(
+            task,
+            context=context,
+            demand=RateLimitDemand(
+                requests=1.0,
+                concurrency=1,
+            ),
+            lease_for=timedelta(
+                seconds=self._config.rate_lease_seconds
+            ),
+        )
 
-            if decision.outcome is not RateLimitOutcome.DEFER:
-                break
-
-            retry_after = (
-                decision.retry_after_seconds
-                if decision.retry_after_seconds is not None
-                else self._config.default_retry_after_seconds
-            )
-            await asyncio.sleep(
-                retry_after
-                if retry_after > 0.0
-                else 0.05
+        if decision.outcome is RateLimitOutcome.DEFER:
+            return WorkerExecutionResult(
+                outcome=WorkerOutcome.RETRY,
+                error=(
+                    decision.reason
+                    or "VHOST shared rate limit temporarily exhausted"
+                ),
+                retry_after_seconds=(
+                    decision.retry_after_seconds
+                    if decision.retry_after_seconds is not None
+                    else self._config.default_retry_after_seconds
+                ),
             )
 
         if decision.outcome is RateLimitOutcome.DENY:

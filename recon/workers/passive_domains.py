@@ -47,6 +47,10 @@ from recon.core.events import Event, EventType, ScopeState
 from recon.core.lifecycle import WorkerExecutionResult, WorkerOutcome
 from recon.core.queue import Task
 from recon.core.router import RouteRule
+from recon.workers.subprocess_stream import (
+    completed_process_returncode,
+    stream_process_stdout,
+)
 
 WORKER_NAME = "passive_domains"
 ACTION_ENUMERATE = "enumerate"
@@ -423,26 +427,20 @@ class SubfinderSource:
 
         try:
             try:
-                async with asyncio.timeout(
-                    self.config.process_timeout_seconds
+                async for raw_line in stream_process_stdout(
+                    process,
+                    timeout_seconds=self.config.process_timeout_seconds,
                 ):
-                    while True:
-                        raw_line = await process.stdout.readline()
-                        if not raw_line:
-                            break
+                    line = raw_line.decode(
+                        "utf-8",
+                        errors="replace",
+                    ).strip()
 
-                        line = raw_line.decode(
-                            "utf-8",
-                            errors="replace",
-                        ).strip()
+                    if not line:
+                        continue
 
-                        if not line:
-                            continue
-
-                        for finding in parse_subfinder_line(line):
-                            yield finding
-
-                    returncode = await process.wait()
+                    for finding in parse_subfinder_line(line):
+                        yield finding
             except TimeoutError as exc:
                 await _terminate_process(process)
                 raise SourceTimeoutError(
@@ -454,6 +452,7 @@ class SubfinderSource:
                     stderr_tail=tuple(stderr_tail),
                 ) from exc
 
+            returncode = completed_process_returncode(process)
             if returncode != 0:
                 raise SourceExecutionError(
                     source=self.name,
