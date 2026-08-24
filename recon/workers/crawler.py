@@ -611,12 +611,13 @@ class KatanaBackend:
             args.append("-fsu")
 
         if self.config.known_files:
-            args.extend(
-                (
-                    "-kf",
-                    ",".join(self.config.known_files),
-                )
+            known_files_value = (
+                "all"
+                if set(self.config.known_files)
+                == {"robotstxt", "sitemapxml"}
+                else self.config.known_files[0]
             )
+            args.extend(("-kf", known_files_value))
 
         if pacing.host_rps is not None:
             args.extend(
@@ -677,6 +678,8 @@ class KatanaBackend:
             )
         )
 
+        results: list[CrawlResult] = []
+
         try:
             process.stdin.write(
                 (normalized_url + "\n").encode("utf-8")
@@ -706,7 +709,7 @@ class KatanaBackend:
                         result = parse_katana_line(line)
 
                         if result is not None:
-                            yield result
+                            results.append(result)
 
                     returncode = await process.wait()
 
@@ -741,6 +744,9 @@ class KatanaBackend:
                 raise
             except Exception:
                 pass
+
+        for result in results:
+            yield result
 
 
 class CrawlerWorker:

@@ -281,7 +281,7 @@ class TlsxBackend:
             "-c", "1",
             "-retry", "0",
             "-timeout", str(self.config.timeout_seconds),
-            "-san", "-cn", "-so",
+            "-so",
             "-tv", "-cipher",
             "-hash", "sha256",
             "-se", "-tps",

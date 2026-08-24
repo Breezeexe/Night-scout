@@ -1136,30 +1136,31 @@ class VHostWorker:
 
         cli_rps = tool_integer_rps_hint(plan)
 
-        decision = await self._rate_limiter.acquire(
-            task,
-            context=context,
-            demand=RateLimitDemand(
-                requests=1.0,
-                concurrency=1,
-            ),
-            lease_for=timedelta(
-                seconds=self._config.rate_lease_seconds
-            ),
-        )
+        while True:
+            decision = await self._rate_limiter.acquire(
+                task,
+                context=context,
+                demand=RateLimitDemand(
+                    requests=1.0,
+                    concurrency=1,
+                ),
+                lease_for=timedelta(
+                    seconds=self._config.rate_lease_seconds
+                ),
+            )
 
-        if decision.outcome is RateLimitOutcome.DEFER:
-            return WorkerExecutionResult(
-                outcome=WorkerOutcome.RETRY,
-                error=(
-                    decision.reason
-                    or "VHOST shared rate limit temporarily exhausted"
-                ),
-                retry_after_seconds=(
-                    decision.retry_after_seconds
-                    if decision.retry_after_seconds is not None
-                    else self._config.default_retry_after_seconds
-                ),
+            if decision.outcome is not RateLimitOutcome.DEFER:
+                break
+
+            retry_after = (
+                decision.retry_after_seconds
+                if decision.retry_after_seconds is not None
+                else self._config.default_retry_after_seconds
+            )
+            await asyncio.sleep(
+                retry_after
+                if retry_after > 0.0
+                else 0.05
             )
 
         if decision.outcome is RateLimitOutcome.DENY:

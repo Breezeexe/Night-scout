@@ -1,0 +1,497 @@
+schema_version: 1
+
+profile_id: jetinfosystems-full-recon
+display_name: Jet Infosystems broad authorized reconnaissance
+scope_file: jetinfosystems.scope.yaml
+
+runtime:
+  max_steps: 25000
+  task_lease_seconds: 300
+  heartbeat_interval_seconds: 60
+  recover_retry_delay_seconds: 0
+  resume_frontier: true
+  max_deferred_wait_seconds: 60
+  project_vocabulary: true
+  vulnerability_enrichment: true
+  snapshot_capture: true
+  snapshot_diff_on_write: true
+  build_genome_on_finish: true
+  novel_asset_threshold: 0.70
+
+storage:
+  database:
+    path: .nightscout/nightscout.sqlite3
+    busy_timeout_ms: 5000
+    echo: false
+    wal: true
+    synchronous: NORMAL
+  event_log:
+    enabled: true
+    path: .nightscout/events.jsonl
+  content_store:
+    root: .nightscout/content
+  artifact_store:
+    root: .nightscout/artifacts
+  sensitive_evidence:
+    root: .nightscout/sensitive-evidence
+    directory_mode: "0700"
+    file_mode: "0600"
+
+scheduler:
+  route_priority_weight: 1.0
+  confidence_weight: 3.0
+  novelty_weight: 4.0
+  expected_yield_weight: 3.0
+  information_gain_weight: 3.0
+  cost_weight: 2.0
+  retry_penalty_weight: 1.0
+  age_boost_per_minute: 0.01
+  max_age_boost: 3.0
+  candidate_limit: 256
+  signal_concurrency: 16
+
+budgets:
+  exploration_reserve_fraction: 0.20
+  soft_max_branch_depth: 8
+  hard_max_branch_depth: 12
+
+  soft_global_limits:
+    tasks: 20000
+    requests: 75000
+    candidates: 250000
+    concurrent_tasks: 8
+  soft_branch_limits:
+    tasks: 2500
+    requests: 10000
+    candidates: 20000
+    concurrent_tasks: 4
+  soft_resource_limits:
+    tasks: 50
+    requests: 1500
+    candidates: 2000
+    concurrent_tasks: 2
+  soft_worker_limits:
+    crawler:
+      tasks: 1000
+      requests: 25000
+      concurrent_tasks: 2
+    parameters:
+      tasks: 2000
+      requests: 30000
+      candidates: 100000
+      concurrent_tasks: 2
+    vhost:
+      tasks: 2000
+      requests: 30000
+      candidates: 100000
+      concurrent_tasks: 2
+    nuclei:
+      tasks: 2000
+      requests: 10000
+      concurrent_tasks: 1
+    permutations:
+      tasks: 5000
+      candidates: 200000
+      concurrent_tasks: 4
+
+  hard_global_limits:
+    tasks: 50000
+    requests: 200000
+    candidates: 1000000
+    concurrent_tasks: 16
+  hard_branch_limits:
+    tasks: 7500
+    requests: 30000
+    candidates: 100000
+    concurrent_tasks: 8
+  hard_resource_limits:
+    tasks: 200
+    requests: 5000
+    candidates: 10000
+    concurrent_tasks: 4
+  hard_worker_limits:
+    crawler:
+      requests: 75000
+      concurrent_tasks: 4
+    parameters:
+      requests: 100000
+      candidates: 300000
+      concurrent_tasks: 4
+    vhost:
+      requests: 100000
+      candidates: 300000
+      concurrent_tasks: 4
+    nuclei:
+      requests: 30000
+      concurrent_tasks: 2
+
+rate_limit:
+  require_matching_rule: true
+  default_retry_after_seconds: 2.0
+  rules:
+    - rule_id: jet-global-active
+      scope: GLOBAL
+      resource_pattern: "*"
+      requests_per_second: 30.0
+      burst: 5.0
+      max_concurrency: 4
+      workers:
+        - dns
+        - http
+        - tls
+        - crawler
+        - content
+        - parameters
+        - vhost
+        - nuclei
+      reason: Conservative global rate for authorized research
+
+    - rule_id: jet-per-host-active
+      scope: PER_RESOURCE
+      resource_pattern: "host:*"
+      requests_per_second: 5.0
+      burst: 5.0
+      max_concurrency: 1
+      workers:
+        - dns
+        - http
+        - tls
+        - crawler
+        - content
+        - parameters
+        - vhost
+        - nuclei
+      reason: Conservative per-host rate
+
+    - rule_id: jet-per-ip-active
+      scope: PER_RESOURCE
+      resource_pattern: "ip:*"
+      requests_per_second: 1.0
+      burst: 2.0
+      max_concurrency: 1
+      workers:
+        - http
+        - tls
+      reason: Conservative rate for explicitly scoped network assets
+
+routing:
+  enabled_rule_ids:
+    - passive_domains.enumerate
+    - permutations.root.targeted
+    - permutations.confirmed-dns.targeted
+    - permutations.root.exploration
+    - permutations.confirmed-dns.exploration
+    - dns.resolve
+    - http.probe.confirmed-dns
+    - tls.inspect.confirmed-dns
+    - asn.lookup-ip
+    - archives.discover-urls
+    - crawler.crawl.confirmed-root-url
+    - content.fetch-javascript.live
+    - javascript.analyze.local-content
+    - parameters.api.targeted
+    - parameters.api.exploration
+    - vhost.discover-targeted.confirmed-http-service
+    - vhost.discover-exploration.confirmed-http-service
+    - fingerprints.http-response
+    - fingerprints.certificate
+    - fingerprints.favicon
+    - nuclei.validate-cve.audited
+
+exploration:
+  enabled: true
+  initial_tier: SMALL
+  maximum_tier: EXHAUSTIVE
+  protected_lane: EXPLORATION
+  reserve_fraction_from_budgets: true
+  exploration_low_yield_close: false
+
+restrictions:
+  enabled: true
+  rules: []
+
+workers:
+  passive_domains:
+    enabled: true
+    backend:
+      binary: subfinder
+      recursive: false
+      all_sources: false
+      max_results_per_source: 5000
+      source_timeout_seconds: 30
+      max_time_minutes: 10
+      process_timeout_seconds: 660
+      extra_args: []
+    config:
+      retry_after_seconds: 30
+      fail_if_all_sources_fail: true
+
+  dns:
+    enabled: true
+    backend:
+      binary: dnsx
+      retry: 1
+      query_timeout: 3s
+      process_timeout_seconds: 15
+      capture_nxdomain: true
+      extra_args: []
+    config:
+      record_types:
+        - A
+        - AAAA
+        - CNAME
+      rate_lease_seconds: 30
+      default_retry_after_seconds: 5
+
+  permutations:
+    enabled: true
+    config:
+      tier: SMALL
+      max_candidates: 500
+      exploration_fraction: 0.20
+      minimum_exploration_candidates: 25
+      pairwise_top_words: 24
+      pairwise_enabled: true
+      nested_children: true
+      sibling_mutations: true
+
+  http:
+    enabled: true
+    backend:
+      binary: httpx
+      schemes:
+        - https
+        - http
+      timeout_seconds: 10
+      process_timeout_seconds: 20
+      max_response_read_bytes: 2097152
+      user_agent: NightScout/0.1 authorized-security-research
+      detect_technologies: true
+      extra_args: []
+    config:
+      rate_lease_seconds: 30
+      default_retry_after_seconds: 5
+
+  tls:
+    enabled: true
+    backend:
+      binary: tlsx
+      timeout_seconds: 5
+      process_timeout_seconds: 12
+      scan_mode: ctls
+      extra_args: []
+    config:
+      default_port: 443
+      rate_lease_seconds: 20
+      default_retry_after_seconds: 5
+
+  asn:
+    enabled: true
+    backend:
+      binary: asnmap
+      process_timeout_seconds: 30
+      extra_args: []
+    config:
+      retry_after_seconds: 30
+
+  archives:
+    enabled: true
+    backend:
+      binary: urlfinder
+      sources:
+        - waybackarchive
+        - commoncrawl
+      all_sources: false
+      field_scope: rdn
+      provider_rate_limit: 5
+      process_timeout_seconds: 300
+      extra_args: []
+    config:
+      retry_after_seconds: 30
+      max_url_length: 16384
+      max_parameters_per_url: 64
+      recent_dedupe_capacity: 250000
+      fail_if_all_sources_fail: true
+
+  crawler:
+    enabled: true
+    backend:
+      binary: katana
+      depth: 3
+      crawl_duration_seconds: 60
+      max_domain_pages: 100
+      timeout_seconds: 10
+      max_response_size_bytes: 2097152
+      process_timeout_seconds: 90
+      js_crawl: true
+      form_extraction: true
+      ignore_query_param_values: true
+      filter_similar_urls: true
+      known_files:
+        - robotstxt
+        - sitemapxml
+      user_agent: NightScout/0.1 authorized-security-research
+      extra_args: []
+    config:
+      retry_after_seconds: 5
+      lease_margin_seconds: 30
+      max_parameters_per_url: 64
+      max_form_fields_per_result: 128
+
+  content:
+    enabled: true
+    backend:
+      binary: httpx
+      timeout_seconds: 10
+      process_timeout_seconds: 20
+      max_response_bytes: 8388608
+      user_agent: NightScout/0.1 authorized-security-research
+      extra_args: []
+    config:
+      rate_lease_seconds: 30
+      default_retry_after_seconds: 5
+      allow_missing_content_type: true
+      reject_html_prefix_bytes: 2048
+
+  javascript:
+    enabled: true
+    config:
+      max_content_bytes: 33554432
+      max_strings: 200000
+      max_string_length: 16384
+      max_urls: 20000
+      max_api_endpoints: 20000
+      max_parameters: 10000
+      max_vocabulary_tokens: 30000
+      max_source_maps: 1024
+
+  parameters:
+    enabled: true
+    config:
+      targeted_candidates: 100
+      exploration_candidates: 40
+      chunk_size: 40
+      request_timeout_seconds: 15
+      process_timeout_seconds: 300
+      lease_margin_seconds: 30
+      retry_after_seconds: 15
+    backend:
+      binary: arjun
+      extra_args: []
+
+  vhost:
+    enabled: true
+    config:
+      targeted_limit: 100
+      exploration_limit: 40
+      rate_lease_seconds: 30
+      default_retry_after_seconds: 5
+      min_differential_score: 2.0
+      min_stable_dimensions: 1
+    backend:
+      binary: httpx
+      timeout_seconds: 10
+      process_timeout_seconds: 20
+      max_response_read_bytes: 2097152
+      user_agent: NightScout/0.1 authorized-security-research
+      extra_args: []
+
+  fingerprints:
+    enabled: true
+    config:
+      emit_http_content: true
+      emit_http_structure: true
+      emit_http_stack: true
+      emit_tls_certificate: true
+      emit_tls_identity: true
+      emit_favicon_sha256: true
+      emit_favicon_mmh3: true
+      normalize_title_max_chars: 256
+      max_technologies: 64
+
+  nuclei:
+    enabled: true
+    templates:
+      manifest: configs/nuclei-templates.yaml
+      root: nuclei-templates
+      max_template_bytes: 1048576
+    config:
+      max_requests_per_template: 3
+      lease_margin_seconds: 30
+      default_retry_after_seconds: 10
+      minimum_cpe_score: 0.60
+      finding_confidence_floor: 0.72
+      finding_confidence_ceiling: 0.95
+      require_signed_templates: true
+    backend:
+      binary: nuclei
+      timeout_seconds: 10
+      process_timeout_seconds: 60
+      max_response_read_bytes: 1048576
+      max_response_save_bytes: 1024
+      extra_args: []
+
+  mobile:
+    enabled: false
+
+intelligence:
+  wordlists:
+    manifest: /home/breeze/.local/share/nightscout/wordlists/generated/manifest.local.yaml
+    corpus_root: /home/breeze/.local/share/nightscout/wordlists
+    dns_tier: medium
+    parameter_tier: medium
+    max_target_events: 250000
+    max_projected_evidence: 500000
+  vulnerabilities:
+    enabled: true
+    nvd_cache_path: .nightscout/cache/nvd.sqlite3
+    client:
+      api_key_env: NVD_API_KEY
+      timeout_seconds: 20
+      min_request_interval_seconds: 6
+      max_attempts: 3
+      max_response_bytes: 16777216
+      cpe_results_per_page: 100
+      max_cpe_records: 250
+      cve_results_per_page: 2000
+      max_cves_per_cpe: 500
+      cpe_cache_ttl_seconds: 2592000
+      cve_cache_ttl_seconds: 86400
+      negative_cache_ttl_seconds: 21600
+      min_cpe_score: 0.60
+      max_cpe_candidates: 5
+      max_references_per_cve: 32
+  vocabulary: {}
+  patterns: {}
+  confidence: {}
+  novelty: {}
+  yield_model: {}
+  convergence: {}
+  genome: {}
+
+snapshots:
+  enabled: true
+  kinds:
+    - DNS
+    - HTTP
+    - TLS
+    - JAVASCRIPT
+    - API
+    - ASSET
+  diff_on_write: true
+  record_present_false: true
+
+exports:
+  default_mode: SAFE
+  jsonl:
+    enabled: true
+    path: exports/jetinfosystems.jsonl
+  text:
+    enabled: true
+    directory: exports/jetinfosystems-text
+  csv:
+    enabled: true
+    directory: exports/jetinfosystems-csv
+  sensitive_evidence:
+    enabled: true
+    require_explicit_confirmation: true
