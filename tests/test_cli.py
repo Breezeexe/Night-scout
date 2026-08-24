@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
+from typer.main import get_command
 from typer.testing import CliRunner
 
 from recon.cli import app
@@ -47,11 +48,21 @@ def test_cli_version_and_help():
     assert run_help.exit_code == 0
     assert "target_id selects" in run_help.stdout
     assert "workspace" in run_help.stdout
-    assert "--mobile-artifact" in run_help.stdout
-    assert "--mobile-app-id" in run_help.stdout
-    assert "--mobile-source" in run_help.stdout
-    assert "--identity-header" in run_help.stdout
     assert "provenance only" in run_help.stdout
+
+    root_command = get_command(app)
+    run_command = root_command.commands["run"]  # type: ignore[attr-defined]
+    run_options = {
+        option
+        for parameter in run_command.params
+        for option in (*getattr(parameter, "opts", ()), *getattr(parameter, "secondary_opts", ()))
+    }
+    assert {
+        "--mobile-artifact",
+        "--mobile-app-id",
+        "--mobile-source-url",
+        "--identity-header",
+    } <= run_options
 
     doctor_help = runner.invoke(app, ["doctor", "--help"])
     assert doctor_help.exit_code == 0

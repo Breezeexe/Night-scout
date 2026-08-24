@@ -63,10 +63,16 @@ async def test_process_timeout_does_not_cancel_slow_result_consumer() -> None:
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
-        "import time; print('one', flush=True); print('two', flush=True); time.sleep(1)",
+        (
+            "import sys, time; "
+            "sys.stdout.write('ready\\none\\ntwo\\n'); "
+            "sys.stdout.flush(); time.sleep(1)"
+        ),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
+    assert process.stdout is not None
+    assert await asyncio.wait_for(process.stdout.readline(), timeout=1) == b"ready\n"
     stream = stream_process_stdout(process, timeout_seconds=0.05)
     try:
         assert await anext(stream) == b"one\n"
@@ -88,10 +94,12 @@ async def test_completed_process_buffer_survives_slow_result_consumer() -> None:
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
-        "print('one', flush=True); print('two', flush=True)",
+        "print('ready', flush=True); print('one', flush=True); print('two', flush=True)",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
+    assert process.stdout is not None
+    assert await asyncio.wait_for(process.stdout.readline(), timeout=1) == b"ready\n"
     stream = stream_process_stdout(process, timeout_seconds=0.05)
     try:
         assert await anext(stream) == b"one\n"
