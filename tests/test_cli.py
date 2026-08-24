@@ -66,7 +66,13 @@ def test_cli_version_and_help():
 
     doctor_help = runner.invoke(app, ["doctor", "--help"])
     assert doctor_help.exit_code == 0
-    assert "--identity-header" in doctor_help.stdout
+    doctor_command = root_command.commands["doctor"]  # type: ignore[attr-defined]
+    doctor_options = {
+        option
+        for parameter in doctor_command.params
+        for option in (*getattr(parameter, "opts", ()), *getattr(parameter, "secondary_opts", ()))
+    }
+    assert "--identity-header" in doctor_options
 
     removed_mobile_command = runner.invoke(app, ["mobile", "--help"])
     assert removed_mobile_command.exit_code != 0
