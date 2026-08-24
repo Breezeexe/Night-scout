@@ -20,7 +20,8 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates git gh python3 python3-venv python3-pip build-essential dpkg-dev
+            ca-certificates git gh python3 python3-venv python3-pip libpython3.13 \
+            build-essential dpkg-dev
 
       - name: Checkout
         uses: actions/checkout@v7
